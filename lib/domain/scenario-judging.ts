@@ -23,13 +23,23 @@ function findActor(pitch: PitchState, actorId: string) {
   return pitch.players.find((player) => player.id === actorId);
 }
 
+function isTeammate(content: ScenarioContent, targetPlayerId: string | undefined): boolean {
+  const actor = findActor(content.pitch, content.actorId);
+  return Boolean(
+    actor &&
+      content.pitch.players.some(
+        (player) => player.id === targetPlayerId && player.team === actor.team && player.id !== actor.id,
+      ),
+  );
+}
+
 function selectedPath(content: ScenarioContent, input: ScenarioActionInput): Point[] | null {
   const actor = findActor(content.pitch, content.actorId);
   if (!actor) return null;
 
   if (input.actionType === "pass") {
     const target = content.pitch.players.find(
-      (player) => player.id === input.targetPlayerId && player.team === "us" && player.id !== actor.id,
+      (player) => player.id === input.targetPlayerId && player.team === actor.team && player.id !== actor.id,
     );
     return target ? [{ x: actor.x, y: actor.y }, { x: target.x, y: target.y }] : null;
   }
@@ -50,9 +60,7 @@ function actionMatches(
     return (
       action.target.kind === "player" &&
       action.target.playerId === input.targetPlayerId &&
-      content.pitch.players.some(
-        (player) => player.id === input.targetPlayerId && player.team === "us" && player.id !== content.actorId,
-      )
+      isTeammate(content, input.targetPlayerId)
     );
   }
 

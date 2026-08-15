@@ -105,6 +105,41 @@ test("judges a pass by action type and teammate target", () => {
   });
 });
 
+test("requires a pass target to share the actor's team", () => {
+  const themActorContent: ScenarioContent = {
+    ...reviewedScenarioContent,
+    actorId: "defender-1",
+    pitch: {
+      ...reviewedScenarioContent.pitch,
+      players: [
+        ...reviewedScenarioContent.pitch.players,
+        { id: "defender-2", x: 58, y: 60, team: "them" },
+      ],
+    },
+    answer: {
+      ...reviewedScenarioContent.answer,
+      preferred: { actionType: "pass", target: { kind: "player", playerId: "ala-left" } },
+    },
+  };
+
+  assert.equal(
+    evaluateScenarioAction(themActorContent, { actionType: "pass", targetPlayerId: "ala-left" }).correct,
+    false,
+  );
+
+  const sameTeamContent: ScenarioContent = {
+    ...themActorContent,
+    answer: {
+      ...themActorContent.answer,
+      preferred: { actionType: "pass", target: { kind: "player", playerId: "defender-2" } },
+    },
+  };
+  assert.equal(
+    evaluateScenarioAction(sameTeamContent, { actionType: "pass", targetPlayerId: "defender-2" }).correct,
+    true,
+  );
+});
+
 test("judges action type, target, and path together", () => {
   const dribbleContent: ScenarioContent = {
     ...reviewedScenarioContent,
