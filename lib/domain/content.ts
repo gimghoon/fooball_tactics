@@ -442,6 +442,16 @@ export function isScenarioPublishable(input: unknown): boolean {
   }
 }
 
+/** Ensures a coach cannot publish incomplete or unreviewed structured content. */
+export function assertReviewTransition(status: ReviewStatus, input: unknown): void {
+  if (status !== "reviewed") return;
+
+  const content = parseScenarioContent(input);
+  if (!content.review.sourceReviewed) fail("출처 검수가 완료되지 않았습니다.");
+  if (!content.review.timelineReviewed) fail("타임라인 검수가 완료되지 않았습니다.");
+  if (!content.review.explanationsReviewed) fail("설명 검수가 완료되지 않았습니다.");
+}
+
 export function adaptLegacyPassScenario({ pitchJson, answerJson }: LegacyPassScenario): LegacyPassScenarioContent {
   let rawPitch: unknown;
   let rawAnswer: unknown;

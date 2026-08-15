@@ -5,6 +5,7 @@ import { isPointInZone, normalizeClientPoint, segmentIntersectsCircle } from "..
 import { calculateMastery } from "../lib/domain/mastery.ts";
 import {
   adaptLegacyPassScenario,
+  assertReviewTransition,
   isScenarioPublishable,
   mapAttemptInputError,
   parseAttemptInput,
@@ -228,6 +229,43 @@ test("publishes only complete coach-reviewed scenario content", () => {
     ...reviewedScenarioContent,
     explanations: reviewedScenarioContent.explanations.slice(0, 3),
   }), false);
+});
+
+test("blocks publication until content and all review dimensions are complete", () => {
+  assert.doesNotThrow(() => assertReviewTransition("pending", {
+    ...reviewedScenarioContent,
+    review: { sourceReviewed: false, timelineReviewed: false, explanationsReviewed: false },
+  }));
+  assert.doesNotThrow(() => assertReviewTransition("draft", {}));
+
+  assert.throws(() => assertReviewTransition("reviewed", {
+    ...reviewedScenarioContent,
+    review: { ...reviewedScenarioContent.review, sourceReviewed: false },
+  }), /출처/);
+  assert.throws(() => assertReviewTransition("reviewed", {
+    ...reviewedScenarioContent,
+    review: { ...reviewedScenarioContent.review, timelineReviewed: false },
+  }), /타임라인/);
+  assert.throws(() => assertReviewTransition("reviewed", {
+    ...reviewedScenarioContent,
+    review: { ...reviewedScenarioContent.review, explanationsReviewed: false },
+  }), /설명/);
+  assert.throws(() => assertReviewTransition("reviewed", {
+    ...reviewedScenarioContent,
+    explanations: reviewedScenarioContent.explanations.slice(0, 3),
+  }), /설명은 네 종류/);
+  assert.throws(() => assertReviewTransition("reviewed", {
+    ...reviewedScenarioContent,
+    explanations: [{ ...reviewedScenarioContent.explanations[0], fromMs: 1800, toMs: 1200 }],
+  }), /시간 범위/);
+  assert.throws(() => assertReviewTransition("reviewed", {
+    ...reviewedScenarioContent,
+    explanations: [{
+      ...reviewedScenarioContent.explanations[0],
+      highlights: [{ kind: "player", id: "missing-player" }],
+    }],
+  }), /강조 대상/);
+  assert.throws(() => assertReviewTransition("reviewed", ""), /콘텐츠 객체|JSON/);
 });
 
 test("rejects scenario content with unknown references or malformed JSON", () => {
