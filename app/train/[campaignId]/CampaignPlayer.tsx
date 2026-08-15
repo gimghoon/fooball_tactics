@@ -5,7 +5,7 @@ import Link from "next/link";
 import type { AttemptInput, PublicScenarioProjection } from "@/lib/domain/content";
 import { TacticalPitch, type TacticalChoice } from "./TacticalPitch";
 
-type Scenario = { id: string; role: "fixo" | "ala" | "pivo" | "recap"; principle: string; prompt: string; hint: string; explanation: string; contentJson: string; orderIndex: number };
+type Scenario = { id: string; role: "fixo" | "ala" | "pivo" | "recap"; principle: string; prompt: string; contentJson: string; orderIndex: number };
 type Auth = { participantId: string; recoveryToken: string };
 type Feedback = { correct: boolean; hint: string | null; explanation: string | null };
 

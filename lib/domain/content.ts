@@ -107,6 +107,24 @@ export type PublicLegacyScenarioContent = Omit<PublicScenarioContent, "defenseTy
 
 export type PublicScenarioProjection = PublicScenarioContent | PublicLegacyScenarioContent;
 
+export type PublicTrainingScenarioSource = {
+  id: string;
+  campaignId: string;
+  role: "fixo" | "ala" | "pivo" | "recap";
+  principle: string;
+  prompt: string;
+  hint: string;
+  explanation: string;
+  pitchJson: string;
+  answerJson: string;
+  contentJson: string;
+  orderIndex: number;
+};
+
+export type PublicTrainingScenario = Pick<PublicTrainingScenarioSource, "id" | "campaignId" | "role" | "principle" | "prompt" | "orderIndex"> & {
+  contentJson: string;
+};
+
 type LegacyPassScenario = {
   pitchJson: string;
   answerJson: string;
@@ -493,4 +511,18 @@ export function serializePublicScenarioContent(source: ScenarioContentSource): s
   }
   if (!isScenarioPublishable(source.contentJson)) return null;
   return JSON.stringify(toPublicScenarioContent(parseScenarioContent(source.contentJson)));
+}
+
+export function serializePublicTrainingScenario(source: PublicTrainingScenarioSource): PublicTrainingScenario | null {
+  const contentJson = serializePublicScenarioContent(source);
+  if (contentJson === null) return null;
+  return {
+    id: source.id,
+    campaignId: source.campaignId,
+    role: source.role,
+    principle: source.principle,
+    prompt: source.prompt,
+    contentJson,
+    orderIndex: source.orderIndex,
+  };
 }

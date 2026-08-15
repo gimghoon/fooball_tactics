@@ -12,6 +12,7 @@ import {
   playableScenarios,
   reconstructAttemptInput,
   serializePublicScenarioContent,
+  serializePublicTrainingScenario,
   toPublicScenarioContent,
   type ScenarioContent,
 } from "../lib/domain/content.ts";
@@ -19,6 +20,7 @@ import { mergePendingEvents } from "../lib/domain/offline-queue.ts";
 import { advanceRole, evaluateAttempt } from "../lib/domain/session.ts";
 import { createRecoveryToken, hashRecoveryToken, normalizeNickname } from "../lib/domain/identity.ts";
 import { evaluateScenarioAction } from "../lib/domain/scenario-judging.ts";
+import { classifyPlayerTap, playerAriaLabel } from "../lib/domain/tactical-pitch.ts";
 
 const reviewedScenarioContent: ScenarioContent = {
   defenseType: "front_press",
@@ -192,6 +194,56 @@ test("normalizes client touches into the pitch viewBox", () => {
     normalizeClientPoint({ x: 210, y: 310 }, { left: 10, top: 10, width: 400, height: 600 }),
     { x: 50, y: 50 },
   );
+});
+
+test("normalizes unpadded pitch edges and center to the matching viewBox coordinates", () => {
+  const bounds = { left: 10, top: 20, width: 400, height: 400 };
+
+  assert.deepEqual(normalizeClientPoint({ x: 10, y: 20 }, bounds), { x: 0, y: 0 });
+  assert.deepEqual(normalizeClientPoint({ x: 210, y: 220 }, bounds), { x: 50, y: 50 });
+  assert.deepEqual(normalizeClientPoint({ x: 410, y: 420 }, bounds), { x: 100, y: 100 });
+});
+
+test("classifies player taps from the actor's team and keeps dribble and move taps as destinations", () => {
+  const actor = { id: "defender-1", x: 50, y: 58, team: "them" as const };
+  const teammate = { id: "defender-2", x: 58, y: 60, team: "them" as const };
+  const opponent = { id: "ala-left", x: 24, y: 52, team: "us" as const };
+
+  assert.equal(classifyPlayerTap("pass", actor, teammate), "pass-target");
+  assert.equal(classifyPlayerTap("pass", actor, opponent), "ignore");
+  assert.equal(classifyPlayerTap("pass", actor, actor), "ignore");
+  assert.equal(playerAriaLabel(actor, teammate), "동료 선수 defender-2");
+  assert.equal(playerAriaLabel(actor, opponent), "상대 선수 ala-left");
+  assert.equal(classifyPlayerTap("dribble", actor, opponent), "destination");
+  assert.equal(classifyPlayerTap("move", actor, teammate), "destination");
+});
+
+test("projects training props without pre-attempt feedback", () => {
+  const projected = serializePublicTrainingScenario({
+    id: "scenario-1",
+    campaignId: "campaign-1",
+    role: "fixo",
+    principle: "support",
+    prompt: "어디로 움직일까요?",
+    hint: "수비수의 위치를 보세요.",
+    explanation: "정답은 반대편입니다.",
+    pitchJson: JSON.stringify(reviewedScenarioContent.pitch),
+    answerJson: JSON.stringify(reviewedScenarioContent.answer),
+    contentJson: JSON.stringify(reviewedScenarioContent),
+    orderIndex: 1,
+  });
+
+  assert.deepEqual(projected, {
+    id: "scenario-1",
+    campaignId: "campaign-1",
+    role: "fixo",
+    principle: "support",
+    prompt: "어디로 움직일까요?",
+    contentJson: JSON.stringify(toPublicScenarioContent(reviewedScenarioContent)),
+    orderIndex: 1,
+  });
+  assert.equal("hint" in (projected ?? {}), false);
+  assert.equal("explanation" in (projected ?? {}), false);
 });
 
 test("counts a path touching a hazard boundary as unsafe", () => {

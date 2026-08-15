@@ -3,6 +3,7 @@
 import { useMemo, useState, type PointerEvent } from "react";
 import { normalizeClientPoint } from "@/lib/domain/geometry";
 import type { ActionType, Point, PublicScenarioProjection } from "@/lib/domain/content";
+import { classifyPlayerTap, playerAriaLabel } from "@/lib/domain/tactical-pitch";
 
 const ACTION_LABELS: Record<ActionType, string> = {
   pass: "패스",
@@ -22,10 +23,6 @@ type TacticalPitchProps = {
   onSubmit: (input: TacticalChoice) => void;
 };
 
-function playerLabel(team: "us" | "them", id: string) {
-  return `${team === "us" ? "우리 팀" : "상대 팀"} 선수 ${id}`;
-}
-
 export function TacticalPitch({ content, disabled = false, onSubmit }: TacticalPitchProps) {
   const [selectedAction, setSelectedAction] = useState<ActionType | null>(null);
   const setup = useMemo(() => content.setupTimeline.keyframes.at(-1), [content]);
@@ -33,6 +30,7 @@ export function TacticalPitch({ content, disabled = false, onSubmit }: TacticalP
     ...player,
     ...(setup?.players[player.id] ?? {}),
   }));
+  const actor = players.find((player) => player.id === content.actorId);
   const ball = setup?.ball ?? content.pitch.ball;
 
   function submitDestination(event: PointerEvent<SVGSVGElement>) {
@@ -45,9 +43,13 @@ export function TacticalPitch({ content, disabled = false, onSubmit }: TacticalP
   }
 
   function submitPlayer(event: PointerEvent<SVGGElement>, player: typeof players[number]) {
-    event.stopPropagation();
-    if (disabled || selectedAction !== "pass" || player.team !== "us" || player.id === content.actorId) return;
-    onSubmit({ actionType: "pass", targetPlayerId: player.id });
+    const outcome = classifyPlayerTap(selectedAction, actor, player);
+    if (outcome === "pass-target") {
+      event.stopPropagation();
+      if (!disabled) onSubmit({ actionType: "pass", targetPlayerId: player.id });
+    } else if (outcome === "ignore") {
+      event.stopPropagation();
+    }
   }
 
   return (
@@ -73,12 +75,12 @@ export function TacticalPitch({ content, disabled = false, onSubmit }: TacticalP
         aria-label="전술 경기장"
         onPointerDown={submitDestination}
       >
-        <rect x="1" y="1" width="98" height="98" rx="3" className="pitch-line" />
-        <line x1="1" x2="99" y1="50" y2="50" className="pitch-line" />
+        <rect x="4" y="4" width="92" height="92" rx="3" className="pitch-line" />
+        <line x1="4" x2="96" y1="50" y2="50" className="pitch-line" />
         <circle cx="50" cy="50" r="12" className="pitch-line" />
         {players.map((player) => (
           <g key={player.id} onPointerDown={(event) => submitPlayer(event, player)}>
-            <title>{playerLabel(player.team, player.id)}</title>
+            <title>{playerAriaLabel(actor, player)}</title>
             <circle cx={player.x} cy={player.y} r="5" className={player.team === "us" ? "player" : "opponent"} />
           </g>
         ))}

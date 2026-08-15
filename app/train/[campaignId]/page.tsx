@@ -2,24 +2,11 @@ import { and, asc, eq } from "drizzle-orm";
 import { notFound } from "next/navigation";
 import { getDb } from "@/db";
 import { campaigns, scenarios } from "@/db/schema";
-import { serializePublicScenarioContent } from "@/lib/domain/content";
+import { serializePublicTrainingScenario } from "@/lib/domain/content";
 import { CampaignPlayer } from "./CampaignPlayer";
 
 function serializeScenario(item: typeof scenarios.$inferSelect) {
-  const contentJson = serializePublicScenarioContent(item);
-  if (contentJson === null) return null;
-  return {
-    id: item.id,
-    campaignId: item.campaignId,
-    role: item.role,
-    principle: item.principle,
-    prompt: item.prompt,
-    hint: item.hint,
-    explanation: item.explanation,
-    pitchJson: item.pitchJson,
-    contentJson,
-    orderIndex: item.orderIndex,
-  };
+  return serializePublicTrainingScenario(item);
 }
 
 export default async function TrainingPage({ params }: { params: Promise<{ campaignId: string }> }) {
