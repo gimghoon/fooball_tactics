@@ -2,7 +2,7 @@
 
 import { useEffect, useMemo, useRef, useSyncExternalStore } from "react";
 import type { HighlightRef, PitchState, Point, ScenarioTimeline } from "@/lib/domain/content";
-import { frameAt } from "@/lib/domain/timeline";
+import { frameAt, snapToKeyframe } from "@/lib/domain/timeline";
 
 type ScenarioPlaybackProps = {
   pitch: PitchState;
@@ -12,8 +12,11 @@ type ScenarioPlaybackProps = {
   highlights: HighlightRef[];
   currentMs: number;
   playing: boolean;
+  generation: number;
   onCurrentMsChange: (atMs: number) => void;
   onPlayingChange: (playing: boolean) => void;
+  onRestart: () => void;
+  onPlaybackComplete: () => void;
   prefersReducedMotion?: boolean;
 };
 
@@ -43,8 +46,11 @@ export function ScenarioPlayback({
   highlights,
   currentMs,
   playing,
+  generation,
   onCurrentMsChange,
   onPlayingChange,
+  onRestart,
+  onPlaybackComplete,
   prefersReducedMotion,
 }: ScenarioPlaybackProps) {
   const systemReducedMotion = useSyncExternalStore(
@@ -62,8 +68,9 @@ export function ScenarioPlayback({
   useEffect(() => {
     if (!playing || reducedMotion === null) return;
     if (reducedMotion) {
-      onCurrentMsChange(timeline.durationMs);
+      onCurrentMsChange(snapToKeyframe(timeline, timeline.durationMs));
       onPlayingChange(false);
+      onPlaybackComplete();
       return;
     }
 
@@ -78,13 +85,16 @@ export function ScenarioPlayback({
         requestId = window.requestAnimationFrame(tick);
       } else {
         onPlayingChange(false);
+        onPlaybackComplete();
       }
     };
     requestId = window.requestAnimationFrame(tick);
     return () => window.cancelAnimationFrame(requestId);
-  }, [onCurrentMsChange, onPlayingChange, playing, reducedMotion, timeline.durationMs]);
+  }, [generation, onCurrentMsChange, onPlaybackComplete, onPlayingChange, playing, reducedMotion, timeline, timeline.durationMs]);
 
-  const frame = useMemo(() => frameAt(timeline, currentMs), [currentMs, timeline]);
+  const endpointOnly = reducedMotion !== false;
+  const displayedMs = endpointOnly ? snapToKeyframe(timeline, currentMs) : currentMs;
+  const frame = useMemo(() => frameAt(timeline, displayedMs), [displayedMs, timeline]);
   const highlighted = useMemo(
     () => new Set(highlights.map((highlight) => `${highlight.kind}:${highlight.id}`)),
     [highlights],
@@ -92,18 +102,12 @@ export function ScenarioPlayback({
   const players = pitch.players.map((player) => ({ ...player, ...(frame.players[player.id] ?? {}) }));
 
   function replay() {
-    if (reducedMotion) {
-      onCurrentMsChange(timeline.durationMs);
-      onPlayingChange(false);
-      return;
-    }
-    onCurrentMsChange(0);
-    onPlayingChange(true);
+    onRestart();
   }
 
   function seek(atMs: number) {
     onPlayingChange(false);
-    onCurrentMsChange(atMs);
+    onCurrentMsChange(endpointOnly ? snapToKeyframe(timeline, atMs) : atMs);
   }
 
   const showArrows = reducedMotion !== false;
@@ -164,12 +168,12 @@ export function ScenarioPlayback({
         <label>
           <span>재생 위치</span>
           <input
-            className="playback-seek"
+            className={`playback-seek${endpointOnly ? " playback-keyframe-seek" : ""}`}
             type="range"
             min="0"
             max={timeline.durationMs}
             step="10"
-            value={currentMs}
+            value={displayedMs}
             onChange={(event) => seek(Number(event.currentTarget.value))}
           />
         </label>

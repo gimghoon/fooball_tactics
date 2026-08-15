@@ -60,4 +60,5 @@ test("renders the three-stage reviewed explanation controls in the client bundle
   assert.match(assets, /playback-seek/);
   assert.match(assets, /reduced-motion-arrow/);
   assert.match(assets, /path-endpoint/);
+  assert.match(assets, /playback-keyframe-seek/);
 });

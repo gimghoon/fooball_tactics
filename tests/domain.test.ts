@@ -21,7 +21,15 @@ import { advanceRole, evaluateAttempt } from "../lib/domain/session.ts";
 import { createRecoveryToken, hashRecoveryToken, normalizeNickname } from "../lib/domain/identity.ts";
 import { evaluateScenarioAction } from "../lib/domain/scenario-judging.ts";
 import { classifyPlayerTap, playerAriaLabel } from "../lib/domain/tactical-pitch.ts";
-import { explanationStage, frameAt, initialExplanationIndex } from "../lib/domain/timeline.ts";
+import {
+  beginInitialPlayback,
+  completePlayback,
+  explanationStage,
+  frameAt,
+  initialExplanationIndex,
+  restartPlayback,
+  snapToKeyframe,
+} from "../lib/domain/timeline.ts";
 
 const reviewedScenarioContent: ScenarioContent = {
   defenseType: "front_press",
@@ -106,6 +114,35 @@ test("carries the nearest defined player position between sparse keyframes", () 
   });
 });
 
+test("materializes carried players at an exact sparse keyframe", () => {
+  const timeline = {
+    durationMs: 1000,
+    decisionAtMs: 400,
+    keyframes: [
+      { atMs: 0, players: { d1: { x: 20, y: 20 } }, ball: { x: 50, y: 70 } },
+      { atMs: 500, players: {}, ball: { x: 40, y: 60 } },
+      { atMs: 1000, players: { d1: { x: 40, y: 20 } }, ball: { x: 30, y: 50 } },
+    ],
+  };
+
+  assert.deepEqual(frameAt(timeline, 500).players, { d1: { x: 20, y: 20 } });
+});
+
+test("interpolates from carried positions across multiple sparse keyframes", () => {
+  const timeline = {
+    durationMs: 1000,
+    decisionAtMs: 400,
+    keyframes: [
+      { atMs: 0, players: { d1: { x: 20, y: 20 } }, ball: { x: 50, y: 70 } },
+      { atMs: 250, players: {}, ball: { x: 45, y: 65 } },
+      { atMs: 750, players: {}, ball: { x: 35, y: 55 } },
+      { atMs: 1000, players: { d1: { x: 40, y: 20 } }, ball: { x: 30, y: 50 } },
+    ],
+  };
+
+  assert.deepEqual(frameAt(timeline, 875).players.d1, { x: 30, y: 20 });
+});
+
 test("clamps timeline playback to its duration without mutating keyframe order", () => {
   const later = { atMs: 1000, players: { d1: { x: 40, y: 20 } }, ball: { x: 30, y: 50 } };
   const earlier = { atMs: 0, players: { d1: { x: 20, y: 20 } }, ball: { x: 50, y: 70 } };
@@ -132,6 +169,53 @@ test("starts explanation review with the observe block regardless of authored or
   ];
 
   assert.equal(initialExplanationIndex(reordered), 2);
+});
+
+test("restarts an active playback with a new generation without relocking completed review", () => {
+  const restarted = restartPlayback({
+    currentMs: 700,
+    playing: true,
+    generation: 4,
+    initialPlaybackComplete: true,
+  });
+
+  assert.deepEqual(restarted, {
+    currentMs: 0,
+    playing: true,
+    generation: 5,
+    initialPlaybackComplete: true,
+  });
+});
+
+test("locks review controls until the initial playback completes and keeps them unlocked on replay", () => {
+  const begun = beginInitialPlayback({
+    currentMs: 900,
+    playing: false,
+    generation: 2,
+    initialPlaybackComplete: true,
+  });
+  assert.equal(begun.initialPlaybackComplete, false);
+
+  const completed = completePlayback(begun);
+  assert.equal(completed.initialPlaybackComplete, true);
+  assert.equal(restartPlayback(completed).initialPlaybackComplete, true);
+});
+
+test("snaps reduced-motion playback to the nearest authored keyframe", () => {
+  const timeline = {
+    durationMs: 1000,
+    decisionAtMs: 400,
+    keyframes: [
+      { atMs: 0, players: {}, ball: { x: 50, y: 70 } },
+      { atMs: 400, players: {}, ball: { x: 40, y: 60 } },
+      { atMs: 900, players: {}, ball: { x: 30, y: 50 } },
+    ],
+  };
+
+  assert.equal(snapToKeyframe(timeline, -100), 0);
+  assert.equal(snapToKeyframe(timeline, 520), 400);
+  assert.equal(snapToKeyframe(timeline, 800), 900);
+  assert.equal(snapToKeyframe(timeline, 1200), 900);
 });
 
 test("publishes only complete coach-reviewed scenario content", () => {

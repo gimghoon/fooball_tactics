@@ -1,9 +1,15 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import Link from "next/link";
 import type { AttemptInput, CoachExplanation, HighlightRef, Point, PublicScenarioProjection, ScenarioTimeline } from "@/lib/domain/content";
-import { initialExplanationIndex } from "@/lib/domain/timeline";
+import {
+  beginInitialPlayback,
+  completePlayback,
+  initialExplanationIndex,
+  restartPlayback,
+  type PlaybackReviewState,
+} from "@/lib/domain/timeline";
 import { CoachExplanationPanel } from "./CoachExplanationPanel";
 import { ScenarioPlayback } from "./ScenarioPlayback";
 import { TacticalPitch, type TacticalChoice } from "./TacticalPitch";
@@ -18,6 +24,13 @@ type Feedback = {
   recommendedPath?: Point[] | null;
   timeline?: ScenarioTimeline | null;
   explanations?: CoachExplanation[];
+};
+
+const INITIAL_PLAYBACK_STATE: PlaybackReviewState = {
+  currentMs: 0,
+  playing: false,
+  generation: 0,
+  initialPlaybackComplete: false,
 };
 
 function readAuth(): Auth | null {
@@ -40,11 +53,22 @@ export function CampaignPlayer({ campaign, scenarios }: { campaign: { id: string
   const [feedback, setFeedback] = useState<Feedback | null>(null);
   const [saving, setSaving] = useState(false);
   const [reflectionSaved, setReflectionSaved] = useState(false);
-  const [currentMs, setCurrentMs] = useState(0);
-  const [playing, setPlaying] = useState(false);
+  const [playback, setPlayback] = useState<PlaybackReviewState>(INITIAL_PLAYBACK_STATE);
   const [highlights, setHighlights] = useState<HighlightRef[]>([]);
   const scenario = scenarios[index];
   const roleName = { fixo: "픽소", ala: "알라", pivo: "피보", recap: "전체 움직임" }[scenario?.role ?? "fixo"];
+  const setPlaybackMs = useCallback((currentMs: number) => {
+    setPlayback((state) => ({ ...state, currentMs }));
+  }, []);
+  const setPlaybackPlaying = useCallback((playing: boolean) => {
+    setPlayback((state) => ({ ...state, playing }));
+  }, []);
+  const restartReviewedPlayback = useCallback(() => {
+    setPlayback((state) => restartPlayback(state));
+  }, []);
+  const finishReviewedPlayback = useCallback(() => {
+    setPlayback((state) => completePlayback(state));
+  }, []);
 
   useEffect(() => {
     async function flushPending() {
@@ -76,8 +100,7 @@ export function CampaignPlayer({ campaign, scenarios }: { campaign: { id: string
       setFeedback(nextFeedback);
       if (nextFeedback.timeline && nextFeedback.explanations?.length) {
         const initialIndex = initialExplanationIndex(nextFeedback.explanations);
-        setCurrentMs(0);
-        setPlaying(true);
+        setPlayback((state) => beginInitialPlayback(state));
         setHighlights(nextFeedback.explanations[initialIndex].highlights);
       }
     } catch (error) {
@@ -99,13 +122,15 @@ export function CampaignPlayer({ campaign, scenarios }: { campaign: { id: string
   const reviewedTimeline = feedback?.timeline ?? null;
   const reviewedExplanations = feedback?.explanations ?? [];
   const reviewedPlayback = reviewedTimeline !== null && reviewedExplanations.length > 0;
-  const canContinue = feedback !== null && (feedback.correct || reviewedPlayback || feedback.explanation !== null);
+  const reviewedPlaybackReady = reviewedPlayback && playback.initialPlaybackComplete;
+  const canContinue = feedback !== null && (
+    reviewedPlayback ? playback.initialPlaybackComplete : feedback.correct || feedback.explanation !== null
+  );
 
   function nextScenario() {
     setIndex(index + 1);
     setFeedback(null);
-    setCurrentMs(0);
-    setPlaying(false);
+    setPlayback(INITIAL_PLAYBACK_STATE);
     setHighlights([]);
   }
 
@@ -120,10 +145,13 @@ export function CampaignPlayer({ campaign, scenarios }: { campaign: { id: string
           selectedPath={feedback.selectedPath ?? null}
           recommendedPath={feedback.recommendedPath ?? null}
           highlights={highlights}
-          currentMs={currentMs}
-          playing={playing}
-          onCurrentMsChange={setCurrentMs}
-          onPlayingChange={setPlaying}
+          currentMs={playback.currentMs}
+          playing={playback.playing}
+          generation={playback.generation}
+          onCurrentMsChange={setPlaybackMs}
+          onPlayingChange={setPlaybackPlaying}
+          onRestart={restartReviewedPlayback}
+          onPlaybackComplete={finishReviewedPlayback}
         />
       ) : (
         <TacticalPitch key={scenario.id} content={content} disabled={saving} onSubmit={(choice) => { void submit(choice); }} />
@@ -132,11 +160,15 @@ export function CampaignPlayer({ campaign, scenarios }: { campaign: { id: string
         <section className={feedback.correct ? "feedback correct" : "feedback"}>
           <strong>{feedback.correct ? "좋은 선택이에요" : reviewedPlayback || feedback.explanation ? "정답 움직임을 확인하세요" : "한 번 더 생각해볼까요?"}</strong>
           {reviewedPlayback ? (
-            <CoachExplanationPanel
-              explanations={reviewedExplanations}
-              onSeek={(atMs) => { setPlaying(false); setCurrentMs(atMs); }}
-              onHighlightsChange={setHighlights}
-            />
+            reviewedPlaybackReady ? (
+              <CoachExplanationPanel
+                explanations={reviewedExplanations}
+                onSeek={(atMs) => {
+                  setPlayback((state) => ({ ...state, playing: false, currentMs: atMs }));
+                }}
+                onHighlightsChange={setHighlights}
+              />
+            ) : null
           ) : <p>{feedback.explanation ?? feedback.hint}</p>}
           {canContinue && index < scenarios.length - 1 ? <button className="primary-button" onClick={nextScenario}>다음 포지션 →</button> : null}
           {canContinue && index === scenarios.length - 1 ? <div className="reflection-box"><strong>다음 경기 미션</strong><p>공을 받기 전 동료와 상대를 한 번씩 확인하세요. 경기 후 어땠는지 남겨주세요.</p>{reflectionSaved ? <span>회고를 저장했어요 ✓</span> : <div><button onClick={() => void reflect("worked")}>잘 됨</button><button onClick={() => void reflect("difficult")}>어려웠음</button></div>}</div> : null}
