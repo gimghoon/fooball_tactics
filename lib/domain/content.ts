@@ -52,6 +52,7 @@ export type TimelineKeyframe = {
 
 export type ScenarioTimeline = {
   durationMs: number;
+  decisionAtMs: number;
   keyframes: TimelineKeyframe[];
 };
 
@@ -78,9 +79,23 @@ export type PublicScenarioContent = Pick<ScenarioContent, "defenseType" | "actor
   setupTimeline: ScenarioTimeline;
 };
 
+export type LegacyPassScenarioContent = Omit<ScenarioContent, "defenseType"> & {
+  defenseType: null;
+};
+
+export type PublicLegacyScenarioContent = Omit<PublicScenarioContent, "defenseType"> & {
+  defenseType: null;
+};
+
+export type PublicScenarioProjection = PublicScenarioContent | PublicLegacyScenarioContent;
+
 type LegacyPassScenario = {
   pitchJson: string;
   answerJson: string;
+};
+
+type ScenarioContentSource = LegacyPassScenario & {
+  contentJson: string;
 };
 
 const ACTION_TYPES: readonly ActionType[] = ["pass", "dribble", "move"];
@@ -224,6 +239,8 @@ function parseContentObject(input: unknown): ScenarioContent {
 
   if (!isRecord(input.timeline)) fail("timeline이 필요합니다.");
   const durationMs = nonNegativeNumber(input.timeline.durationMs, "timeline.durationMs");
+  const decisionAtMs = finiteNumber(input.timeline.decisionAtMs, "timeline.decisionAtMs");
+  if (decisionAtMs < 0 || decisionAtMs > durationMs) fail("timeline.decisionAtMs가 범위를 벗어났습니다.");
   if (!Array.isArray(input.timeline.keyframes) || input.timeline.keyframes.length === 0) fail("timeline.keyframes가 필요합니다.");
   const keyframes = input.timeline.keyframes.map((value, index) => {
     if (!isRecord(value)) fail(`timeline.keyframes[${index}]가 필요합니다.`);
@@ -240,7 +257,7 @@ function parseContentObject(input: unknown): ScenarioContent {
   for (let index = 1; index < keyframes.length; index += 1) {
     if (keyframes[index].atMs < keyframes[index - 1].atMs) fail("timeline.keyframes 시간이 정렬되지 않았습니다.");
   }
-  const timeline: ScenarioTimeline = { durationMs, keyframes };
+  const timeline: ScenarioTimeline = { durationMs, decisionAtMs, keyframes };
 
   if (!Array.isArray(input.explanations)) fail("explanations가 필요합니다.");
   const explanations = input.explanations.map((value, index) => {
@@ -310,7 +327,7 @@ export function isScenarioPublishable(input: unknown): boolean {
   }
 }
 
-export function adaptLegacyPassScenario({ pitchJson, answerJson }: LegacyPassScenario): ScenarioContent {
+export function adaptLegacyPassScenario({ pitchJson, answerJson }: LegacyPassScenario): LegacyPassScenarioContent {
   let rawPitch: unknown;
   let rawAnswer: unknown;
   try {
@@ -344,7 +361,7 @@ export function adaptLegacyPassScenario({ pitchJson, answerJson }: LegacyPassSce
 
   const targetZone = circleZoneValue(rawAnswer, "기존 문제 answer");
   return {
-    defenseType: "front_press",
+    defenseType: null,
     actorId: actor.id,
     allowedActions: ["pass"],
     pitch: { players, ball, zones: [] },
@@ -353,21 +370,30 @@ export function adaptLegacyPassScenario({ pitchJson, answerJson }: LegacyPassSce
       alternatives: [],
       hazards: [],
     },
-    timeline: { durationMs: 0, keyframes: [{ atMs: 0, players: {}, ball }] },
+    timeline: { durationMs: 0, decisionAtMs: 0, keyframes: [{ atMs: 0, players: {}, ball }] },
     explanations: [],
     review: { sourceReviewed: false, timelineReviewed: false, explanationsReviewed: false },
   };
 }
 
-export function toPublicScenarioContent(content: ScenarioContent): PublicScenarioContent {
+export function toPublicScenarioContent(content: ScenarioContent | LegacyPassScenarioContent): PublicScenarioProjection {
   return {
     defenseType: content.defenseType,
     actorId: content.actorId,
     allowedActions: content.allowedActions,
     pitch: content.pitch,
     setupTimeline: {
-      durationMs: content.timeline.durationMs,
-      keyframes: content.timeline.keyframes.slice(0, 1),
+      durationMs: content.timeline.decisionAtMs,
+      decisionAtMs: content.timeline.decisionAtMs,
+      keyframes: content.timeline.keyframes.filter((keyframe) => keyframe.atMs <= content.timeline.decisionAtMs),
     },
   };
+}
+
+export function serializePublicScenarioContent(source: ScenarioContentSource): string | null {
+  if (source.contentJson === "") {
+    return JSON.stringify(toPublicScenarioContent(adaptLegacyPassScenario(source)));
+  }
+  if (!isScenarioPublishable(source.contentJson)) return null;
+  return JSON.stringify(toPublicScenarioContent(parseScenarioContent(source.contentJson)));
 }

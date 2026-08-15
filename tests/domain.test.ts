@@ -8,6 +8,7 @@ import {
   isScenarioPublishable,
   parseScenarioContent,
   playableScenarios,
+  serializePublicScenarioContent,
   toPublicScenarioContent,
   type ScenarioContent,
 } from "../lib/domain/content.ts";
@@ -36,8 +37,10 @@ const reviewedScenarioContent: ScenarioContent = {
   },
   timeline: {
     durationMs: 2400,
+    decisionAtMs: 1200,
     keyframes: [
       { atMs: 0, players: {}, ball: { x: 50, y: 72 } },
+      { atMs: 1200, players: { "defender-1": { x: 50, y: 65 } }, ball: { x: 50, y: 72 } },
       { atMs: 2400, players: { "defender-1": { x: 50, y: 65 } }, ball: { x: 24, y: 52 } },
     ],
   },
@@ -68,6 +71,10 @@ test("rejects scenario content with unknown references or malformed JSON", () =>
     ...reviewedScenarioContent,
     explanations: [{ ...reviewedScenarioContent.explanations[0], highlights: [{ kind: "player", id: "missing-player" }] }],
   })), /강조 대상/);
+  assert.throws(() => parseScenarioContent({
+    ...reviewedScenarioContent,
+    timeline: { ...reviewedScenarioContent.timeline, decisionAtMs: 2401 },
+  }), /decisionAtMs/);
 });
 
 test("adapts legacy pitch and circle answer JSON to a pass scenario without coach explanations", () => {
@@ -84,6 +91,7 @@ test("adapts legacy pitch and circle answer JSON to a pass scenario without coac
   assert.deepEqual(adapted.answer.preferred.target, { kind: "zone", zone: { kind: "circle", cx: 30, cy: 50, radius: 8 } });
   assert.deepEqual(adapted.explanations, []);
   assert.equal(adapted.review.explanationsReviewed, false);
+  assert.equal(toPublicScenarioContent(adapted).defenseType, null);
 });
 
 test("projects only pre-decision content for a reviewed scenario", () => {
@@ -95,12 +103,34 @@ test("projects only pre-decision content for a reviewed scenario", () => {
     allowedActions: reviewedScenarioContent.allowedActions,
     pitch: reviewedScenarioContent.pitch,
     setupTimeline: {
-      durationMs: reviewedScenarioContent.timeline.durationMs,
-      keyframes: [reviewedScenarioContent.timeline.keyframes[0]],
+      durationMs: reviewedScenarioContent.timeline.decisionAtMs,
+      decisionAtMs: reviewedScenarioContent.timeline.decisionAtMs,
+      keyframes: [reviewedScenarioContent.timeline.keyframes[0], reviewedScenarioContent.timeline.keyframes[1]],
     },
   });
   assert.equal("answer" in publicContent, false);
   assert.equal("review" in publicContent, false);
+});
+
+test("withholds incompletely reviewed structured content while preserving legacy compatibility", () => {
+  for (const reviewFlag of ["sourceReviewed", "timelineReviewed", "explanationsReviewed"] as const) {
+    const structured = serializePublicScenarioContent({
+      contentJson: JSON.stringify({
+        ...reviewedScenarioContent,
+        review: { ...reviewedScenarioContent.review, [reviewFlag]: false },
+      }),
+      pitchJson: JSON.stringify(reviewedScenarioContent.pitch),
+      answerJson: JSON.stringify(reviewedScenarioContent.answer),
+    });
+    assert.equal(structured, null);
+  }
+  const legacy = serializePublicScenarioContent({
+    contentJson: "",
+    pitchJson: JSON.stringify({ players: [], ball: { x: 50, y: 80 } }),
+    answerJson: JSON.stringify({ kind: "circle", cx: 30, cy: 50, radius: 8 }),
+  });
+
+  assert.equal(JSON.parse(legacy ?? "{}").defenseType, null);
 });
 
 test("accepts points inside and on the boundary of a circular answer zone", () => {
