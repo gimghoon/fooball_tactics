@@ -94,6 +94,7 @@ export type ScenarioContent = {
 };
 
 export type PublicScenarioContent = Pick<ScenarioContent, "defenseType" | "actorId" | "allowedActions" | "pitch"> & {
+  passInputMode: "player" | "destination";
   setupTimeline: ScenarioTimeline;
 };
 
@@ -409,6 +410,9 @@ function parseContentObject(input: unknown): ScenarioContent {
       if (highlight.kind === "path" && id !== "selected-path" && id !== "recommended-path") fail(`강조 대상 경로 ${id}가 올바르지 않습니다.`);
       return highlight.kind === "path" ? { kind: "path", id: id as "selected-path" | "recommended-path" } : { kind: highlight.kind, id };
     }) as HighlightRef[];
+    if (value.kind === "observe" && highlights.some((highlight) => highlight.kind === "path" && highlight.id === "recommended-path")) {
+      fail("관찰 설명은 권장 경로를 공개할 수 없습니다.");
+    }
     return { kind: value.kind as ExplanationKind, text, fromMs, toMs, highlights };
   });
   if (explanations.length !== EXPLANATION_KINDS.length || new Set(explanations.map(({ kind }) => kind)).size !== EXPLANATION_KINDS.length) {
@@ -517,11 +521,14 @@ export function adaptLegacyPassScenario({ pitchJson, answerJson }: LegacyPassSce
 }
 
 export function toPublicScenarioContent(content: ScenarioContent | LegacyPassScenarioContent): PublicScenarioProjection {
+  const passAction = [content.answer.preferred, ...content.answer.alternatives]
+    .find((action) => action.actionType === "pass");
   return {
     defenseType: content.defenseType,
     actorId: content.actorId,
     allowedActions: content.allowedActions,
     pitch: content.pitch,
+    passInputMode: passAction?.target.kind === "player" ? "player" : "destination",
     setupTimeline: {
       durationMs: content.timeline.decisionAtMs,
       decisionAtMs: content.timeline.decisionAtMs,

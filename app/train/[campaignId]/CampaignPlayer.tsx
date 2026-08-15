@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useState } from "react";
 import Link from "next/link";
 import type { AttemptInput, CoachExplanation, HighlightRef, Point, PublicScenarioProjection, ScenarioTimeline } from "@/lib/domain/content";
+import { attemptDeliveryDisposition, mergePendingEvents } from "@/lib/domain/offline-queue";
 import {
   beginInitialPlayback,
   completePlayback,
@@ -18,6 +19,7 @@ type Scenario = { id: string; role: "fixo" | "ala" | "pivo" | "recap"; principle
 type Auth = { participantId: string; recoveryToken: string };
 type Feedback = {
   correct: boolean;
+  grade: "preferred" | "alternative" | "incorrect" | null;
   hint: string | null;
   explanation: string | null;
   selectedPath?: Point[] | null;
@@ -46,6 +48,23 @@ function readPendingAttempts(): AttemptInput[] {
   } catch {
     return [];
   }
+}
+
+function storePendingAttempt(event: AttemptInput) {
+  localStorage.setItem(
+    "tactiq-pending-attempts",
+    JSON.stringify(mergePendingEvents(readPendingAttempts(), [event])),
+  );
+}
+
+async function responseError(response: Response): Promise<string> {
+  try {
+    const payload = await response.json() as { error?: unknown };
+    if (typeof payload.error === "string" && payload.error.trim()) return payload.error;
+  } catch {
+    // The HTTP status remains enough to classify this as permanent or retryable.
+  }
+  return `답안을 처리할 수 없어요. (${response.status})`;
 }
 
 export function CampaignPlayer({ campaign, scenarios }: { campaign: { id: string; title: string }; scenarios: Scenario[] }) {
@@ -77,7 +96,7 @@ export function CampaignPlayer({ campaign, scenarios }: { campaign: { id: string
       if (!auth || !pending.length) return;
       for (const event of pending) {
         const response = await fetch("/api/attempts", { method: "POST", headers: { "content-type": "application/json", authorization: `Bearer ${auth.recoveryToken}`, "x-participant-id": auth.participantId }, body: JSON.stringify(event) }).catch(() => null);
-        if (response?.ok) {
+        if (attemptDeliveryDisposition(response?.status ?? null) !== "retry") {
           localStorage.setItem("tactiq-pending-attempts", JSON.stringify(readPendingAttempts().filter((item) => item.eventId !== event.eventId)));
         }
       }
@@ -90,23 +109,36 @@ export function CampaignPlayer({ campaign, scenarios }: { campaign: { id: string
   async function submit(choice: TacticalChoice) {
     if (!scenario || saving) return;
     const auth = readAuth();
-    if (!auth) { setFeedback({ correct: false, hint: "팀방 초대 링크로 입장한 뒤 훈련을 시작해주세요.", explanation: null }); return; }
+    if (!auth) { setFeedback({ correct: false, grade: null, hint: "팀방 초대 링크로 입장한 뒤 훈련을 시작해주세요.", explanation: null }); return; }
     const event: AttemptInput = { eventId: crypto.randomUUID(), scenarioId: scenario.id, ...choice };
     setSaving(true);
     try {
-      const response = await fetch("/api/attempts", { method: "POST", headers: { "content-type": "application/json", authorization: `Bearer ${auth.recoveryToken}`, "x-participant-id": auth.participantId }, body: JSON.stringify(event) });
-      if (!response.ok) throw new Error((await response.json() as { error?: string }).error);
-      const nextFeedback = await response.json() as Feedback;
+      const response = await fetch("/api/attempts", { method: "POST", headers: { "content-type": "application/json", authorization: `Bearer ${auth.recoveryToken}`, "x-participant-id": auth.participantId }, body: JSON.stringify(event) }).catch(() => null);
+      const disposition = attemptDeliveryDisposition(response?.status ?? null);
+      if (disposition === "retry") {
+        storePendingAttempt(event);
+        const message = response ? await responseError(response) : "네트워크에 연결할 수 없어요.";
+        setFeedback({ correct: false, grade: null, hint: `${message} 답안은 기기에 임시 저장했어요.`, explanation: null });
+        return;
+      }
+      if (disposition === "rejected" && response) {
+        setFeedback({ correct: false, grade: null, hint: await responseError(response), explanation: null });
+        return;
+      }
+      if (!response) return;
+      let nextFeedback: Feedback;
+      try {
+        nextFeedback = await response.json() as Feedback;
+      } catch {
+        setFeedback({ correct: false, grade: null, hint: "서버 응답을 읽을 수 없어요.", explanation: null });
+        return;
+      }
       setFeedback(nextFeedback);
       if (nextFeedback.timeline && nextFeedback.explanations?.length) {
         const initialIndex = initialExplanationIndex(nextFeedback.explanations);
         setPlayback((state) => beginInitialPlayback(state));
         setHighlights(nextFeedback.explanations[initialIndex].highlights);
       }
-    } catch (error) {
-      const pending = readPendingAttempts();
-      localStorage.setItem("tactiq-pending-attempts", JSON.stringify([...new Map([...pending, event].map((item) => [item.eventId, item])).values()]));
-      setFeedback({ correct: false, hint: error instanceof Error ? `${error.message} 답안은 기기에 임시 저장했어요.` : "답안을 기기에 임시 저장했어요.", explanation: null });
     } finally { setSaving(false); }
   }
 
@@ -123,6 +155,9 @@ export function CampaignPlayer({ campaign, scenarios }: { campaign: { id: string
   const reviewedExplanations = feedback?.explanations ?? [];
   const reviewedPlayback = reviewedTimeline !== null && reviewedExplanations.length > 0;
   const reviewedPlaybackReady = reviewedPlayback && playback.initialPlaybackComplete;
+  const observeFeedback = !reviewedPlayback
+    ? reviewedExplanations.find((explanation) => explanation.kind === "observe") ?? null
+    : null;
   const canContinue = feedback !== null && (
     reviewedPlayback ? playback.initialPlaybackComplete : feedback.correct || feedback.explanation !== null
   );
@@ -154,11 +189,20 @@ export function CampaignPlayer({ campaign, scenarios }: { campaign: { id: string
           onPlaybackComplete={finishReviewedPlayback}
         />
       ) : (
-        <TacticalPitch key={scenario.id} content={content} disabled={saving} onSubmit={(choice) => { void submit(choice); }} />
+        <TacticalPitch
+          key={scenario.id}
+          content={content}
+          disabled={saving}
+          highlights={observeFeedback?.highlights ?? []}
+          observeText={observeFeedback?.text ?? null}
+          selectedPath={observeFeedback ? feedback?.selectedPath ?? null : null}
+          onSubmit={(choice) => { void submit(choice); }}
+        />
       )}
       {feedback ? (
-        <section className={feedback.correct ? "feedback correct" : "feedback"}>
-          <strong>{feedback.correct ? "좋은 선택이에요" : reviewedPlayback || feedback.explanation ? "정답 움직임을 확인하세요" : "한 번 더 생각해볼까요?"}</strong>
+        <section className={`feedback${feedback.grade === "alternative" ? " alternative" : feedback.correct ? " correct" : ""}`}>
+          <strong>{feedback.grade === "alternative" ? "차선 선택의 트레이드오프" : feedback.correct ? "좋은 선택이에요" : reviewedPlayback || feedback.explanation ? "정답 움직임을 확인하세요" : "한 번 더 생각해볼까요?"}</strong>
+          {feedback.grade === "alternative" && feedback.explanation ? <p className="alternative-reason">{feedback.explanation}</p> : null}
           {reviewedPlayback ? (
             reviewedPlaybackReady ? (
               <CoachExplanationPanel
@@ -169,7 +213,7 @@ export function CampaignPlayer({ campaign, scenarios }: { campaign: { id: string
                 onHighlightsChange={setHighlights}
               />
             ) : null
-          ) : <p>{feedback.explanation ?? feedback.hint}</p>}
+          ) : <p>{observeFeedback?.text ?? feedback.explanation ?? feedback.hint}</p>}
           {canContinue && index < scenarios.length - 1 ? <button className="primary-button" onClick={nextScenario}>다음 포지션 →</button> : null}
           {canContinue && index === scenarios.length - 1 ? <div className="reflection-box"><strong>다음 경기 미션</strong><p>공을 받기 전 동료와 상대를 한 번씩 확인하세요. 경기 후 어땠는지 남겨주세요.</p>{reflectionSaved ? <span>회고를 저장했어요 ✓</span> : <div><button onClick={() => void reflect("worked")}>잘 됨</button><button onClick={() => void reflect("difficult")}>어려웠음</button></div>}</div> : null}
         </section>

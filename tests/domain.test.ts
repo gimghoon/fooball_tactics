@@ -17,11 +17,12 @@ import {
   toPublicScenarioContent,
   type ScenarioContent,
 } from "../lib/domain/content.ts";
-import { mergePendingEvents } from "../lib/domain/offline-queue.ts";
+import { attemptDeliveryDisposition, mergePendingEvents } from "../lib/domain/offline-queue.ts";
 import { advanceRole, evaluateAttempt } from "../lib/domain/session.ts";
 import { createRecoveryToken, hashRecoveryToken, normalizeNickname } from "../lib/domain/identity.ts";
 import { evaluateScenarioAction } from "../lib/domain/scenario-judging.ts";
-import { classifyPlayerTap, playerAriaLabel } from "../lib/domain/tactical-pitch.ts";
+import { classifyPlayerTap, defenseTypeLabel, playerAriaLabel } from "../lib/domain/tactical-pitch.ts";
+import { attemptAnalyticsPoint, buildStructuredAttemptFeedback } from "../lib/domain/attempt-feedback.ts";
 import {
   beginInitialPlayback,
   completePlayback,
@@ -274,6 +275,14 @@ test("rejects semantically unsafe reviewed answers and unusable decision state",
     },
     {
       ...reviewedScenarioContent,
+      explanations: reviewedScenarioContent.explanations.map((explanation, index) => (
+        index === 0
+          ? { ...explanation, highlights: [{ kind: "path", id: "recommended-path" }] }
+          : explanation
+      )),
+    },
+    {
+      ...reviewedScenarioContent,
       timeline: {
         ...reviewedScenarioContent.timeline,
         keyframes: reviewedScenarioContent.timeline.keyframes.filter(({ atMs }) => atMs !== reviewedScenarioContent.timeline.decisionAtMs),
@@ -403,6 +412,7 @@ test("projects only pre-decision content for a reviewed scenario", () => {
     defenseType: reviewedScenarioContent.defenseType,
     actorId: reviewedScenarioContent.actorId,
     allowedActions: reviewedScenarioContent.allowedActions,
+    passInputMode: "player",
     pitch: reviewedScenarioContent.pitch,
     setupTimeline: {
       durationMs: reviewedScenarioContent.timeline.decisionAtMs,
@@ -412,6 +422,24 @@ test("projects only pre-decision content for a reviewed scenario", () => {
   });
   assert.equal("answer" in publicContent, false);
   assert.equal("review" in publicContent, false);
+});
+
+test("publishes a canonical pass input mode for structured zone and legacy answers", () => {
+  const zonePass = toPublicScenarioContent({
+    ...reviewedScenarioContent,
+    answer: {
+      ...reviewedScenarioContent.answer,
+      preferred: { actionType: "pass", target: { kind: "zone", zone: { kind: "circle", cx: 30, cy: 50, radius: 5 } } },
+    },
+  });
+  const legacy = toPublicScenarioContent(adaptLegacyPassScenario({
+    pitchJson: JSON.stringify({ players: [], ball: { x: 50, y: 80 } }),
+    answerJson: JSON.stringify({ kind: "circle", cx: 30, cy: 50, radius: 8 }),
+  }));
+
+  assert.equal(toPublicScenarioContent(reviewedScenarioContent).passInputMode, "player");
+  assert.equal(zonePass.passInputMode, "destination");
+  assert.equal(legacy.passInputMode, "destination");
 });
 
 test("withholds incompletely reviewed structured content while preserving legacy compatibility", () => {
@@ -470,6 +498,19 @@ test("classifies player taps from the actor's team and keeps dribble and move ta
   assert.equal(playerAriaLabel(actor, opponent), "상대 선수 ala-left");
   assert.equal(classifyPlayerTap("dribble", actor, opponent), "destination");
   assert.equal(classifyPlayerTap("move", actor, teammate), "destination");
+});
+
+test("maps all six defense values to stable Korean labels", () => {
+  const cases = [
+    ["front_press", "전방 압박"],
+    ["central_block", "중앙 차단"],
+    ["wide_funnel", "측면 유도"],
+    ["one_v_one", "1대1"],
+    ["numerical_advantage", "수적 우위"],
+    ["numerical_disadvantage", "수적 열세"],
+  ] as const;
+
+  for (const [defenseType, label] of cases) assert.equal(defenseTypeLabel(defenseType), label);
 });
 
 test("projects training props without pre-attempt feedback", () => {
@@ -654,6 +695,67 @@ test("merges offline events idempotently and preserves order", () => {
   );
 
   assert.deepEqual(merged.map((event) => event.eventId), ["a", "b"]);
+});
+
+test("queues only transport failures and retryable server responses", () => {
+  const cases = [
+    [null, "retry"],
+    [200, "accepted"],
+    [409, "rejected"],
+    [422, "rejected"],
+    [500, "retry"],
+    [503, "retry"],
+  ] as const;
+
+  for (const [status, expected] of cases) assert.equal(attemptDeliveryDisposition(status), expected);
+});
+
+test("first miss returns only the authored observe clue and safe setup data", () => {
+  const evaluation = evaluateScenarioAction(reviewedScenarioContent, {
+    actionType: "pass",
+    targetPlayerId: "defender-1",
+  });
+  const feedback = buildStructuredAttemptFeedback(
+    "다시 보세요.",
+    evaluation,
+    reviewedScenarioContent,
+    1,
+    { support: 0 },
+  );
+
+  assert.equal(feedback.correct, false);
+  assert.equal(feedback.timeline, null);
+  assert.equal(feedback.recommendedAction, null);
+  assert.equal(feedback.recommendedPath, null);
+  assert.equal(feedback.explanation, null);
+  assert.deepEqual(feedback.explanations, [reviewedScenarioContent.explanations[0]]);
+  assert.deepEqual(feedback.selectedPath, null);
+});
+
+test("alternative feedback retains its grade and coach-authored tradeoff", () => {
+  const content: ScenarioContent = {
+    ...reviewedScenarioContent,
+    answer: {
+      ...reviewedScenarioContent.answer,
+      alternatives: [{
+        actionType: "pass",
+        target: { kind: "zone", zone: { kind: "circle", cx: 35, cy: 55, radius: 4 } },
+        reason: "검수된 차선 선택 이유",
+      }],
+    },
+  };
+  const evaluation = evaluateScenarioAction(content, { actionType: "pass", destination: { x: 35, y: 55 } });
+  const feedback = buildStructuredAttemptFeedback("다시 보세요.", evaluation, content, 0, { support: 100 });
+
+  assert.equal(feedback.grade, "alternative");
+  assert.equal(feedback.explanation, "검수된 차선 선택 이유");
+  assert.equal(feedback.timeline, content.timeline);
+  assert.deepEqual(feedback.explanations, content.explanations);
+});
+
+test("records tapped player coordinates for an invalid player-target pass", () => {
+  const input = { actionType: "pass" as const, targetPlayerId: "defender-1" };
+  assert.deepEqual(attemptAnalyticsPoint(reviewedScenarioContent, input, null), { x: 50, y: 58 });
 });
 
 test("rotates through fixo, ala, and pivo before the team recap", () => {

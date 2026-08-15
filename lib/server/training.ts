@@ -17,6 +17,10 @@ import {
 } from "@/lib/domain/content";
 import { calculateMastery, type Principle } from "@/lib/domain/mastery";
 import { evaluateScenarioAction, type ActionEvaluation } from "@/lib/domain/scenario-judging";
+import {
+  attemptAnalyticsPoint,
+  buildStructuredAttemptFeedback,
+} from "@/lib/domain/attempt-feedback";
 import { RoomError, authenticateParticipant } from "./rooms";
 
 export type AttemptFeedback = {
@@ -42,44 +46,6 @@ export async function authFromRequest(request: Request) {
 
 function isLegacyAttemptInput(input: ParsedAttemptInput): input is LegacyAttemptInput {
   return !("actionType" in input);
-}
-
-function actionPath(content: ScenarioContent, action: ScenarioAction): Point[] | null {
-  const actor = content.pitch.players.find((player) => player.id === content.actorId);
-  if (!actor) return null;
-  const start = { x: actor.x, y: actor.y };
-  if (action.target.kind === "player") {
-    const target = content.pitch.players.find((player) => player.id === action.target.playerId);
-    return target ? [start, { x: target.x, y: target.y }] : null;
-  }
-  return [start, { x: action.target.zone.cx, y: action.target.zone.cy }];
-}
-
-function touchPoint(input: AttemptInput, selectedPath: Point[] | null): Point {
-  return input.destination ?? selectedPath?.at(-1) ?? { x: 0, y: 0 };
-}
-
-function structuredFeedback(
-  scenario: { hint: string },
-  evaluation: ActionEvaluation,
-  content: ScenarioContent,
-  misses: number,
-  masteryScores: Record<string, number>,
-): AttemptFeedback {
-  const revealResult = evaluation.correct || misses >= 2;
-  const observe = content.explanations.find((explanation) => explanation.kind === "observe");
-  return {
-    correct: evaluation.correct,
-    grade: evaluation.grade,
-    hint: evaluation.correct ? null : scenario.hint,
-    explanation: revealResult ? evaluation.reason : null,
-    selectedPath: evaluation.selectedPath,
-    recommendedAction: revealResult ? evaluation.recommended : null,
-    recommendedPath: revealResult ? actionPath(content, evaluation.recommended) : null,
-    timeline: revealResult ? content.timeline : null,
-    explanations: revealResult ? content.explanations : observe ? [observe] : [],
-    mastery: masteryScores,
-  };
 }
 
 export async function recordAttempt(request: Request, input: ParsedAttemptInput): Promise<AttemptFeedback> {
@@ -131,7 +97,7 @@ export async function recordAttempt(request: Request, input: ParsedAttemptInput)
     actionType = actionInput.actionType;
     targetPlayerId = actionInput.targetPlayerId ?? null;
     selectedPath = evaluation.selectedPath;
-    recordedPoint = touchPoint(actionInput, selectedPath);
+    recordedPoint = attemptAnalyticsPoint(content, actionInput, selectedPath);
   }
 
   if (!existing) {
@@ -171,7 +137,7 @@ export async function recordAttempt(request: Request, input: ParsedAttemptInput)
   for (const [principle, score] of Object.entries(scores)) {
     await db.insert(mastery).values({ participantId: participant.id, principle, score, updatedAt: new Date() }).onConflictDoUpdate({ target: [mastery.participantId, mastery.principle], set: { score, updatedAt: new Date() } }).run();
   }
-  if (content && evaluation) return structuredFeedback(scenario, { ...evaluation, correct }, content, misses, scores);
+  if (content && evaluation) return buildStructuredAttemptFeedback(scenario.hint, { ...evaluation, correct }, content, misses, scores);
   return {
     correct,
     grade: null,
