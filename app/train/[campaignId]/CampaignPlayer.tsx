@@ -2,12 +2,23 @@
 
 import { useEffect, useState } from "react";
 import Link from "next/link";
-import type { AttemptInput, PublicScenarioProjection } from "@/lib/domain/content";
+import type { AttemptInput, CoachExplanation, HighlightRef, Point, PublicScenarioProjection, ScenarioTimeline } from "@/lib/domain/content";
+import { initialExplanationIndex } from "@/lib/domain/timeline";
+import { CoachExplanationPanel } from "./CoachExplanationPanel";
+import { ScenarioPlayback } from "./ScenarioPlayback";
 import { TacticalPitch, type TacticalChoice } from "./TacticalPitch";
 
 type Scenario = { id: string; role: "fixo" | "ala" | "pivo" | "recap"; principle: string; prompt: string; contentJson: string; orderIndex: number };
 type Auth = { participantId: string; recoveryToken: string };
-type Feedback = { correct: boolean; hint: string | null; explanation: string | null };
+type Feedback = {
+  correct: boolean;
+  hint: string | null;
+  explanation: string | null;
+  selectedPath?: Point[] | null;
+  recommendedPath?: Point[] | null;
+  timeline?: ScenarioTimeline | null;
+  explanations?: CoachExplanation[];
+};
 
 function readAuth(): Auth | null {
   if (typeof window === "undefined") return null;
@@ -29,6 +40,9 @@ export function CampaignPlayer({ campaign, scenarios }: { campaign: { id: string
   const [feedback, setFeedback] = useState<Feedback | null>(null);
   const [saving, setSaving] = useState(false);
   const [reflectionSaved, setReflectionSaved] = useState(false);
+  const [currentMs, setCurrentMs] = useState(0);
+  const [playing, setPlaying] = useState(false);
+  const [highlights, setHighlights] = useState<HighlightRef[]>([]);
   const scenario = scenarios[index];
   const roleName = { fixo: "픽소", ala: "알라", pivo: "피보", recap: "전체 움직임" }[scenario?.role ?? "fixo"];
 
@@ -58,7 +72,14 @@ export function CampaignPlayer({ campaign, scenarios }: { campaign: { id: string
     try {
       const response = await fetch("/api/attempts", { method: "POST", headers: { "content-type": "application/json", authorization: `Bearer ${auth.recoveryToken}`, "x-participant-id": auth.participantId }, body: JSON.stringify(event) });
       if (!response.ok) throw new Error((await response.json() as { error?: string }).error);
-      setFeedback(await response.json() as Feedback);
+      const nextFeedback = await response.json() as Feedback;
+      setFeedback(nextFeedback);
+      if (nextFeedback.timeline && nextFeedback.explanations?.length) {
+        const initialIndex = initialExplanationIndex(nextFeedback.explanations);
+        setCurrentMs(0);
+        setPlaying(true);
+        setHighlights(nextFeedback.explanations[initialIndex].highlights);
+      }
     } catch (error) {
       const pending = readPendingAttempts();
       localStorage.setItem("tactiq-pending-attempts", JSON.stringify([...new Map([...pending, event].map((item) => [item.eventId, item])).values()]));
@@ -75,12 +96,52 @@ export function CampaignPlayer({ campaign, scenarios }: { campaign: { id: string
 
   if (!scenario) return <main className="training-screen"><h1>검수된 문제가 아직 없어요.</h1></main>;
   const content = JSON.parse(scenario.contentJson) as PublicScenarioProjection;
+  const reviewedTimeline = feedback?.timeline ?? null;
+  const reviewedExplanations = feedback?.explanations ?? [];
+  const reviewedPlayback = reviewedTimeline !== null && reviewedExplanations.length > 0;
+  const canContinue = feedback !== null && (feedback.correct || reviewedPlayback || feedback.explanation !== null);
+
+  function nextScenario() {
+    setIndex(index + 1);
+    setFeedback(null);
+    setCurrentMs(0);
+    setPlaying(false);
+    setHighlights([]);
+  }
+
   return (
     <main className="training-screen">
       <header className="training-nav"><Link href="/">←</Link><div><span>{campaign.title}</span><strong>{index + 1} / {scenarios.length}</strong></div></header>
       <section className="scenario-copy"><span>{roleName} · {scenario.principle}</span><h1>{scenario.prompt}</h1></section>
-      <TacticalPitch key={scenario.id} content={content} disabled={saving} onSubmit={(choice) => { void submit(choice); }} />
-      {feedback ? <section className={feedback.correct ? "feedback correct" : "feedback"}><strong>{feedback.correct ? "좋은 선택이에요" : feedback.explanation ? "정답 움직임을 확인하세요" : "한 번 더 생각해볼까요?"}</strong><p>{feedback.explanation ?? feedback.hint}</p>{feedback.correct && index < scenarios.length - 1 ? <button className="primary-button" onClick={() => { setIndex(index + 1); setFeedback(null); }}>다음 포지션 →</button> : null}{feedback.correct && index === scenarios.length - 1 ? <div className="reflection-box"><strong>다음 경기 미션</strong><p>공을 받기 전 동료와 상대를 한 번씩 확인하세요. 경기 후 어땠는지 남겨주세요.</p>{reflectionSaved ? <span>회고를 저장했어요 ✓</span> : <div><button onClick={() => void reflect("worked")}>잘 됨</button><button onClick={() => void reflect("difficult")}>어려웠음</button></div>}</div> : null}</section> : null}
+      {reviewedPlayback ? (
+        <ScenarioPlayback
+          pitch={content.pitch}
+          timeline={reviewedTimeline}
+          selectedPath={feedback.selectedPath ?? null}
+          recommendedPath={feedback.recommendedPath ?? null}
+          highlights={highlights}
+          currentMs={currentMs}
+          playing={playing}
+          onCurrentMsChange={setCurrentMs}
+          onPlayingChange={setPlaying}
+        />
+      ) : (
+        <TacticalPitch key={scenario.id} content={content} disabled={saving} onSubmit={(choice) => { void submit(choice); }} />
+      )}
+      {feedback ? (
+        <section className={feedback.correct ? "feedback correct" : "feedback"}>
+          <strong>{feedback.correct ? "좋은 선택이에요" : reviewedPlayback || feedback.explanation ? "정답 움직임을 확인하세요" : "한 번 더 생각해볼까요?"}</strong>
+          {reviewedPlayback ? (
+            <CoachExplanationPanel
+              explanations={reviewedExplanations}
+              onSeek={(atMs) => { setPlaying(false); setCurrentMs(atMs); }}
+              onHighlightsChange={setHighlights}
+            />
+          ) : <p>{feedback.explanation ?? feedback.hint}</p>}
+          {canContinue && index < scenarios.length - 1 ? <button className="primary-button" onClick={nextScenario}>다음 포지션 →</button> : null}
+          {canContinue && index === scenarios.length - 1 ? <div className="reflection-box"><strong>다음 경기 미션</strong><p>공을 받기 전 동료와 상대를 한 번씩 확인하세요. 경기 후 어땠는지 남겨주세요.</p>{reflectionSaved ? <span>회고를 저장했어요 ✓</span> : <div><button onClick={() => void reflect("worked")}>잘 됨</button><button onClick={() => void reflect("difficult")}>어려웠음</button></div>}</div> : null}
+        </section>
+      ) : null}
     </main>
   );
 }

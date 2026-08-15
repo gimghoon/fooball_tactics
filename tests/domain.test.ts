@@ -21,6 +21,7 @@ import { advanceRole, evaluateAttempt } from "../lib/domain/session.ts";
 import { createRecoveryToken, hashRecoveryToken, normalizeNickname } from "../lib/domain/identity.ts";
 import { evaluateScenarioAction } from "../lib/domain/scenario-judging.ts";
 import { classifyPlayerTap, playerAriaLabel } from "../lib/domain/tactical-pitch.ts";
+import { explanationStage, frameAt, initialExplanationIndex } from "../lib/domain/timeline.ts";
 
 const reviewedScenarioContent: ScenarioContent = {
   defenseType: "front_press",
@@ -57,6 +58,81 @@ const reviewedScenarioContent: ScenarioContent = {
   ],
   review: { sourceReviewed: true, timelineReviewed: true, explanationsReviewed: true },
 };
+
+test("returns exact reviewed timeline endpoints", () => {
+  const timeline = {
+    durationMs: 1000,
+    decisionAtMs: 400,
+    keyframes: [
+      { atMs: 0, players: { d1: { x: 20, y: 20 } }, ball: { x: 50, y: 70 } },
+      { atMs: 1000, players: { d1: { x: 40, y: 20 } }, ball: { x: 30, y: 50 } },
+    ],
+  };
+
+  assert.deepEqual(frameAt(timeline, 0), timeline.keyframes[0]);
+  assert.deepEqual(frameAt(timeline, 1000), timeline.keyframes[1]);
+});
+
+test("interpolates reviewed player and ball positions at a deterministic midpoint", () => {
+  const timeline = {
+    durationMs: 1000,
+    decisionAtMs: 400,
+    keyframes: [
+      { atMs: 0, players: { d1: { x: 20, y: 20 } }, ball: { x: 50, y: 70 } },
+      { atMs: 1000, players: { d1: { x: 40, y: 20 } }, ball: { x: 30, y: 50 } },
+    ],
+  };
+
+  assert.deepEqual(frameAt(timeline, 500), {
+    atMs: 500,
+    players: { d1: { x: 30, y: 20 } },
+    ball: { x: 40, y: 60 },
+  });
+});
+
+test("carries the nearest defined player position between sparse keyframes", () => {
+  const timeline = {
+    durationMs: 1000,
+    decisionAtMs: 400,
+    keyframes: [
+      { atMs: 0, players: { d1: { x: 20, y: 20 } }, ball: { x: 50, y: 70 } },
+      { atMs: 1000, players: { d2: { x: 80, y: 20 } }, ball: { x: 30, y: 50 } },
+    ],
+  };
+
+  assert.deepEqual(frameAt(timeline, 500).players, {
+    d1: { x: 20, y: 20 },
+    d2: { x: 80, y: 20 },
+  });
+});
+
+test("clamps timeline playback to its duration without mutating keyframe order", () => {
+  const later = { atMs: 1000, players: { d1: { x: 40, y: 20 } }, ball: { x: 30, y: 50 } };
+  const earlier = { atMs: 0, players: { d1: { x: 20, y: 20 } }, ball: { x: 50, y: 70 } };
+  const timeline = { durationMs: 1000, decisionAtMs: 400, keyframes: [later, earlier] };
+
+  assert.deepEqual(frameAt(timeline, -100), earlier);
+  assert.deepEqual(frameAt(timeline, 1500), later);
+  assert.deepEqual(timeline.keyframes, [later, earlier]);
+});
+
+test("maps every reviewed explanation kind to its intended Korean review stage", () => {
+  assert.deepEqual(
+    ["observe", "benefit", "risk", "remember"].map((kind) => explanationStage(kind as "observe" | "benefit" | "risk" | "remember")),
+    ["상황", "판단", "판단", "결과"],
+  );
+});
+
+test("starts explanation review with the observe block regardless of authored order", () => {
+  const reordered = [
+    reviewedScenarioContent.explanations[2],
+    reviewedScenarioContent.explanations[3],
+    reviewedScenarioContent.explanations[0],
+    reviewedScenarioContent.explanations[1],
+  ];
+
+  assert.equal(initialExplanationIndex(reordered), 2);
+});
 
 test("publishes only complete coach-reviewed scenario content", () => {
   assert.equal(isScenarioPublishable(reviewedScenarioContent), true);

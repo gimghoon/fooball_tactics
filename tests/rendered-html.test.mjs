@@ -21,6 +21,13 @@ async function renderedClientBundles() {
   return Promise.all(bundles.map((entry) => readFile(join(entry.parentPath, entry.name), "utf8")));
 }
 
+async function renderedClientAssets() {
+  const clientRoot = new URL("../dist/client/", import.meta.url);
+  const entries = await readdir(clientRoot, { recursive: true, withFileTypes: true });
+  const assets = entries.filter((entry) => entry.isFile() && /\.(?:css|js)$/.test(entry.name));
+  return Promise.all(assets.map((entry) => readFile(join(entry.parentPath, entry.name), "utf8")));
+}
+
 test("renders the mobile futsal training product shell", async () => {
   const response = await render();
   assert.equal(response.status, 200);
@@ -40,4 +47,17 @@ test("renders action-first tactical controls in the client bundle", async () => 
   assert.match(bundle, /드리블/);
   assert.match(bundle, /이동/);
   assert.match(bundle, /행동을 먼저 고르세요/);
+});
+
+test("renders the three-stage reviewed explanation controls in the client bundle", async () => {
+  const assets = (await renderedClientAssets()).join("\n");
+
+  assert.match(assets, /상황/);
+  assert.match(assets, /판단/);
+  assert.match(assets, /결과/);
+  assert.match(assets, /다시 보기/);
+  assert.match(assets, /일시정지/);
+  assert.match(assets, /playback-seek/);
+  assert.match(assets, /reduced-motion-arrow/);
+  assert.match(assets, /path-endpoint/);
 });
