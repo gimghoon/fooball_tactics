@@ -6,6 +6,7 @@ import { calculateMastery } from "../lib/domain/mastery.ts";
 import {
   adaptLegacyPassScenario,
   isScenarioPublishable,
+  parseAttemptInput,
   parseScenarioContent,
   playableScenarios,
   serializePublicScenarioContent,
@@ -92,6 +93,33 @@ test("adapts legacy pitch and circle answer JSON to a pass scenario without coac
   assert.deepEqual(adapted.explanations, []);
   assert.equal(adapted.review.explanationsReviewed, false);
   assert.equal(toPublicScenarioContent(adapted).defenseType, null);
+});
+
+test("validates action-specific attempt payloads", () => {
+  assert.throws(
+    () => parseAttemptInput({ eventId: "e", scenarioId: "s", actionType: "dribble" }),
+    /도착/,
+  );
+  assert.throws(
+    () => parseAttemptInput({ eventId: "e", scenarioId: "s", actionType: "move", destination: { x: Infinity, y: 50 } }),
+    /유한/,
+  );
+  assert.throws(
+    () => parseAttemptInput({ eventId: "e", scenarioId: "s", actionType: "shoot" }),
+    /행동/,
+  );
+  assert.throws(
+    () => parseAttemptInput({ eventId: "e", scenarioId: "s", actionType: "pass" }),
+    /대상|도착/,
+  );
+  assert.equal(
+    parseAttemptInput({ eventId: "e", scenarioId: "s", actionType: "move", destination: { x: 40, y: 50 } }).actionType,
+    "move",
+  );
+  assert.deepEqual(
+    parseAttemptInput({ eventId: "e", scenarioId: "s", x: 40, y: 50 }),
+    { eventId: "e", scenarioId: "s", x: 40, y: 50 },
+  );
 });
 
 test("projects only pre-decision content for a reviewed scenario", () => {

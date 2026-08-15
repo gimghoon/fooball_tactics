@@ -15,6 +15,20 @@ export type DefenseType =
 export type ExplanationKind = "observe" | "benefit" | "risk" | "remember";
 
 export type Point = { x: number; y: number };
+export type AttemptInput = {
+  eventId: string;
+  scenarioId: string;
+  actionType: ActionType;
+  targetPlayerId?: string;
+  destination?: Point;
+};
+export type LegacyAttemptInput = {
+  eventId: string;
+  scenarioId: string;
+  x: number;
+  y: number;
+};
+export type ParsedAttemptInput = AttemptInput | LegacyAttemptInput;
 export type CircleZone = { kind: "circle"; cx: number; cy: number; radius: number };
 export type PitchPlayer = Point & { id: string; team: "us" | "them" };
 export type PitchState = {
@@ -113,6 +127,10 @@ function fail(message: string): never {
   throw new Error(`시나리오 ${message}`);
 }
 
+function attemptFail(message: string): never {
+  throw new Error(`답안 ${message}`);
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -154,6 +172,48 @@ function circleZoneValue(value: unknown, field: string): CircleZone {
 function actionTypeValue(value: unknown, field: string): ActionType {
   if (!ACTION_TYPES.includes(value as ActionType)) fail(`${field}가 올바르지 않습니다.`);
   return value as ActionType;
+}
+
+function attemptIdValue(value: unknown, field: string): string {
+  if (typeof value !== "string" || value.trim() === "") attemptFail(`${field}이 필요해요.`);
+  return value;
+}
+
+function attemptPointValue(value: unknown): Point {
+  if (!isRecord(value)) attemptFail("도착 지점이 필요해요.");
+  if (typeof value.x !== "number" || !Number.isFinite(value.x) || typeof value.y !== "number" || !Number.isFinite(value.y)) {
+    attemptFail("도착 지점은 유한한 숫자여야 해요.");
+  }
+  return { x: value.x, y: value.y };
+}
+
+/** Parses either the structured action request or the legacy coordinate request. */
+export function parseAttemptInput(input: unknown): ParsedAttemptInput {
+  if (!isRecord(input)) attemptFail("내용이 올바르지 않아요.");
+  const eventId = attemptIdValue(input.eventId, "eventId");
+  const scenarioId = attemptIdValue(input.scenarioId, "scenarioId");
+
+  if (input.actionType === undefined) {
+    if (typeof input.x !== "number" || !Number.isFinite(input.x) || typeof input.y !== "number" || !Number.isFinite(input.y)) {
+      attemptFail("행동 유형 또는 좌표가 필요해요.");
+    }
+    return { eventId, scenarioId, x: input.x, y: input.y };
+  }
+
+  if (!ACTION_TYPES.includes(input.actionType as ActionType)) attemptFail("행동 유형이 올바르지 않아요.");
+  const actionType = input.actionType as ActionType;
+  const targetPlayerId = input.targetPlayerId === undefined
+    ? undefined
+    : attemptIdValue(input.targetPlayerId, "targetPlayerId");
+  const destination = input.destination === undefined ? undefined : attemptPointValue(input.destination);
+
+  if (actionType === "pass" && targetPlayerId === undefined && destination === undefined) {
+    attemptFail("패스 대상 또는 도착 지점이 필요해요.");
+  }
+  if ((actionType === "dribble" || actionType === "move") && destination === undefined) {
+    attemptFail("도착 지점이 필요해요.");
+  }
+  return { eventId, scenarioId, actionType, ...(targetPlayerId === undefined ? {} : { targetPlayerId }), ...(destination === undefined ? {} : { destination }) };
 }
 
 function targetValue(value: unknown, field: string): ScenarioTarget {

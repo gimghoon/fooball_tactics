@@ -2,8 +2,35 @@ import { and, eq, isNull } from "drizzle-orm";
 import { getDb } from "@/db";
 import { attempts, mastery, participants, reflections, rooms, scenarios } from "@/db/schema";
 import { isPointInZone, type CircleZone } from "@/lib/domain/geometry";
+import {
+  adaptLegacyPassScenario,
+  parseScenarioContent,
+  type AttemptInput,
+  type CoachExplanation,
+  type LegacyAttemptInput,
+  type ParsedAttemptInput,
+  type Point,
+  type ScenarioAction,
+  type ScenarioContent,
+  type ScenarioTimeline,
+} from "@/lib/domain/content";
 import { calculateMastery, type Principle } from "@/lib/domain/mastery";
+import { evaluateScenarioAction, type ActionEvaluation } from "@/lib/domain/scenario-judging";
 import { RoomError, authenticateParticipant } from "./rooms";
+
+export type AttemptFeedback = {
+  correct: boolean;
+  grade: "preferred" | "alternative" | "incorrect" | null;
+  hint: string | null;
+  explanation: string | null;
+  selectedPath: Point[] | null;
+  recommendedAction: ScenarioAction | null;
+  recommendedPath: Point[] | null;
+  timeline: ScenarioTimeline | null;
+  explanations: CoachExplanation[];
+  mastery: Record<string, number>;
+  answer?: CircleZone | null;
+};
 
 export async function authFromRequest(request: Request) {
   const participantId = request.headers.get("x-participant-id") ?? "";
@@ -12,14 +39,141 @@ export async function authFromRequest(request: Request) {
   return authenticateParticipant(participantId, token);
 }
 
-export async function recordAttempt(request: Request, input: { eventId: string; scenarioId: string; x: number; y: number }) {
+function isLegacyAttemptInput(input: ParsedAttemptInput): input is LegacyAttemptInput {
+  return !("actionType" in input);
+}
+
+function actionPath(content: ScenarioContent, action: ScenarioAction): Point[] | null {
+  const actor = content.pitch.players.find((player) => player.id === content.actorId);
+  if (!actor) return null;
+  const start = { x: actor.x, y: actor.y };
+  if (action.target.kind === "player") {
+    const target = content.pitch.players.find((player) => player.id === action.target.playerId);
+    return target ? [start, { x: target.x, y: target.y }] : null;
+  }
+  return [start, { x: action.target.zone.cx, y: action.target.zone.cy }];
+}
+
+function touchPoint(input: AttemptInput, selectedPath: Point[] | null): Point {
+  return input.destination ?? selectedPath?.at(-1) ?? { x: 0, y: 0 };
+}
+
+type StoredAttempt = {
+  eventId: string;
+  participantId: string;
+  scenarioId: string;
+  correct: boolean;
+  actionType: AttemptInput["actionType"];
+  targetPlayerId: string | null;
+  touchX: number;
+  touchY: number;
+};
+
+function storedStructuredInput(input: AttemptInput, attempt: StoredAttempt): AttemptInput {
+  const base = { eventId: input.eventId, scenarioId: input.scenarioId, actionType: attempt.actionType };
+  if (attempt.actionType === "pass" && attempt.targetPlayerId !== null) {
+    return { ...base, targetPlayerId: attempt.targetPlayerId };
+  }
+  return { ...base, destination: { x: attempt.touchX / 100, y: attempt.touchY / 100 } };
+}
+
+function structuredFeedback(
+  scenario: { hint: string },
+  evaluation: ActionEvaluation,
+  content: ScenarioContent,
+  misses: number,
+  masteryScores: Record<string, number>,
+): AttemptFeedback {
+  const revealResult = evaluation.correct || misses >= 2;
+  const observe = content.explanations.find((explanation) => explanation.kind === "observe");
+  return {
+    correct: evaluation.correct,
+    grade: evaluation.grade,
+    hint: evaluation.correct ? null : scenario.hint,
+    explanation: revealResult ? evaluation.reason : null,
+    selectedPath: evaluation.selectedPath,
+    recommendedAction: revealResult ? evaluation.recommended : null,
+    recommendedPath: revealResult ? actionPath(content, evaluation.recommended) : null,
+    timeline: revealResult ? content.timeline : null,
+    explanations: revealResult ? content.explanations : observe ? [observe] : [],
+    mastery: masteryScores,
+  };
+}
+
+export async function recordAttempt(request: Request, input: ParsedAttemptInput): Promise<AttemptFeedback> {
   const participant = await authFromRequest(request);
   const db = getDb();
   const scenario = await db.select().from(scenarios).where(and(eq(scenarios.id, input.scenarioId), eq(scenarios.reviewStatus, "reviewed"))).get();
   if (!scenario) throw new RoomError("검수되지 않은 문제에는 답안을 제출할 수 없어요.", 409);
-  const zone = JSON.parse(scenario.answerJson) as CircleZone;
-  const correct = isPointInZone({ x: input.x, y: input.y }, zone);
-  await db.insert(attempts).values({ eventId: input.eventId, participantId: participant.id, scenarioId: scenario.id, principle: scenario.principle, correct, touchX: Math.round(input.x * 100), touchY: Math.round(input.y * 100), createdAt: new Date() }).onConflictDoNothing().run();
+  const existing = await db.select().from(attempts).where(eq(attempts.eventId, input.eventId)).get();
+  if (existing && (existing.participantId !== participant.id || existing.scenarioId !== scenario.id)) {
+    throw new RoomError("이미 사용된 답안 ID예요.", 409);
+  }
+
+  let correct: boolean;
+  let evaluation: ActionEvaluation | null = null;
+  let content: ScenarioContent | null = null;
+  let zone: CircleZone | null = null;
+  let actionType: AttemptInput["actionType"] = "pass";
+  let targetPlayerId: string | null = null;
+  let selectedPath: Point[] | null = null;
+  let recordedPoint: Point;
+
+  if (scenario.contentJson === "") {
+    const legacy = adaptLegacyPassScenario(scenario);
+    if (legacy.answer.preferred.target.kind !== "zone") throw new RoomError("기존 문제 답안을 확인할 수 없어요.", 409);
+    zone = legacy.answer.preferred.target.zone;
+    if (isLegacyAttemptInput(input)) {
+      recordedPoint = { x: input.x, y: input.y };
+    } else {
+      if (input.actionType !== "pass" || input.destination === undefined) {
+        throw new RoomError("기존 문제는 패스 도착 지점으로 제출해주세요.", 400);
+      }
+      actionType = input.actionType;
+      targetPlayerId = input.targetPlayerId ?? null;
+      recordedPoint = input.destination;
+    }
+    if (existing) recordedPoint = { x: existing.touchX / 100, y: existing.touchY / 100 };
+    correct = existing?.correct ?? isPointInZone(recordedPoint, zone);
+  } else {
+    if (isLegacyAttemptInput(input)) throw new RoomError("행동 유형을 포함해 답안을 제출해주세요.", 400);
+    content = parseScenarioContent(scenario.contentJson);
+    if (!content.review.sourceReviewed || !content.review.timelineReviewed || !content.review.explanationsReviewed) {
+      throw new RoomError("검수가 완료되지 않은 문제에는 답안을 제출할 수 없어요.", 409);
+    }
+    const actionInput = existing ? storedStructuredInput(input, existing) : input;
+    evaluation = evaluateScenarioAction(content, actionInput);
+    correct = existing?.correct ?? evaluation.correct;
+    actionType = actionInput.actionType;
+    targetPlayerId = actionInput.targetPlayerId ?? null;
+    selectedPath = evaluation.selectedPath;
+    recordedPoint = touchPoint(actionInput, selectedPath);
+  }
+
+  if (!existing) {
+    await db.insert(attempts).values({
+      eventId: input.eventId,
+      participantId: participant.id,
+      scenarioId: scenario.id,
+      principle: scenario.principle,
+      correct,
+      touchX: Math.round(recordedPoint.x * 100),
+      touchY: Math.round(recordedPoint.y * 100),
+      actionType,
+      targetPlayerId,
+      pathJson: selectedPath === null ? null : JSON.stringify(selectedPath),
+      createdAt: new Date(),
+    }).onConflictDoNothing().run();
+  }
+  const persisted = await db.select().from(attempts).where(eq(attempts.eventId, input.eventId)).get();
+  if (!persisted || persisted.participantId !== participant.id || persisted.scenarioId !== scenario.id) {
+    throw new RoomError("이미 사용된 답안 ID예요.", 409);
+  }
+  correct = persisted.correct;
+  if (content && !isLegacyAttemptInput(input)) {
+    evaluation = evaluateScenarioAction(content, storedStructuredInput(input, persisted));
+    selectedPath = evaluation.selectedPath;
+  }
   if (correct) await db.update(participants).set({ completedStage: scenario.role }).where(eq(participants.id, participant.id)).run();
 
   const scenarioAttempts = await db.select({ correct: attempts.correct }).from(attempts).where(and(eq(attempts.participantId, participant.id), eq(attempts.scenarioId, scenario.id))).all();
@@ -30,7 +184,20 @@ export async function recordAttempt(request: Request, input: { eventId: string; 
   for (const [principle, score] of Object.entries(scores)) {
     await db.insert(mastery).values({ participantId: participant.id, principle, score, updatedAt: new Date() }).onConflictDoUpdate({ target: [mastery.participantId, mastery.principle], set: { score, updatedAt: new Date() } }).run();
   }
-  return { correct, hint: correct ? null : scenario.hint, explanation: correct || misses >= 2 ? scenario.explanation : null, answer: !correct && misses >= 2 ? zone : null, mastery: scores };
+  if (content && evaluation) return structuredFeedback(scenario, { ...evaluation, correct }, content, misses, scores);
+  return {
+    correct,
+    grade: null,
+    hint: correct ? null : scenario.hint,
+    explanation: correct || misses >= 2 ? scenario.explanation : null,
+    selectedPath: null,
+    recommendedAction: null,
+    recommendedPath: null,
+    timeline: null,
+    explanations: [],
+    answer: !correct && misses >= 2 ? zone : null,
+    mastery: scores,
+  };
 }
 
 export async function teamProgress(request: Request, inviteCode: string) {
