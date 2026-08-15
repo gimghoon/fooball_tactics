@@ -6,9 +6,11 @@ import { calculateMastery } from "../lib/domain/mastery.ts";
 import {
   adaptLegacyPassScenario,
   isScenarioPublishable,
+  mapAttemptInputError,
   parseAttemptInput,
   parseScenarioContent,
   playableScenarios,
+  reconstructAttemptInput,
   serializePublicScenarioContent,
   toPublicScenarioContent,
   type ScenarioContent,
@@ -122,6 +124,18 @@ test("validates action-specific attempt payloads", () => {
   );
 });
 
+test("maps invalid attempt payloads to a bad-request response", () => {
+  let invalid: unknown;
+  try {
+    parseAttemptInput({ eventId: "", scenarioId: "s", actionType: "move", destination: { x: 40, y: 50 } });
+  } catch (error) {
+    invalid = error;
+  }
+
+  assert.deepEqual(mapAttemptInputError(invalid), { error: "답안 eventId이 필요해요.", status: 400 });
+  assert.equal(mapAttemptInputError(new Error("database failed")), null);
+});
+
 test("projects only pre-decision content for a reviewed scenario", () => {
   const publicContent = toPublicScenarioContent(reviewedScenarioContent);
 
@@ -196,6 +210,58 @@ test("judges a pass by action type and teammate target", () => {
     recommended: reviewedScenarioContent.answer.preferred,
     reason: null,
   });
+});
+
+test("judges a pass by destination when the reviewed target is a zone", () => {
+  const zonePassContent: ScenarioContent = {
+    ...reviewedScenarioContent,
+    allowedActions: ["pass"],
+    answer: {
+      preferred: { actionType: "pass", target: { kind: "zone", zone: { kind: "circle", cx: 30, cy: 50, radius: 5 } } },
+      alternatives: [],
+      hazards: [],
+    },
+  };
+
+  assert.deepEqual(
+    evaluateScenarioAction(zonePassContent, { actionType: "pass", destination: { x: 30, y: 50 } }),
+    {
+      correct: true,
+      grade: "preferred",
+      selectedPath: [{ x: 50, y: 72 }, { x: 30, y: 50 }],
+      recommended: zonePassContent.answer.preferred,
+      reason: null,
+    },
+  );
+});
+
+test("reconstructs retries from the exact persisted path instead of rounded coordinates", () => {
+  const boundaryContent: ScenarioContent = {
+    ...reviewedScenarioContent,
+    allowedActions: ["dribble"],
+    answer: {
+      preferred: { actionType: "dribble", target: { kind: "zone", zone: { kind: "circle", cx: 60, cy: 72, radius: 10 } } },
+      alternatives: [],
+      hazards: [],
+    },
+  };
+  const reconstructed = reconstructAttemptInput(
+    { eventId: "event", scenarioId: "scenario" },
+    {
+      actionType: "dribble",
+      targetPlayerId: null,
+      pathJson: JSON.stringify([{ x: 50, y: 72 }, { x: 70.004, y: 72 }]),
+    },
+  );
+
+  assert.deepEqual(reconstructed, {
+    eventId: "event",
+    scenarioId: "scenario",
+    actionType: "dribble",
+    destination: { x: 70.004, y: 72 },
+  });
+  assert.equal(evaluateScenarioAction(boundaryContent, reconstructed).correct, false);
+  assert.equal(evaluateScenarioAction(boundaryContent, { ...reconstructed, destination: { x: 70, y: 72 } }).correct, true);
 });
 
 test("requires a pass target to share the actor's team", () => {

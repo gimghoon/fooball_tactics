@@ -29,6 +29,10 @@ export type LegacyAttemptInput = {
   y: number;
 };
 export type ParsedAttemptInput = AttemptInput | LegacyAttemptInput;
+export type PersistedAttemptChoice = Pick<AttemptInput, "actionType"> & {
+  targetPlayerId: string | null;
+  pathJson: string | null;
+};
 export type CircleZone = { kind: "circle"; cx: number; cy: number; radius: number };
 export type PitchPlayer = Point & { id: string; team: "us" | "them" };
 export type PitchState = {
@@ -127,8 +131,10 @@ function fail(message: string): never {
   throw new Error(`시나리오 ${message}`);
 }
 
+export class AttemptInputError extends Error {}
+
 function attemptFail(message: string): never {
-  throw new Error(`답안 ${message}`);
+  throw new AttemptInputError(`답안 ${message}`);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -214,6 +220,37 @@ export function parseAttemptInput(input: unknown): ParsedAttemptInput {
     attemptFail("도착 지점이 필요해요.");
   }
   return { eventId, scenarioId, actionType, ...(targetPlayerId === undefined ? {} : { targetPlayerId }), ...(destination === undefined ? {} : { destination }) };
+}
+
+export function mapAttemptInputError(error: unknown): { error: string; status: 400 } | null {
+  return error instanceof AttemptInputError ? { error: error.message, status: 400 } : null;
+}
+
+function persistedPathEndpoint(pathJson: string | null): Point {
+  if (pathJson === null) throw new Error("저장된 답안 경로가 없어요.");
+  try {
+    const path = JSON.parse(pathJson);
+    if (!Array.isArray(path) || path.length < 2) throw new Error();
+    const endpoint = path.at(-1);
+    if (!isRecord(endpoint) || typeof endpoint.x !== "number" || !Number.isFinite(endpoint.x) || typeof endpoint.y !== "number" || !Number.isFinite(endpoint.y)) {
+      throw new Error();
+    }
+    return { x: endpoint.x, y: endpoint.y };
+  } catch {
+    throw new Error("저장된 답안 경로가 올바르지 않아요.");
+  }
+}
+
+/** Rebuilds a structured retry strictly from the choice persisted with its event ID. */
+export function reconstructAttemptInput(
+  identity: Pick<AttemptInput, "eventId" | "scenarioId">,
+  choice: PersistedAttemptChoice,
+): AttemptInput {
+  const base = { ...identity, actionType: choice.actionType };
+  if (choice.actionType === "pass" && choice.targetPlayerId !== null) {
+    return { ...base, targetPlayerId: choice.targetPlayerId };
+  }
+  return { ...base, destination: persistedPathEndpoint(choice.pathJson) };
 }
 
 function targetValue(value: unknown, field: string): ScenarioTarget {

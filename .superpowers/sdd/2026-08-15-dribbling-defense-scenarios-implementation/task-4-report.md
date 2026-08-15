@@ -37,3 +37,64 @@
 ## Concerns
 
 - No route-level database integration test exists in the repository; behavior was verified through pure-domain tests, production build/type checking, linting, rendered HTML coverage, and code review.
+
+## Fix round 1/5
+
+### Changes
+
+- `evaluateScenarioAction` now supports a `pass` action whose reviewed target is a zone: a finite submitted destination must be inside that zone, and its selected path runs from the actor to that exact point.
+- Attempt-input failures now use `AttemptInputError`; the attempts route consumes the tested `mapAttemptInputError` result and returns `{ error }` with HTTP 400 instead of passing invalid requests to the generic HTTP-500 mapper.
+- Structured retries are reconstructed from the persisted `actionType`, `targetPlayerId`, and exact final point in `pathJson`. The rounded `touchX`/`touchY` analytics columns are no longer used to re-evaluate a stored structured action. A malformed or missing persisted structured path is rejected instead of trusting a changed retry body.
+
+### TDD evidence
+
+#### RED
+
+```text
+node --experimental-strip-types --test --test-name-pattern='bad-request|destination when|exact persisted' tests/domain.test.ts
+```
+
+Result: failed during test-module loading because `mapAttemptInputError` did not exist. The same test patch also specified the missing zone-pass and exact-path reconstruction behavior.
+
+#### GREEN
+
+```text
+node --experimental-strip-types --test --test-name-pattern='bad-request|destination when|exact persisted' tests/domain.test.ts
+```
+
+Result: 3 passed / 0 failed:
+
+- invalid request maps to `{ status: 400 }`;
+- a pass to a reviewed zone is correct and yields its path;
+- a persisted `{ x: 70.004 }` endpoint remains incorrect against a radius-10 boundary even though rounded `{ x: 70 }` would become correct.
+
+### Verification
+
+```text
+node --experimental-strip-types --test tests/domain.test.ts
+```
+
+Result: 22 passed / 0 failed.
+
+```text
+npm test
+```
+
+Result: 22 domain tests passed, production build passed, and rendered HTML test passed. The build emitted only the existing Node `DEP0205` deprecation warning.
+
+```text
+npm run lint
+git diff --check
+```
+
+Result: both commands exited 0.
+
+### Self-review
+
+- Confirmed the actual attempts route consumes the tested 400 mapper before the generic `jsonError` fallback.
+- Confirmed stored structured choices never fall back to a changed retry body; `pathJson` supplies the destination on every reload.
+- Confirmed the regression test exercises the classification change caused specifically by two-decimal coordinate rounding.
+
+### Concerns
+
+- The application has no D1 harness for a full HTTP/database retry test; the pure reconstruction contract covers the canonical persisted-choice boundary used by `recordAttempt`.

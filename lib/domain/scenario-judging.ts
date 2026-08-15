@@ -41,7 +41,7 @@ function selectedPath(content: ScenarioContent, input: ScenarioActionInput): Poi
     const target = content.pitch.players.find(
       (player) => player.id === input.targetPlayerId && player.team === actor.team && player.id !== actor.id,
     );
-    return target ? [{ x: actor.x, y: actor.y }, { x: target.x, y: target.y }] : null;
+    if (target) return [{ x: actor.x, y: actor.y }, { x: target.x, y: target.y }];
   }
 
   return isFinitePoint(input.destination)
@@ -57,11 +57,10 @@ function actionMatches(
   if (action.actionType !== input.actionType || !content.allowedActions.includes(input.actionType)) return false;
 
   if (input.actionType === "pass") {
-    return (
-      action.target.kind === "player" &&
-      action.target.playerId === input.targetPlayerId &&
-      isTeammate(content, input.targetPlayerId)
-    );
+    if (action.target.kind === "player") {
+      return action.target.playerId === input.targetPlayerId && isTeammate(content, input.targetPlayerId);
+    }
+    return isFinitePoint(input.destination) && isPointInZone(input.destination, action.target.zone);
   }
 
   return action.target.kind === "zone" && isFinitePoint(input.destination) && isPointInZone(input.destination, action.target.zone);

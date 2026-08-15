@@ -5,6 +5,7 @@ import { isPointInZone, type CircleZone } from "@/lib/domain/geometry";
 import {
   adaptLegacyPassScenario,
   parseScenarioContent,
+  reconstructAttemptInput,
   type AttemptInput,
   type CoachExplanation,
   type LegacyAttemptInput,
@@ -56,25 +57,6 @@ function actionPath(content: ScenarioContent, action: ScenarioAction): Point[] |
 
 function touchPoint(input: AttemptInput, selectedPath: Point[] | null): Point {
   return input.destination ?? selectedPath?.at(-1) ?? { x: 0, y: 0 };
-}
-
-type StoredAttempt = {
-  eventId: string;
-  participantId: string;
-  scenarioId: string;
-  correct: boolean;
-  actionType: AttemptInput["actionType"];
-  targetPlayerId: string | null;
-  touchX: number;
-  touchY: number;
-};
-
-function storedStructuredInput(input: AttemptInput, attempt: StoredAttempt): AttemptInput {
-  const base = { eventId: input.eventId, scenarioId: input.scenarioId, actionType: attempt.actionType };
-  if (attempt.actionType === "pass" && attempt.targetPlayerId !== null) {
-    return { ...base, targetPlayerId: attempt.targetPlayerId };
-  }
-  return { ...base, destination: { x: attempt.touchX / 100, y: attempt.touchY / 100 } };
 }
 
 function structuredFeedback(
@@ -141,7 +123,9 @@ export async function recordAttempt(request: Request, input: ParsedAttemptInput)
     if (!content.review.sourceReviewed || !content.review.timelineReviewed || !content.review.explanationsReviewed) {
       throw new RoomError("검수가 완료되지 않은 문제에는 답안을 제출할 수 없어요.", 409);
     }
-    const actionInput = existing ? storedStructuredInput(input, existing) : input;
+    const actionInput = existing
+      ? reconstructAttemptInput({ eventId: input.eventId, scenarioId: input.scenarioId }, existing)
+      : input;
     evaluation = evaluateScenarioAction(content, actionInput);
     correct = existing?.correct ?? evaluation.correct;
     actionType = actionInput.actionType;
@@ -171,7 +155,10 @@ export async function recordAttempt(request: Request, input: ParsedAttemptInput)
   }
   correct = persisted.correct;
   if (content && !isLegacyAttemptInput(input)) {
-    evaluation = evaluateScenarioAction(content, storedStructuredInput(input, persisted));
+    evaluation = evaluateScenarioAction(
+      content,
+      reconstructAttemptInput({ eventId: input.eventId, scenarioId: input.scenarioId }, persisted),
+    );
     selectedPath = evaluation.selectedPath;
   }
   if (correct) await db.update(participants).set({ completedStage: scenario.role }).where(eq(participants.id, participant.id)).run();
