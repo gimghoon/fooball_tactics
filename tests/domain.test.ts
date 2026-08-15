@@ -231,6 +231,62 @@ test("publishes only complete coach-reviewed scenario content", () => {
   }), false);
 });
 
+test("rejects semantically unsafe reviewed answers and unusable decision state", () => {
+  const invalidContents: unknown[] = [
+    {
+      ...reviewedScenarioContent,
+      allowedActions: ["dribble"],
+    },
+    {
+      ...reviewedScenarioContent,
+      answer: {
+        ...reviewedScenarioContent.answer,
+        preferred: { actionType: "pass", target: { kind: "player", playerId: "defender-1" } },
+      },
+    },
+    {
+      ...reviewedScenarioContent,
+      answer: {
+        ...reviewedScenarioContent.answer,
+        preferred: { actionType: "pass", target: { kind: "player", playerId: "fixo-1" } },
+      },
+    },
+    {
+      ...reviewedScenarioContent,
+      allowedActions: ["dribble"],
+      answer: {
+        ...reviewedScenarioContent.answer,
+        preferred: { actionType: "dribble", target: { kind: "player", playerId: "ala-left" } },
+      },
+    },
+    {
+      ...reviewedScenarioContent,
+      answer: {
+        ...reviewedScenarioContent.answer,
+        alternatives: [{ actionType: "pass", target: { kind: "player", playerId: "ala-left" } }],
+      },
+    },
+    {
+      ...reviewedScenarioContent,
+      explanations: reviewedScenarioContent.explanations.map((explanation, index) => (
+        index === 0 ? { ...explanation, highlights: [] } : explanation
+      )),
+    },
+    {
+      ...reviewedScenarioContent,
+      timeline: {
+        ...reviewedScenarioContent.timeline,
+        keyframes: reviewedScenarioContent.timeline.keyframes.filter(({ atMs }) => atMs !== reviewedScenarioContent.timeline.decisionAtMs),
+      },
+    },
+  ];
+
+  for (const content of invalidContents) {
+    assert.equal(isScenarioPublishable(content), false);
+    assert.throws(() => assertReviewTransition("reviewed", content));
+  }
+});
+
 test("blocks publication until content and all review dimensions are complete", () => {
   assert.doesNotThrow(() => assertReviewTransition("pending", {
     ...reviewedScenarioContent,

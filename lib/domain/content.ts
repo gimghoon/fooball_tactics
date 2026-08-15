@@ -344,8 +344,20 @@ function parseContentObject(input: unknown): ScenarioContent {
   };
   const actions = [answer.preferred, ...answer.alternatives];
   for (const [index, action] of actions.entries()) {
-    if (action.target.kind === "player" && !playerIds.has(action.target.playerId)) {
-      fail(`answer[${index}]의 선수가 존재하지 않습니다.`);
+    if (!allowedActions.includes(action.actionType)) {
+      fail(`answer[${index}]의 행동이 허용 행동에 없습니다.`);
+    }
+    if (index > 0 && action.reason === undefined) {
+      fail(`answer.alternatives[${index - 1}].reason이 필요합니다.`);
+    }
+    if (action.target.kind === "player") {
+      if (!playerIds.has(action.target.playerId)) fail(`answer[${index}]의 선수가 존재하지 않습니다.`);
+      if (action.actionType !== "pass") fail(`answer[${index}]의 선수 대상은 패스에만 사용할 수 있습니다.`);
+      const actor = players.find((player) => player.id === actorId)!;
+      const target = players.find((player) => player.id === action.target.playerId)!;
+      if (target.id === actor.id || target.team !== actor.team) {
+        fail(`answer[${index}]의 패스 대상은 같은 팀 동료여야 합니다.`);
+      }
     }
     if (action.target.kind === "zone" && (action.target.zone.radius < 0 || !Number.isFinite(action.target.zone.radius))) {
       fail(`answer[${index}]의 영역이 올바르지 않습니다.`);
@@ -372,6 +384,9 @@ function parseContentObject(input: unknown): ScenarioContent {
   for (let index = 1; index < keyframes.length; index += 1) {
     if (keyframes[index].atMs < keyframes[index - 1].atMs) fail("timeline.keyframes 시간이 정렬되지 않았습니다.");
   }
+  if (!keyframes.some(({ atMs }) => atMs === decisionAtMs)) {
+    fail("timeline에 판단 시점 키프레임이 필요합니다.");
+  }
   const timeline: ScenarioTimeline = { durationMs, decisionAtMs, keyframes };
 
   if (!Array.isArray(input.explanations)) fail("explanations가 필요합니다.");
@@ -383,7 +398,7 @@ function parseContentObject(input: unknown): ScenarioContent {
     const fromMs = finiteNumber(value.fromMs, `explanations[${index}].fromMs`);
     const toMs = finiteNumber(value.toMs, `explanations[${index}].toMs`);
     if (fromMs < 0 || fromMs > toMs || toMs > durationMs) fail(`explanations[${index}] 시간 범위가 올바르지 않습니다.`);
-    if (!Array.isArray(value.highlights)) fail(`explanations[${index}].highlights가 필요합니다.`);
+    if (!Array.isArray(value.highlights) || value.highlights.length === 0) fail(`explanations[${index}].highlights가 필요합니다.`);
     const highlights = value.highlights.map((highlight, highlightIndex) => {
       if (!isRecord(highlight) || (highlight.kind !== "player" && highlight.kind !== "zone" && highlight.kind !== "path")) {
         fail(`explanations[${index}].highlights[${highlightIndex}]가 올바르지 않습니다.`);
