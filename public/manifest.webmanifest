@@ -1,0 +1,10 @@
+{
+  "name": "TACTIQ 풋살 전술 훈련",
+  "short_name": "TACTIQ",
+  "description": "친구들과 함께 익히는 풋살 전술 훈련",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#f4f1e8",
+  "theme_color": "#10231c",
+  "orientation": "portrait"
+}
