@@ -114,6 +114,10 @@ test("validates action-specific attempt payloads", () => {
     () => parseAttemptInput({ eventId: "e", scenarioId: "s", actionType: "pass" }),
     /대상|도착/,
   );
+  assert.throws(
+    () => parseAttemptInput({ eventId: "e", scenarioId: "s", actionType: "pass", targetPlayerId: "ala-left", destination: { x: 30, y: 50 } }),
+    /하나만/,
+  );
   assert.equal(
     parseAttemptInput({ eventId: "e", scenarioId: "s", actionType: "move", destination: { x: 40, y: 50 } }).actionType,
     "move",

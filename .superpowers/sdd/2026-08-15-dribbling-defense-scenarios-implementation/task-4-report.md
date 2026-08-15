@@ -98,3 +98,47 @@ Result: both commands exited 0.
 ### Concerns
 
 - The application has no D1 harness for a full HTTP/database retry test; the pure reconstruction contract covers the canonical persisted-choice boundary used by `recordAttempt`.
+
+## Fix round 2/5
+
+### Change
+
+- Pass submissions now require exactly one selection representation: `targetPlayerId` XOR `destination`. A payload containing both raises `AttemptInputError`, which the attempts route maps to HTTP 400. This keeps evaluation, selected-path persistence, and retry reconstruction aligned on one canonical pass choice.
+
+### TDD evidence
+
+#### RED
+
+```text
+node --experimental-strip-types --test --test-name-pattern='attempt payloads' tests/domain.test.ts
+```
+
+Result: 1 failed / 1 passed. `validates action-specific attempt payloads` failed with `Missing expected exception` for a pass carrying both `targetPlayerId` and `destination`.
+
+#### GREEN
+
+```text
+node --experimental-strip-types --test --test-name-pattern='attempt payloads' tests/domain.test.ts
+```
+
+Result: 2 passed / 0 failed. The dual-field pass is rejected with an error containing `하나만`.
+
+### Verification
+
+```text
+node --experimental-strip-types --test tests/domain.test.ts
+npm test
+npm run lint
+git diff --check
+```
+
+Result: 22 domain tests passed; `npm test` passed its domain tests, production build, and rendered HTML test; lint and diff checks exited 0. The build emitted only the existing Node `DEP0205` deprecation warning.
+
+### Self-review
+
+- Confirmed the XOR invariant applies before route evaluation and is carried by the existing HTTP-400 mapper.
+- Confirmed the zone-pass regression remains covered by the destination-only form and teammate passes remain covered by the target-only form.
+
+### Concerns
+
+- No D1-backed HTTP test harness exists; parser tests exercise the exact boundary that prevents ambiguous submissions.

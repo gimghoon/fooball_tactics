@@ -213,8 +213,8 @@ export function parseAttemptInput(input: unknown): ParsedAttemptInput {
     : attemptIdValue(input.targetPlayerId, "targetPlayerId");
   const destination = input.destination === undefined ? undefined : attemptPointValue(input.destination);
 
-  if (actionType === "pass" && targetPlayerId === undefined && destination === undefined) {
-    attemptFail("패스 대상 또는 도착 지점이 필요해요.");
+  if (actionType === "pass" && (targetPlayerId === undefined) === (destination === undefined)) {
+    attemptFail("패스 대상 또는 도착 지점 중 하나만 필요해요.");
   }
   if ((actionType === "dribble" || actionType === "move") && destination === undefined) {
     attemptFail("도착 지점이 필요해요.");
