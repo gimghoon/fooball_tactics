@@ -3,10 +3,69 @@ import test from "node:test";
 
 import { isPointInZone, normalizeClientPoint } from "../lib/domain/geometry.ts";
 import { calculateMastery } from "../lib/domain/mastery.ts";
-import { playableScenarios } from "../lib/domain/content.ts";
+import {
+  isScenarioPublishable,
+  parseScenarioContent,
+  playableScenarios,
+  type ScenarioContent,
+} from "../lib/domain/content.ts";
 import { mergePendingEvents } from "../lib/domain/offline-queue.ts";
 import { advanceRole, evaluateAttempt } from "../lib/domain/session.ts";
 import { createRecoveryToken, hashRecoveryToken, normalizeNickname } from "../lib/domain/identity.ts";
+
+const reviewedScenarioContent: ScenarioContent = {
+  defenseType: "front_press",
+  actorId: "fixo-1",
+  allowedActions: ["pass", "dribble", "move"],
+  pitch: {
+    players: [
+      { id: "fixo-1", x: 50, y: 72, team: "us" },
+      { id: "ala-left", x: 24, y: 52, team: "us" },
+      { id: "defender-1", x: 50, y: 58, team: "them" },
+    ],
+    ball: { x: 50, y: 72 },
+    zones: [{ id: "weak-side", zone: { kind: "circle", cx: 24, cy: 52, radius: 9 } }],
+  },
+  answer: {
+    preferred: { actionType: "pass", target: { kind: "player", playerId: "ala-left" } },
+    alternatives: [],
+    hazards: [],
+  },
+  timeline: {
+    durationMs: 2400,
+    keyframes: [
+      { atMs: 0, players: {}, ball: { x: 50, y: 72 } },
+      { atMs: 2400, players: { "defender-1": { x: 50, y: 65 } }, ball: { x: 24, y: 52 } },
+    ],
+  },
+  explanations: [
+    { kind: "observe", text: "압박 방향을 확인하세요.", fromMs: 0, toMs: 800, highlights: [{ kind: "player", id: "defender-1" }] },
+    { kind: "benefit", text: "열린 동료를 활용합니다.", fromMs: 800, toMs: 1600, highlights: [{ kind: "player", id: "ala-left" }] },
+    { kind: "risk", text: "중앙 전진은 압박에 갇힙니다.", fromMs: 800, toMs: 1600, highlights: [{ kind: "path", id: "selected-path" }] },
+    { kind: "remember", text: "압박 반대편을 먼저 본다.", fromMs: 1600, toMs: 2400, highlights: [{ kind: "zone", id: "weak-side" }] },
+  ],
+  review: { sourceReviewed: true, timelineReviewed: true, explanationsReviewed: true },
+};
+
+test("publishes only complete coach-reviewed scenario content", () => {
+  assert.equal(isScenarioPublishable(reviewedScenarioContent), true);
+  assert.equal(isScenarioPublishable({
+    ...reviewedScenarioContent,
+    review: { ...reviewedScenarioContent.review, timelineReviewed: false },
+  }), false);
+  assert.equal(isScenarioPublishable({
+    ...reviewedScenarioContent,
+    explanations: reviewedScenarioContent.explanations.slice(0, 3),
+  }), false);
+});
+
+test("rejects scenario content with unknown references or malformed JSON", () => {
+  assert.throws(() => parseScenarioContent("{"), /시나리오/);
+  assert.throws(() => parseScenarioContent(JSON.stringify({
+    ...reviewedScenarioContent,
+    explanations: [{ ...reviewedScenarioContent.explanations[0], highlights: [{ kind: "player", id: "missing-player" }] }],
+  })), /강조 대상/);
+});
 
 test("accepts points inside and on the boundary of a circular answer zone", () => {
   const zone = { kind: "circle" as const, cx: 60, cy: 35, radius: 10 };
