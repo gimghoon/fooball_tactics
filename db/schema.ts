@@ -11,7 +11,7 @@ export const scenarios = sqliteTable("scenarios", {
   role: text("role", { enum: ["fixo", "ala", "pivo", "recap"] }).notNull(),
   principle: text("principle", { enum: ["width", "support", "pivot", "transition"] }).notNull(),
   prompt: text("prompt").notNull(), hint: text("hint").notNull(), explanation: text("explanation").notNull(),
-  pitchJson: text("pitch_json").notNull(), answerJson: text("answer_json").notNull(),
+  pitchJson: text("pitch_json").notNull(), answerJson: text("answer_json").notNull(), contentJson: text("content_json").notNull().default(""),
   reviewStatus: text("review_status", { enum: ["draft", "pending", "reviewed"] }).notNull().default("pending"), orderIndex: integer("order_index").notNull(),
 }, (table) => [index("idx_scenarios_campaign_order").on(table.campaignId, table.orderIndex)]);
 
@@ -29,7 +29,7 @@ export const participants = sqliteTable("participants", {
 export const attempts = sqliteTable("attempts", {
   eventId: text("event_id").primaryKey(), participantId: text("participant_id").notNull().references(() => participants.id, { onDelete: "cascade" }),
   scenarioId: text("scenario_id").notNull().references(() => scenarios.id), principle: text("principle").notNull(), correct: integer("correct", { mode: "boolean" }).notNull(),
-  touchX: integer("touch_x").notNull(), touchY: integer("touch_y").notNull(), createdAt: integer("created_at", { mode: "timestamp_ms" }).notNull(),
+  touchX: integer("touch_x").notNull(), touchY: integer("touch_y").notNull(), actionType: text("action_type", { enum: ["pass", "dribble", "move"] }).notNull().default("pass"), targetPlayerId: text("target_player_id"), pathJson: text("path_json"), createdAt: integer("created_at", { mode: "timestamp_ms" }).notNull(),
 }, (table) => [index("idx_attempts_participant").on(table.participantId)]);
 
 export const mastery = sqliteTable("mastery", {

@@ -74,6 +74,15 @@ export type ScenarioContent = {
   review: { sourceReviewed: boolean; timelineReviewed: boolean; explanationsReviewed: boolean };
 };
 
+export type PublicScenarioContent = Pick<ScenarioContent, "defenseType" | "actorId" | "allowedActions" | "pitch"> & {
+  setupTimeline: ScenarioTimeline;
+};
+
+type LegacyPassScenario = {
+  pitchJson: string;
+  answerJson: string;
+};
+
 const ACTION_TYPES: readonly ActionType[] = ["pass", "dribble", "move"];
 const DEFENSE_TYPES: readonly DefenseType[] = [
   "front_press",
@@ -299,4 +308,66 @@ export function isScenarioPublishable(input: unknown): boolean {
   } catch {
     return false;
   }
+}
+
+export function adaptLegacyPassScenario({ pitchJson, answerJson }: LegacyPassScenario): ScenarioContent {
+  let rawPitch: unknown;
+  let rawAnswer: unknown;
+  try {
+    rawPitch = JSON.parse(pitchJson);
+    rawAnswer = JSON.parse(answerJson);
+  } catch {
+    fail("기존 문제 JSON을 해석할 수 없습니다.");
+  }
+
+  if (!isRecord(rawPitch)) fail("기존 문제의 pitch가 필요합니다.");
+  const ball = pointValue(rawPitch.ball, "기존 문제 pitch.ball");
+  const rawPlayers = Array.isArray(rawPitch.players) ? rawPitch.players : [];
+  const players: PitchPlayer[] = rawPlayers.map((value, index) => {
+    if (!isRecord(value) || (value.team !== "us" && value.team !== "them")) {
+      fail(`기존 문제 pitch.players[${index}]가 올바르지 않습니다.`);
+    }
+    return {
+      id: `legacy-player-${index + 1}`,
+      x: finiteNumber(value.x, `기존 문제 pitch.players[${index}].x`),
+      y: finiteNumber(value.y, `기존 문제 pitch.players[${index}].y`),
+      team: value.team,
+    };
+  });
+  const actor = players.find((player) => player.x === ball.x && player.y === ball.y) ?? {
+    id: "legacy-actor",
+    x: ball.x,
+    y: ball.y,
+    team: "us" as const,
+  };
+  if (!players.some((player) => player.id === actor.id)) players.unshift(actor);
+
+  const targetZone = circleZoneValue(rawAnswer, "기존 문제 answer");
+  return {
+    defenseType: "front_press",
+    actorId: actor.id,
+    allowedActions: ["pass"],
+    pitch: { players, ball, zones: [] },
+    answer: {
+      preferred: { actionType: "pass", target: { kind: "zone", zone: targetZone } },
+      alternatives: [],
+      hazards: [],
+    },
+    timeline: { durationMs: 0, keyframes: [{ atMs: 0, players: {}, ball }] },
+    explanations: [],
+    review: { sourceReviewed: false, timelineReviewed: false, explanationsReviewed: false },
+  };
+}
+
+export function toPublicScenarioContent(content: ScenarioContent): PublicScenarioContent {
+  return {
+    defenseType: content.defenseType,
+    actorId: content.actorId,
+    allowedActions: content.allowedActions,
+    pitch: content.pitch,
+    setupTimeline: {
+      durationMs: content.timeline.durationMs,
+      keyframes: content.timeline.keyframes.slice(0, 1),
+    },
+  };
 }

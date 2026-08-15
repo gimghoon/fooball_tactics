@@ -4,9 +4,11 @@ import test from "node:test";
 import { isPointInZone, normalizeClientPoint, segmentIntersectsCircle } from "../lib/domain/geometry.ts";
 import { calculateMastery } from "../lib/domain/mastery.ts";
 import {
+  adaptLegacyPassScenario,
   isScenarioPublishable,
   parseScenarioContent,
   playableScenarios,
+  toPublicScenarioContent,
   type ScenarioContent,
 } from "../lib/domain/content.ts";
 import { mergePendingEvents } from "../lib/domain/offline-queue.ts";
@@ -66,6 +68,39 @@ test("rejects scenario content with unknown references or malformed JSON", () =>
     ...reviewedScenarioContent,
     explanations: [{ ...reviewedScenarioContent.explanations[0], highlights: [{ kind: "player", id: "missing-player" }] }],
   })), /강조 대상/);
+});
+
+test("adapts legacy pitch and circle answer JSON to a pass scenario without coach explanations", () => {
+  const adapted = adaptLegacyPassScenario({
+    pitchJson: JSON.stringify({
+      players: [{ x: 50, y: 80, team: "us" }, { x: 30, y: 50, team: "us" }],
+      ball: { x: 50, y: 80 },
+    }),
+    answerJson: JSON.stringify({ kind: "circle", cx: 30, cy: 50, radius: 8 }),
+  });
+
+  assert.equal(adapted.allowedActions[0], "pass");
+  assert.equal(adapted.answer.preferred.actionType, "pass");
+  assert.deepEqual(adapted.answer.preferred.target, { kind: "zone", zone: { kind: "circle", cx: 30, cy: 50, radius: 8 } });
+  assert.deepEqual(adapted.explanations, []);
+  assert.equal(adapted.review.explanationsReviewed, false);
+});
+
+test("projects only pre-decision content for a reviewed scenario", () => {
+  const publicContent = toPublicScenarioContent(reviewedScenarioContent);
+
+  assert.deepEqual(publicContent, {
+    defenseType: reviewedScenarioContent.defenseType,
+    actorId: reviewedScenarioContent.actorId,
+    allowedActions: reviewedScenarioContent.allowedActions,
+    pitch: reviewedScenarioContent.pitch,
+    setupTimeline: {
+      durationMs: reviewedScenarioContent.timeline.durationMs,
+      keyframes: [reviewedScenarioContent.timeline.keyframes[0]],
+    },
+  });
+  assert.equal("answer" in publicContent, false);
+  assert.equal("review" in publicContent, false);
 });
 
 test("accepts points inside and on the boundary of a circular answer zone", () => {
