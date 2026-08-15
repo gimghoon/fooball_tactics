@@ -15,6 +15,13 @@
       "when": 1786805124735,
       "tag": "0001_chunky_talon",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "6",
+      "when": 1786809960061,
+      "tag": "0002_slippery_giant_man",
+      "breakpoints": true
     }
   ]
 }

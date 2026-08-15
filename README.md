@@ -27,8 +27,15 @@ Review each scenario in this order:
    its visual highlight is aligned with the animation; set
    `review.timelineReviewed` and `review.explanationsReviewed` to `true`.
 3. Call `POST /api/content/scenarios/:id/review` with
-   `{ "status": "reviewed" }` and the `x-review-key` header matching
-   `CONTENT_REVIEW_KEY`.
+   `{ "status": "reviewed", "sourceTitle": "…", "sourceUrl": "…" }` and
+   the `x-review-key` header matching `CONTENT_REVIEW_KEY`.
+
+The server must configure `CONTENT_REVIEWER_NAME` together with
+`CONTENT_REVIEW_KEY`. The endpoint records that server-owned reviewer name,
+the normalized source title and URL, and the server timestamp in one database
+update. It never accepts reviewer identity from the request body. Moving a
+scenario back to `draft` or `pending` clears those audit fields so an earlier
+approval cannot be mistaken for the current content.
 
 Publication requires all three flags (`sourceReviewed`, `timelineReviewed`, and
 `explanationsReviewed`) plus valid structured content containing all four
