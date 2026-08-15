@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { isPointInZone, normalizeClientPoint } from "../lib/domain/geometry.ts";
+import { isPointInZone, normalizeClientPoint, segmentIntersectsCircle } from "../lib/domain/geometry.ts";
 import { calculateMastery } from "../lib/domain/mastery.ts";
 import {
   isScenarioPublishable,
@@ -12,6 +12,7 @@ import {
 import { mergePendingEvents } from "../lib/domain/offline-queue.ts";
 import { advanceRole, evaluateAttempt } from "../lib/domain/session.ts";
 import { createRecoveryToken, hashRecoveryToken, normalizeNickname } from "../lib/domain/identity.ts";
+import { evaluateScenarioAction } from "../lib/domain/scenario-judging.ts";
 
 const reviewedScenarioContent: ScenarioContent = {
   defenseType: "front_press",
@@ -80,6 +81,42 @@ test("normalizes client touches into the pitch viewBox", () => {
     normalizeClientPoint({ x: 210, y: 310 }, { left: 10, top: 10, width: 400, height: 600 }),
     { x: 50, y: 50 },
   );
+});
+
+test("counts a path touching a hazard boundary as unsafe", () => {
+  assert.equal(
+    segmentIntersectsCircle({ x: 10, y: 20 }, { x: 90, y: 20 }, { kind: "circle", cx: 50, cy: 30, radius: 10 }),
+    true,
+  );
+});
+
+test("judges a pass by action type and teammate target", () => {
+  const result = evaluateScenarioAction(reviewedScenarioContent, {
+    actionType: "pass",
+    targetPlayerId: "ala-left",
+  });
+
+  assert.deepEqual(result, {
+    correct: true,
+    grade: "preferred",
+    selectedPath: [{ x: 50, y: 72 }, { x: 24, y: 52 }],
+    recommended: reviewedScenarioContent.answer.preferred,
+    reason: null,
+  });
+});
+
+test("judges action type, target, and path together", () => {
+  const dribbleContent: ScenarioContent = {
+    ...reviewedScenarioContent,
+    allowedActions: ["dribble", "pass"],
+    answer: {
+      preferred: { actionType: "dribble", target: { kind: "zone", zone: { kind: "circle", cx: 70, cy: 70, radius: 8 } } },
+      alternatives: [],
+      hazards: [{ kind: "circle", cx: 60, cy: 58, radius: 5 }],
+    },
+  };
+  assert.equal(evaluateScenarioAction(dribbleContent, { actionType: "dribble", destination: { x: 70, y: 70 } }).correct, true);
+  assert.equal(evaluateScenarioAction(dribbleContent, { actionType: "pass", targetPlayerId: "ala-left" }).correct, false);
 });
 
 test("calculates mastery from correct attempts without rewarding duplicate retries", () => {
