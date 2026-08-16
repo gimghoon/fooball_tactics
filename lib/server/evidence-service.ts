@@ -26,7 +26,66 @@ export class D1EvidenceServiceRepository implements EvidenceServiceRepository {
   async findSourceByHash(bundleId:string,hash:string){return this.db.prepare("SELECT id,bundle_id AS bundleId,original_file_name AS originalFileName,media_type AS mediaType,byte_size AS byteSize,content_hash AS contentHash,storage_key AS storageKey,extracted_text_key AS extractedTextKey,extraction_status AS extractionStatus,extraction_error AS extractionError FROM evidence_sources WHERE bundle_id=? AND content_hash=?").bind(bundleId,hash).first<StoredEvidenceFile>()}
   async describeDeleteImpact(sourceId:string){const [cards,scenarios]=await Promise.all([this.db.prepare("SELECT DISTINCT c.id FROM tactic_cards c JOIN tactic_card_citations x ON x.card_id=c.id JOIN evidence_chunks h ON h.id=x.chunk_id WHERE h.source_id=?").bind(sourceId).all<{id:string}>(),this.db.prepare("SELECT id FROM scenarios WHERE review_status='draft' AND content_json LIKE '%' || ? || '%'").bind(sourceId).all<{id:string}>()]);return{sourceId,cardIds:cards.results.map(x=>x.id),scenarioDraftIds:scenarios.results.map(x=>x.id)}}
   async createBundle(b:EvidenceBundleRecord,a:EvidenceAuditEventInput){await this.db.batch([this.db.prepare("INSERT INTO evidence_bundles (id,title,purpose,version,content_version,created_at,updated_at) VALUES (?,?,?,?,?,?,?)").bind(b.id,b.title,b.purpose,b.version,b.contentVersion,b.createdAt,b.updatedAt),this.audit(a,"EXISTS (SELECT 1 FROM evidence_bundles WHERE id=?)",[b.id])])}
-  async applyMutation(m:EvidenceMutation){const c=m.current,n=m.next,cas=[c.id,c.version,c.contentVersion];const ss:EvidenceD1Statement[]=[];if(m.sourceToInsert){const s=m.sourceToInsert;ss.push(this.db.prepare(`INSERT INTO evidence_sources (id,bundle_id,original_file_name,media_type,byte_size,content_hash,storage_key,extracted_text_key,extraction_status,extraction_error,created_at,updated_at) SELECT ?,?,?,?,?,?,?,?,?,?,?,? WHERE ${guard}`).bind(s.id,s.bundleId,s.originalFileName,s.mediaType,s.byteSize,s.contentHash,s.storageKey,s.extractedTextKey,s.extractionStatus,s.extractionError,n.updatedAt,n.updatedAt,...cas));}if(m.sourceToDelete)ss.push(this.db.prepare(`DELETE FROM evidence_sources WHERE id=? AND ${guard} AND NOT EXISTS (SELECT 1 FROM evidence_chunks h JOIN tactic_card_citations x ON x.chunk_id=h.id WHERE h.source_id=?)`).bind(m.sourceToDelete,...cas,m.sourceToDelete));if(m.clipToInsert){const x=m.clipToInsert;ss.push(this.db.prepare(`INSERT INTO evidence_video_clips (id,bundle_id,url,start_ms,end_ms,observation,created_at,updated_at) SELECT ?,?,?,?,?,?,?,? WHERE ${guard}`).bind(x.id,x.bundleId,x.url,x.startMs,x.endMs,x.observation,x.createdAt,x.updatedAt,...cas));}ss.push(this.db.prepare(`UPDATE evidence_analysis_jobs SET is_stale=1,status=CASE WHEN status IN ('queued','running','review_ready') THEN 'failed' ELSE status END,error_message=CASE WHEN status IN ('queued','running','review_ready') THEN 'evidence version superseded' ELSE error_message END,updated_at=? WHERE bundle_id=? AND input_version<>? AND ${guard}`).bind(n.updatedAt,c.id,n.contentVersion,...cas),this.db.prepare(`UPDATE tactic_cards SET is_stale=1,status=CASE WHEN status IN ('analysis_draft','owner_reviewed','coach_reviewed') THEN 'held' ELSE status END,updated_at=? WHERE bundle_id=? AND bundle_version<>? AND ${guard}`).bind(n.updatedAt,c.id,n.contentVersion,...cas),this.audit(m.audit,guard,cas),this.db.prepare("UPDATE evidence_bundles SET title=?,purpose=?,version=?,content_version=?,updated_at=? WHERE id=? AND version=? AND content_version=?").bind(n.title,n.purpose,n.version,n.contentVersion,n.updatedAt,...cas));const result=await this.db.batch(ss);return (result.at(-1)?.meta?.changes??0)===1}
+  async applyMutation(mutation: EvidenceMutation) {
+    const current = mutation.current;
+    const next = mutation.next;
+    const oldState = [current.id, current.version, current.contentVersion];
+    const statements: EvidenceD1Statement[] = [];
+
+    if (mutation.sourceToInsert) {
+      const source = mutation.sourceToInsert;
+      statements.push(this.db.prepare(
+        `INSERT INTO evidence_sources (id,bundle_id,original_file_name,media_type,byte_size,content_hash,storage_key,extracted_text_key,extraction_status,extraction_error,created_at,updated_at)
+          SELECT ?,?,?,?,?,?,?,?,?,?,?,? WHERE ${guard}`,
+      ).bind(
+        source.id, source.bundleId, source.originalFileName, source.mediaType, source.byteSize,
+        source.contentHash, source.storageKey, source.extractedTextKey, source.extractionStatus,
+        source.extractionError, next.updatedAt, next.updatedAt, ...oldState,
+      ));
+    }
+    if (mutation.sourceToDelete) {
+      statements.push(this.db.prepare(
+        `DELETE FROM evidence_sources WHERE id=? AND ${guard}`,
+      ).bind(mutation.sourceToDelete, ...oldState));
+    }
+    if (mutation.clipToInsert) {
+      const clip = mutation.clipToInsert;
+      statements.push(this.db.prepare(
+        `INSERT INTO evidence_video_clips (id,bundle_id,url,start_ms,end_ms,observation,created_at,updated_at)
+          SELECT ?,?,?,?,?,?,?,? WHERE ${guard}`,
+      ).bind(
+        clip.id, clip.bundleId, clip.url, clip.startMs, clip.endMs, clip.observation,
+        clip.createdAt, clip.updatedAt, ...oldState,
+      ));
+    }
+
+    statements.push(
+      this.db.prepare(
+        `UPDATE evidence_analysis_jobs
+          SET is_stale=1,
+            status=CASE WHEN status IN ('queued','running','review_ready') THEN 'failed' ELSE status END,
+            error_message=CASE WHEN status IN ('queued','running','review_ready') THEN 'evidence version superseded' ELSE error_message END,
+            updated_at=?
+          WHERE bundle_id=? AND input_version<>? AND ${guard}`,
+      ).bind(next.updatedAt, current.id, next.contentVersion, ...oldState),
+      this.db.prepare(
+        `UPDATE tactic_cards
+          SET is_stale=1,
+            status=CASE WHEN status IN ('analysis_draft','owner_reviewed','coach_reviewed') THEN 'held' ELSE status END,
+            updated_at=?
+          WHERE bundle_id=? AND bundle_version<>? AND ${guard}`,
+      ).bind(next.updatedAt, current.id, next.contentVersion, ...oldState),
+      this.audit(mutation.audit, guard, oldState),
+      // D1 batch statements execute sequentially. The CAS must remain last so
+      // every dependent old-state guard is true on success and false on a miss.
+      this.db.prepare(
+        "UPDATE evidence_bundles SET title=?,purpose=?,version=?,content_version=?,updated_at=? WHERE id=? AND version=? AND content_version=?",
+      ).bind(next.title, next.purpose, next.version, next.contentVersion, next.updatedAt, ...oldState),
+    );
+
+    const results = await this.db.batch(statements);
+    return (results.at(-1)?.meta?.changes ?? 0) === 1;
+  }
   private audit(a:EvidenceAuditEventInput,w:string,v:unknown[]){return this.db.prepare(`INSERT INTO evidence_audit_events (id,bundle_id,actor_user_id,action,target_type,target_id,details_json,created_at) SELECT ?,?,?,?,?,?,?,? WHERE ${w}`).bind(a.id,a.bundleId,a.actorUserId,a.action,a.targetType,a.targetId,a.detailsJson,a.createdAt,...v)}
 }
 export class EvidenceService {
