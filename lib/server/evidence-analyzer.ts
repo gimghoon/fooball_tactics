@@ -151,7 +151,7 @@ export function parseAnalyzerCards(
   const allowed = extractedCitations === undefined
     ? callerAllowed
     : new Set([...callerAllowed].filter((id) => extractedCitations.has(id)));
-  return cardArray(value).map((candidate, index) => {
+  const cards = cardArray(value).map((candidate, index) => {
     const field = `cards[${index}]`;
     if (!isRecord(candidate)) fail(`${field}가 필요합니다.`);
     exactKeys(candidate, [
@@ -175,6 +175,10 @@ export function parseAnalyzerCards(
       animationSuitable: booleanValue(candidate.animationSuitable, `${field}.animationSuitable`),
     };
   });
+  if (!cards.some((card) => card.preferred.length + card.alternatives.length + card.risky.length > 0)) {
+    fail("카드 결과에는 하나 이상의 행동이 필요합니다.");
+  }
+  return cards;
 }
 
 /** Parses the first-stage evidence extraction without allowing provider-specific fields through. */
@@ -189,7 +193,7 @@ export function parseExtractedEvidence(
       ? parsed.extracted
       : fail("추출 결과 배열이 필요합니다.");
   const allowed = knownCitationIds(known);
-  if (allowed.size > 0 && records.length === 0) fail("추출 결과에는 하나 이상의 근거가 필요합니다.");
+  if (records.length === 0) fail("추출 결과에는 하나 이상의 근거가 필요합니다.");
   return records.map((candidate, index) => {
     const field = `extracted[${index}]`;
     if (!isRecord(candidate)) fail(`${field}가 필요합니다.`);

@@ -56,6 +56,7 @@ test("rejects unknown fields, enums, empty action reasons, and empty citations",
   assert.throws(() => parseAnalyzerCards(JSON.stringify([{ ...card(), preferred: [{ action: "shoot", reason: "x", citationIds: ["chunk-1"] }] }]), chunks), /행동/);
   assert.throws(() => parseAnalyzerCards(JSON.stringify([{ ...card(), preferred: [{ action: "pass", reason: "", citationIds: ["chunk-1"] }] }]), chunks), /필요/);
   assert.throws(() => parseAnalyzerCards(JSON.stringify([card([])]), chunks), /근거/);
+  assert.throws(() => parseAnalyzerCards(JSON.stringify([{ ...card(), preferred: [], alternatives: [], risky: [] }]), chunks), /행동/);
 });
 
 test("configured adapter sends a strict Responses structured-output request and returns only domain cards", async () => {
@@ -150,6 +151,9 @@ test("extraction parser rejects unknown fields, blank values, unknown citations,
   assert.throws(() => parseExtractedEvidence(JSON.stringify({ extracted: [{ ...extracted(), providerResponse: "raw" }] }), chunks), /알 수 없는/);
   assert.throws(() => parseExtractedEvidence(JSON.stringify({ extracted: [{ ...extracted(), situation: " " }] }), chunks), /필요/);
   assert.throws(() => parseExtractedEvidence(JSON.stringify({ extracted: [{ ...extracted(), citationIds: ["unknown"] }] }), chunks), /근거/);
+  assert.throws(() => parseExtractedEvidence(JSON.stringify({ extracted: [{ ...extracted(), actions: [{ action: "shoot", reason: "x", citationIds: ["chunk-1"] }] }] }), chunks), /행동/);
+  assert.throws(() => parseExtractedEvidence(JSON.stringify({ extracted: [{ ...extracted(), actions: [{ action: "pass", reason: " ", citationIds: ["chunk-1"] }] }] }), chunks), /필요/);
+  assert.throws(() => parseExtractedEvidence(JSON.stringify({ extracted: [{ ...extracted(), actions: [{ action: "pass", reason: "x", citationIds: [] }] }] }), chunks), /근거/);
   assert.throws(() => parseExtractedEvidence(JSON.stringify({ extracted: [] }), chunks), /근거/);
 });
 
@@ -165,6 +169,8 @@ test("stage one rejects empty or blank chunks and stage two requires extracted c
   assert.equal(calls, 0);
   await assert.rejects(() => analyzer.analyzeExtraction({ chunks: [{ ...chunks[0], content: " " }], promptVersion: "p" }, AbortSignal.timeout(1_000)), /필요/);
   await assert.rejects(() => analyzer.generateCards({ ...cardInput, extracted: [] }, AbortSignal.timeout(1_000)), /근거/);
+  await assert.rejects(() => analyzer.generateCards({ ...cardInput, extracted: [], allowedCitationIds: [] }, AbortSignal.timeout(1_000)), /근거/);
+  assert.equal(calls, 0);
   await assert.rejects(() => analyzer.generateCards({ ...cardInput, extracted: [{ ...extracted(), citationIds: ["chunk-2"], actions: [{ action: "pass", reason: "x", citationIds: ["chunk-2"] }] }] }, AbortSignal.timeout(1_000)), /근거/);
 });
 
@@ -283,4 +289,72 @@ test("distinguishes an injected adapter timeout from caller cancellation", async
     EVIDENCE_LLM_ENDPOINT: "https://llm.example.test/v1/responses", EVIDENCE_LLM_API_KEY: "key", EVIDENCE_LLM_MODEL: "model",
   }, { fetch: waitingFetch, requestTimeoutMs: 1_000 });
   await assert.rejects(() => cancelled.generateCards(cardInput, AbortSignal.abort()), (error: unknown) => error instanceof EvidenceAnalyzerError && !error.retryable && /취소/.test(error.message));
+});
+
+test("latches the first abort cause even when fetch rejection is delayed", async () => {
+  const delayedAbortFetch = async (_input: RequestInfo | URL, init?: RequestInit) => new Promise<Response>((_resolve, reject) => {
+    init?.signal?.addEventListener("abort", () => setTimeout(() => reject(new Error("secret-key provider raw body")), 10), { once: true });
+  });
+  const timeoutFirstSignal = new AbortController();
+  const timeoutFirst = createConfiguredEvidenceAnalyzer({
+    EVIDENCE_LLM_ENDPOINT: "https://llm.example.test/v1/responses", EVIDENCE_LLM_API_KEY: "secret-key", EVIDENCE_LLM_MODEL: "model",
+  }, { fetch: delayedAbortFetch, requestTimeoutMs: 1 });
+  const timeoutFirstResult = timeoutFirst.generateCards(cardInput, timeoutFirstSignal.signal);
+  setTimeout(() => timeoutFirstSignal.abort(), 5);
+  await assert.rejects(() => timeoutFirstResult, (error: unknown) => error instanceof EvidenceAnalyzerError && error.retryable && /시간이 초과/.test(error.message));
+
+  const callerFirstSignal = new AbortController();
+  const callerFirst = createConfiguredEvidenceAnalyzer({
+    EVIDENCE_LLM_ENDPOINT: "https://llm.example.test/v1/responses", EVIDENCE_LLM_API_KEY: "secret-key", EVIDENCE_LLM_MODEL: "model",
+  }, { fetch: delayedAbortFetch, requestTimeoutMs: 50 });
+  const callerFirstResult = callerFirst.generateCards(cardInput, callerFirstSignal.signal);
+  callerFirstSignal.abort();
+  await assert.rejects(() => callerFirstResult, (error: unknown) => error instanceof EvidenceAnalyzerError && !error.retryable && /취소/.test(error.message));
+});
+
+test("sanitizes response-stream failures and preserves timeout or cancellation during body reads", async () => {
+  const streamFetch = (delayAfterAbort: number) => async (_input: RequestInfo | URL, init?: RequestInit) => new Response(new ReadableStream<Uint8Array>({
+    start(controller) {
+      init?.signal?.addEventListener("abort", () => setTimeout(() => controller.error(new Error("secret-key provider raw body")), delayAfterAbort), { once: true });
+    },
+  }));
+  const rawStream = createConfiguredEvidenceAnalyzer({
+    EVIDENCE_LLM_ENDPOINT: "https://llm.example.test/v1/responses", EVIDENCE_LLM_API_KEY: "secret-key", EVIDENCE_LLM_MODEL: "model",
+  }, { fetch: async () => new Response(new ReadableStream<Uint8Array>({ start(controller) { controller.error(new Error("secret-key provider raw body")); } })) });
+  await assert.rejects(() => rawStream.generateCards(cardInput, AbortSignal.timeout(1_000)), (error: unknown) => {
+    assert.ok(error instanceof EvidenceAnalyzerError);
+    assert.equal(error.retryable, true);
+    assert.equal(error.message.includes("secret-key"), false);
+    assert.equal(error.message.includes("provider raw body"), false);
+    return true;
+  });
+
+  const timedOut = createConfiguredEvidenceAnalyzer({
+    EVIDENCE_LLM_ENDPOINT: "https://llm.example.test/v1/responses", EVIDENCE_LLM_API_KEY: "key", EVIDENCE_LLM_MODEL: "model",
+  }, { fetch: streamFetch(1), requestTimeoutMs: 1 });
+  await assert.rejects(() => timedOut.generateCards(cardInput, AbortSignal.timeout(1_000)), (error: unknown) => error instanceof EvidenceAnalyzerError && error.retryable && /시간이 초과/.test(error.message));
+
+  const caller = new AbortController();
+  const cancelled = createConfiguredEvidenceAnalyzer({
+    EVIDENCE_LLM_ENDPOINT: "https://llm.example.test/v1/responses", EVIDENCE_LLM_API_KEY: "key", EVIDENCE_LLM_MODEL: "model",
+  }, { fetch: streamFetch(1), requestTimeoutMs: 1_000 });
+  const cancelledResult = cancelled.generateCards(cardInput, caller.signal);
+  caller.abort();
+  await assert.rejects(() => cancelledResult, (error: unknown) => error instanceof EvidenceAnalyzerError && !error.retryable && /취소/.test(error.message));
+});
+
+test("removes the caller abort listener after a completed request", async () => {
+  let added = 0;
+  let removed = 0;
+  const signal = {
+    aborted: false,
+    addEventListener: () => { added += 1; },
+    removeEventListener: () => { removed += 1; },
+  } as unknown as AbortSignal;
+  const analyzer = createConfiguredEvidenceAnalyzer({
+    EVIDENCE_LLM_ENDPOINT: "https://llm.example.test/v1/responses", EVIDENCE_LLM_API_KEY: "key", EVIDENCE_LLM_MODEL: "model",
+  }, { fetch: async () => completedResponse(JSON.stringify({ cards: [card()] })) });
+  await analyzer.generateCards(cardInput, signal);
+  assert.equal(added, 1);
+  assert.equal(removed, 1);
 });

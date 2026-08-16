@@ -12,6 +12,10 @@ import type { TacticCardContent } from "../domain/evidence.ts";
 
 const REQUEST_TIMEOUT_MS = 30_000;
 const MAX_RESPONSE_BYTES = 1_000_000;
+type AbortCause = "none" | "timeout" | "caller";
+
+class ResponseBodyTransportError extends Error {}
+class ResponseBodyTooLargeError extends Error {}
 
 export type EvidenceAnalyzerEnvironment = {
   EVIDENCE_LLM_ENDPOINT?: string;
@@ -186,17 +190,22 @@ class OpenAiEvidenceAnalyzer implements EvidenceAnalyzer {
     signal: AbortSignal,
   ): Promise<string> {
     const controller = new AbortController();
-    let timedOut = false;
-    let cancelled = signal.aborted;
-    const timer = setTimeout(() => {
-      timedOut = true;
-      controller.abort();
-    }, this.config.requestTimeoutMs);
-    const forwardAbort = () => {
-      cancelled = true;
+    let abortCause: AbortCause = signal.aborted ? "caller" : "none";
+    const abort = (cause: Exclude<AbortCause, "none">) => {
+      if (abortCause !== "none") return;
+      abortCause = cause;
       controller.abort();
     };
-    if (cancelled) controller.abort();
+    const transportFailure = () => abortCause === "caller"
+      ? new EvidenceAnalyzerError("분석 요청이 취소되었습니다.", false)
+      : abortCause === "timeout"
+        ? new EvidenceAnalyzerError("분석 요청 시간이 초과되었습니다.", true)
+        : new EvidenceAnalyzerError("분석 제공자와 통신할 수 없습니다.", true);
+    const timer = setTimeout(() => {
+      abort("timeout");
+    }, this.config.requestTimeoutMs);
+    const forwardAbort = () => abort("caller");
+    if (abortCause === "caller") controller.abort();
     signal.addEventListener("abort", forwardAbort, { once: true });
     try {
       let response: Response;
@@ -216,9 +225,7 @@ class OpenAiEvidenceAnalyzer implements EvidenceAnalyzer {
           redirect: "error",
         });
       } catch {
-        if (cancelled) throw new EvidenceAnalyzerError("분석 요청이 취소되었습니다.", false);
-        if (timedOut) throw new EvidenceAnalyzerError("분석 요청 시간이 초과되었습니다.", true);
-        throw new EvidenceAnalyzerError("분석 제공자와 통신할 수 없습니다.", true);
+        throw transportFailure();
       }
       if (!response.ok) {
         const retryable = response.status === 408 || response.status === 429 || response.status >= 500;
@@ -227,7 +234,14 @@ class OpenAiEvidenceAnalyzer implements EvidenceAnalyzer {
           : retryable ? "분석 제공자가 일시적으로 응답하지 않습니다." : "분석 제공자 요청이 거부되었습니다.";
         throw new EvidenceAnalyzerError(message, retryable);
       }
-      return extractOutputText(await parseResponseJson(response));
+      let responseJson: unknown;
+      try {
+        responseJson = await parseResponseJson(response);
+      } catch (error) {
+        if (error instanceof ResponseBodyTransportError) throw transportFailure();
+        throw error;
+      }
+      return extractOutputText(responseJson);
     } finally {
       clearTimeout(timer);
       signal.removeEventListener("abort", forwardAbort);
@@ -240,7 +254,15 @@ async function parseResponseJson(response: Response): Promise<unknown> {
   if (contentLength && Number(contentLength) > MAX_RESPONSE_BYTES) {
     throw new EvidenceAnalyzerError("분석 제공자 응답이 너무 큽니다.", true);
   }
-  const bytes = await readBoundedResponse(response, MAX_RESPONSE_BYTES);
+  let bytes: Uint8Array;
+  try {
+    bytes = await readBoundedResponse(response, MAX_RESPONSE_BYTES);
+  } catch (error) {
+    if (error instanceof ResponseBodyTooLargeError) {
+      throw new EvidenceAnalyzerError("분석 제공자 응답이 너무 큽니다.", true);
+    }
+    throw new ResponseBodyTransportError();
+  }
   try {
     return JSON.parse(new TextDecoder().decode(bytes)) as unknown;
   } catch {
@@ -260,7 +282,7 @@ async function readBoundedResponse(response: Response, limit: number): Promise<U
       total += next.value.byteLength;
       if (total > limit) {
         await reader.cancel();
-        throw new EvidenceAnalyzerError("분석 제공자 응답이 너무 큽니다.", true);
+        throw new ResponseBodyTooLargeError();
       }
       chunks.push(next.value);
     }
