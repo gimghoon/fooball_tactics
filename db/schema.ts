@@ -45,3 +45,113 @@ export const reflections = sqliteTable("reflections", {
   missionId: text("mission_id").notNull(), result: text("result", { enum: ["worked", "difficult"] }).notNull(), note: text("note").notNull().default(""),
   createdAt: integer("created_at", { mode: "timestamp_ms" }).notNull(),
 }, (table) => [index("idx_reflections_participant").on(table.participantId)]);
+
+export const evidenceBundles = sqliteTable("evidence_bundles", {
+  id: text("id").primaryKey(),
+  title: text("title").notNull(),
+  purpose: text("purpose").notNull(),
+  version: integer("version").notNull().default(1),
+  contentVersion: text("content_version").notNull(),
+  createdAt: integer("created_at", { mode: "timestamp_ms" }).notNull(),
+  updatedAt: integer("updated_at", { mode: "timestamp_ms" }).notNull(),
+});
+
+export const evidenceSources = sqliteTable("evidence_sources", {
+  id: text("id").primaryKey(),
+  bundleId: text("bundle_id").notNull().references(() => evidenceBundles.id, { onDelete: "cascade" }),
+  originalFileName: text("original_file_name").notNull(),
+  mediaType: text("media_type").notNull(),
+  byteSize: integer("byte_size").notNull(),
+  contentHash: text("content_hash").notNull(),
+  storageKey: text("storage_key").notNull(),
+  extractedTextKey: text("extracted_text_key"),
+  extractionStatus: text("extraction_status", { enum: ["pending", "completed", "failed"] }).notNull().default("pending"),
+  extractionError: text("extraction_error"),
+  createdAt: integer("created_at", { mode: "timestamp_ms" }).notNull(),
+  updatedAt: integer("updated_at", { mode: "timestamp_ms" }).notNull(),
+}, (table) => [
+  uniqueIndex("idx_evidence_sources_bundle_content_hash").on(table.bundleId, table.contentHash),
+]);
+
+export const evidenceVideoClips = sqliteTable("evidence_video_clips", {
+  id: text("id").primaryKey(),
+  bundleId: text("bundle_id").notNull().references(() => evidenceBundles.id, { onDelete: "cascade" }),
+  url: text("url").notNull(),
+  startMs: integer("start_ms").notNull(),
+  endMs: integer("end_ms").notNull(),
+  observation: text("observation").notNull(),
+  createdAt: integer("created_at", { mode: "timestamp_ms" }).notNull(),
+  updatedAt: integer("updated_at", { mode: "timestamp_ms" }).notNull(),
+});
+
+export const evidenceChunks = sqliteTable("evidence_chunks", {
+  id: text("id").primaryKey(),
+  bundleId: text("bundle_id").notNull().references(() => evidenceBundles.id, { onDelete: "cascade" }),
+  sourceId: text("source_id").references(() => evidenceSources.id, { onDelete: "cascade" }),
+  videoClipId: text("video_clip_id").references(() => evidenceVideoClips.id, { onDelete: "cascade" }),
+  ordinal: integer("ordinal").notNull(),
+  locationLabel: text("location_label").notNull(),
+  content: text("content").notNull(),
+  contentHash: text("content_hash").notNull(),
+  createdAt: integer("created_at", { mode: "timestamp_ms" }).notNull(),
+});
+
+export const evidenceAnalysisJobs = sqliteTable("evidence_analysis_jobs", {
+  id: text("id").primaryKey(),
+  bundleId: text("bundle_id").notNull().references(() => evidenceBundles.id, { onDelete: "cascade" }),
+  inputVersion: text("input_version").notNull(),
+  status: text("status", { enum: ["queued", "running", "review_ready", "completed", "failed"] }).notNull().default("queued"),
+  analyzerModel: text("analyzer_model").notNull(),
+  promptVersion: text("prompt_version").notNull(),
+  schemaVersion: text("schema_version").notNull(),
+  stage: text("stage").notNull().default("queued"),
+  leaseOwner: text("lease_owner"),
+  leaseExpiresAt: integer("lease_expires_at", { mode: "timestamp_ms" }),
+  errorMessage: text("error_message"),
+  startedAt: integer("started_at", { mode: "timestamp_ms" }),
+  completedAt: integer("completed_at", { mode: "timestamp_ms" }),
+  createdAt: integer("created_at", { mode: "timestamp_ms" }).notNull(),
+  updatedAt: integer("updated_at", { mode: "timestamp_ms" }).notNull(),
+}, (table) => [uniqueIndex("idx_evidence_analysis_jobs_input_version").on(table.inputVersion)]);
+
+export const tacticCards = sqliteTable("tactic_cards", {
+  id: text("id").primaryKey(),
+  bundleId: text("bundle_id").notNull().references(() => evidenceBundles.id, { onDelete: "cascade" }),
+  jobId: text("job_id").notNull().references(() => evidenceAnalysisJobs.id, { onDelete: "cascade" }),
+  bundleVersion: text("bundle_version").notNull(),
+  status: text("status", { enum: ["analysis_draft", "owner_reviewed", "coach_reviewed", "held", "rejected"] }).notNull().default("analysis_draft"),
+  draftContentJson: text("draft_content_json").notNull(),
+  currentContentJson: text("current_content_json").notNull(),
+  isStale: integer("is_stale", { mode: "boolean" }).notNull().default(false),
+  createdAt: integer("created_at", { mode: "timestamp_ms" }).notNull(),
+  updatedAt: integer("updated_at", { mode: "timestamp_ms" }).notNull(),
+}, (table) => [index("idx_tactic_cards_bundle_status").on(table.bundleId, table.status)]);
+
+export const tacticCardCitations = sqliteTable("tactic_card_citations", {
+  id: text("id").primaryKey(),
+  cardId: text("card_id").notNull().references(() => tacticCards.id, { onDelete: "cascade" }),
+  chunkId: text("chunk_id").notNull().references(() => evidenceChunks.id, { onDelete: "cascade" }),
+  createdAt: integer("created_at", { mode: "timestamp_ms" }).notNull(),
+}, (table) => [uniqueIndex("idx_tactic_card_citations_card_chunk").on(table.cardId, table.chunkId)]);
+
+export const tacticCardReviews = sqliteTable("tactic_card_reviews", {
+  id: text("id").primaryKey(),
+  cardId: text("card_id").notNull().references(() => tacticCards.id, { onDelete: "cascade" }),
+  actorUserId: text("actor_user_id").notNull(),
+  status: text("status", { enum: ["analysis_draft", "owner_reviewed", "coach_reviewed", "held", "rejected"] }).notNull(),
+  contentJson: text("content_json").notNull(),
+  citationSnapshotJson: text("citation_snapshot_json").notNull(),
+  bundleVersion: text("bundle_version").notNull(),
+  createdAt: integer("created_at", { mode: "timestamp_ms" }).notNull(),
+});
+
+export const evidenceAuditEvents = sqliteTable("evidence_audit_events", {
+  id: text("id").primaryKey(),
+  bundleId: text("bundle_id").notNull().references(() => evidenceBundles.id, { onDelete: "cascade" }),
+  actorUserId: text("actor_user_id").notNull(),
+  action: text("action").notNull(),
+  targetType: text("target_type").notNull(),
+  targetId: text("target_id").notNull(),
+  detailsJson: text("details_json").notNull(),
+  createdAt: integer("created_at", { mode: "timestamp_ms" }).notNull(),
+}, (table) => [index("idx_evidence_audit_events_bundle_created_at").on(table.bundleId, table.createdAt)]);
