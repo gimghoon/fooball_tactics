@@ -57,7 +57,7 @@ class SQLiteD1Statement implements EvidenceD1Statement {
 /** Executes the production repository's exact SQL in one sequential SQLite transaction. */
 class SQLiteD1Database implements EvidenceD1Database {
   readonly database = new DatabaseSync(":memory:");
-  beforeNextBatch: (() => void) | null = null;
+  beforeNextBatch: (() => void | Promise<void>) | null = null;
 
   constructor() {
     this.database.exec("PRAGMA foreign_keys = ON");
@@ -73,7 +73,7 @@ class SQLiteD1Database implements EvidenceD1Database {
   async batch(statements: EvidenceD1Statement[]): Promise<{ meta: { changes: number } }[]> {
     const before = this.beforeNextBatch;
     this.beforeNextBatch = null;
-    before?.();
+    await before?.();
     this.database.exec("BEGIN IMMEDIATE");
     try {
       const results = statements.map((statement) => {
@@ -105,6 +105,7 @@ class SQLiteD1Database implements EvidenceD1Database {
 
 class MemoryR2Bucket implements EvidenceR2Bucket {
   readonly objects = new Map<string, Uint8Array | string>();
+  afterObjectsDeleted: (() => void | Promise<void>) | null = null;
 
   async put(key: string, value: Uint8Array | string): Promise<void> {
     this.objects.set(key, value instanceof Uint8Array ? value.slice() : value);
@@ -118,6 +119,11 @@ class MemoryR2Bucket implements EvidenceR2Bucket {
 
   async delete(key: string): Promise<void> {
     this.objects.delete(key);
+    if (this.objects.size === 0 && this.afterObjectsDeleted !== null) {
+      const afterObjectsDeleted = this.afterObjectsDeleted;
+      this.afterObjectsDeleted = null;
+      await afterObjectsDeleted();
+    }
   }
 }
 
@@ -174,6 +180,30 @@ async function uploadText(context: ReturnType<typeof createContext>, bundleId: s
     type: "text/markdown",
     bytes: new TextEncoder().encode("압박 대응"),
   });
+}
+
+function insertDraftScenario(database: SQLiteD1Database, scenarioId: string, contentJson: string): void {
+  database.run(
+    `INSERT INTO scenarios
+      (id,campaign_id,role,principle,prompt,hint,explanation,pitch_json,answer_json,content_json,review_status,order_index)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
+    scenarioId, "diamond-121-intro", "ala", "width", "p", "h", "e", "{}", "{}", contentJson, "draft", 99,
+  );
+}
+
+function linkScenarioSource(database: SQLiteD1Database, scenarioId: string, sourceId: string): void {
+  database.run(
+    "INSERT INTO scenario_evidence_sources (scenario_id,source_id) VALUES (?,?)",
+    scenarioId,
+    sourceId,
+  );
+}
+
+async function removeSourceAsCompetingWinner(
+  context: ReturnType<typeof createContext>,
+  sourceId: string,
+): Promise<void> {
+  await context.service.removeSource(sourceId, admin);
 }
 
 test("production source upload atomically inserts, versions, invalidates approved work, and audits", async () => {
@@ -237,6 +267,47 @@ test("a lost bundle CAS changes none of the guarded source, work, or audit rows"
   );
 });
 
+test("a missing required source makes the mutation and final CAS affect zero rows", async () => {
+  const context = createContext();
+  const bundle = await context.service.createBundle(bundleInput, admin);
+  seedApprovedWork(context.database, bundle);
+  const next = {
+    ...bundle,
+    version: bundle.version + 1,
+    contentVersion: "missing-target-version",
+    updatedAt: bundle.updatedAt + 1,
+  };
+
+  const applied = await context.repository.applyMutation({
+    current: bundle,
+    next,
+    sourceToDelete: "missing-source",
+    audit: {
+      id: "missing-source-audit",
+      bundleId: bundle.id,
+      actorUserId: admin.userId,
+      action: "source.removed",
+      targetType: "source",
+      targetId: "missing-source",
+      detailsJson: "{}",
+      createdAt: next.updatedAt,
+    },
+  });
+
+  assert.equal(applied, false);
+  assert.deepEqual({ ...await context.repository.getBundle(bundle.id) }, bundle);
+  assert.equal(context.database.first<{ count: number }>("SELECT count(*) AS count FROM evidence_audit_events WHERE action='source.removed'").count, 0);
+  assert.deepEqual(
+    { ...context.database.first("SELECT status,is_stale AS isStale,error_message AS errorMessage FROM evidence_analysis_jobs WHERE id='job-1'") },
+    { status: "queued", isStale: 0, errorMessage: null },
+  );
+  assert.deepEqual(
+    { ...context.database.first("SELECT status,is_stale AS isStale FROM tactic_cards WHERE id='card-1'") },
+    { status: "coach_reviewed", isStale: 0 },
+  );
+  assert.equal(context.database.first<{ count: number }>("SELECT count(*) AS count FROM evidence_mutation_receipts").count, 0);
+});
+
 test("a card link created after impact checks aborts D1 deletion and restores both R2 objects", async () => {
   const context = createContext();
   const bundle = await context.service.createBundle(bundleInput, admin);
@@ -275,22 +346,18 @@ test("a card link created after impact checks aborts D1 deletion and restores bo
   assert.ok(source.extractedTextKey !== null && context.bucket.objects.has(source.extractedTextKey));
   assert.deepEqual(await context.repository.getBundle(bundle.id), beforeDelete);
   assert.equal(context.database.first<{ count: number }>("SELECT count(*) AS count FROM evidence_audit_events WHERE action='source.removed'").count, 0);
+  assert.equal(context.database.first<{ count: number }>("SELECT count(*) AS count FROM evidence_mutation_receipts").count, 0);
 });
 
-test("a draft scenario link created after impact checks aborts deletion", async () => {
+test("an exact draft-scenario relation created after impact checks aborts deletion", async () => {
   const context = createContext();
   const bundle = await context.service.createBundle(bundleInput, admin);
   const source = await uploadText(context, bundle.id);
   const beforeDelete = await context.repository.getBundle(bundle.id);
   assert.ok(beforeDelete);
   context.database.beforeNextBatch = () => {
-    context.database.run(
-      `INSERT INTO scenarios
-        (id,campaign_id,role,principle,prompt,hint,explanation,pitch_json,answer_json,content_json,review_status,order_index)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
-      "race-scenario", "diamond-121-intro", "ala", "width", "p", "h", "e", "{}", "{}",
-      JSON.stringify({ sourceIds: [source.id] }), "draft", 99,
-    );
+    insertDraftScenario(context.database, "race-scenario", JSON.stringify({ narrative: "unrelated" }));
+    linkScenarioSource(context.database, "race-scenario", source.id);
   };
 
   await assert.rejects(() => context.service.removeSource(source.id, admin), /연결/);
@@ -299,6 +366,116 @@ test("a draft scenario link created after impact checks aborts deletion", async 
   assert.ok(context.bucket.objects.has(source.storageKey));
   assert.ok(source.extractedTextKey !== null && context.bucket.objects.has(source.extractedTextKey));
   assert.deepEqual(await context.repository.getBundle(bundle.id), beforeDelete);
+  assert.equal(context.database.first<{ count: number }>("SELECT count(*) AS count FROM evidence_mutation_receipts").count, 0);
+});
+
+test("an exact scenario/source relation is reported and blocks deletion before R2", async () => {
+  const context = createContext();
+  const bundle = await context.service.createBundle(bundleInput, admin);
+  const source = await uploadText(context, bundle.id);
+  insertDraftScenario(context.database, "linked-scenario", JSON.stringify({ narrative: "no source id here" }));
+  linkScenarioSource(context.database, "linked-scenario", source.id);
+
+  assert.deepEqual(await context.service.describeDeleteImpact(source.id), {
+    sourceId: source.id,
+    cardIds: [],
+    scenarioDraftIds: ["linked-scenario"],
+  });
+  await assert.rejects(() => context.service.removeSource(source.id, admin), /연결/);
+  assert.ok(context.bucket.objects.has(source.storageKey));
+  assert.ok(source.extractedTextKey !== null && context.bucket.objects.has(source.extractedTextKey));
+});
+
+test("unrelated scenario narrative text containing a source id does not block deletion", async () => {
+  const context = createContext();
+  assert.equal(
+    context.database.first<{ count: number }>(
+      "SELECT count(*) AS count FROM sqlite_master WHERE type='trigger' AND name='trg_evidence_sources_block_linked_delete'",
+    ).count,
+    0,
+  );
+  const bundle = await context.service.createBundle(bundleInput, admin);
+  const source = await uploadText(context, bundle.id);
+  insertDraftScenario(
+    context.database,
+    "narrative-scenario",
+    JSON.stringify({ narrative: `The identifier ${source.id} is only quoted text.` }),
+  );
+
+  await context.service.removeSource(source.id, admin);
+
+  assert.equal(await context.repository.findSource(source.id), null);
+  assert.equal(context.bucket.objects.size, 0);
+});
+
+test("deleting a scenario cascades its exact evidence relations", async () => {
+  const context = createContext();
+  const bundle = await context.service.createBundle(bundleInput, admin);
+  const source = await uploadText(context, bundle.id);
+  insertDraftScenario(context.database, "cascade-scenario", "{}");
+  linkScenarioSource(context.database, "cascade-scenario", source.id);
+
+  context.database.run("DELETE FROM scenarios WHERE id=?", "cascade-scenario");
+
+  assert.equal(
+    context.database.first<{ count: number }>(
+      "SELECT count(*) AS count FROM scenario_evidence_sources WHERE scenario_id=?",
+      "cascade-scenario",
+    ).count,
+    0,
+  );
+  assert.ok(await context.repository.findSource(source.id));
+});
+
+test("a scenario relation cannot be inserted after its source was deleted", async () => {
+  const context = createContext();
+  const bundle = await context.service.createBundle(bundleInput, admin);
+  const source = await uploadText(context, bundle.id);
+  await context.service.removeSource(source.id, admin);
+  insertDraftScenario(context.database, "late-scenario", "{}");
+
+  assert.throws(
+    () => linkScenarioSource(context.database, "late-scenario", source.id),
+    /FOREIGN KEY/,
+  );
+});
+
+test("a competing removal that wins before the loser rereads D1 does not double-version or restore R2", async () => {
+  const context = createContext();
+  const bundle = await context.service.createBundle(bundleInput, admin);
+  const source = await uploadText(context, bundle.id);
+  const beforeDelete = await context.repository.getBundle(bundle.id);
+  assert.ok(beforeDelete);
+  context.bucket.afterObjectsDeleted = () => removeSourceAsCompetingWinner(context, source.id);
+
+  await assert.rejects(() => context.service.removeSource(source.id, admin), EvidenceConflictError);
+
+  const afterDelete = await context.repository.getBundle(bundle.id);
+  assert.ok(afterDelete);
+  assert.equal(afterDelete.version, beforeDelete.version + 1);
+  assert.equal(await context.repository.findSource(source.id), null);
+  assert.equal(context.bucket.objects.size, 0);
+  assert.equal(context.database.first<{ count: number }>("SELECT count(*) AS count FROM evidence_audit_events WHERE action='source.removed'").count, 1);
+  assert.equal(context.database.first<{ count: number }>("SELECT count(*) AS count FROM evidence_mutation_receipts").count, 1);
+});
+
+test("a competing removal that wins after the loser reads old state leaves loser R2 deleted", async () => {
+  const context = createContext();
+  const bundle = await context.service.createBundle(bundleInput, admin);
+  const source = await uploadText(context, bundle.id);
+  const beforeDelete = await context.repository.getBundle(bundle.id);
+  assert.ok(beforeDelete);
+  context.database.beforeNextBatch = () => removeSourceAsCompetingWinner(context, source.id);
+
+  await assert.rejects(() => context.service.removeSource(source.id, admin), EvidenceConflictError);
+
+  const afterDelete = await context.repository.getBundle(bundle.id);
+  assert.ok(afterDelete);
+  assert.equal(afterDelete.version, beforeDelete.version + 1);
+  assert.equal(await context.repository.findSource(source.id), null);
+  assert.equal(context.bucket.objects.size, 0);
+  assert.equal(context.database.first<{ count: number }>("SELECT count(*) AS count FROM evidence_audit_events WHERE action='source.removed'").count, 1);
+  assert.equal(context.database.first<{ count: number }>("SELECT count(*) AS count FROM evidence_mutation_receipts").count, 1);
 });
 
 test("an unlinked source removal deletes D1 and both R2 objects in one compensated workflow", async () => {
@@ -315,4 +492,5 @@ test("an unlinked source removal deletes D1 and both R2 objects in one compensat
   assert.equal(context.bucket.objects.has(source.storageKey), false);
   assert.equal(source.extractedTextKey === null ? true : context.bucket.objects.has(source.extractedTextKey), false);
   assert.equal(context.database.first<{ count: number }>("SELECT count(*) AS count FROM evidence_audit_events WHERE action='source.removed'").count, 1);
+  assert.equal(context.database.first<{ count: number }>("SELECT count(*) AS count FROM evidence_mutation_receipts").count, 1);
 });

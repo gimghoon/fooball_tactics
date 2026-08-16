@@ -268,14 +268,26 @@ export class EvidenceFileStore {
     throw new AggregateError([...errors, ...restoreErrors], "근거 파일 쌍을 모두 삭제하지 못했습니다.");
   }
 
-  /** Restores the exact R2 pair when the following authoritative D1 mutation rejects. */
-  async deleteFilePairWithCompensation<T>(originalKey: string, extractedKey: string | null, mutation: () => Promise<T>): Promise<T> {
+  /** Restores the R2 pair after D1 rejection only while D1 still owns the source. */
+  async deleteFilePairWithCompensation<T>(
+    originalKey: string,
+    extractedKey: string | null,
+    mutation: () => Promise<T>,
+    shouldRestore: () => Promise<boolean>,
+  ): Promise<T> {
     const keys = [originalKey, ...(extractedKey === null ? [] : [extractedKey])];
     const snapshots = await Promise.all(keys.map((key) => this.snapshotFile(key)));
     await this.deleteFilePair(originalKey, extractedKey);
     try {
       return await mutation();
     } catch (error) {
+      let restore: boolean;
+      try {
+        restore = await shouldRestore();
+      } catch (authorityError) {
+        throw new AggregateError([error, authorityError], "근거 삭제 복구 여부를 확인하지 못했습니다.");
+      }
+      if (!restore) throw error;
       const restored = await Promise.allSettled(snapshots.map((snapshot, index) => snapshot === null ? undefined : this.dependencies.bucket.put(keys[index]!, snapshot)));
       const restoreErrors = restored.flatMap((result) => result.status === "rejected" ? [result.reason] : []);
       if (restoreErrors.length) throw new AggregateError([error, ...restoreErrors], "근거 삭제를 복구하지 못했습니다.");

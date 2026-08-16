@@ -1,5 +1,5 @@
 import { sql } from "drizzle-orm";
-import { check, foreignKey, index, integer, sqliteTable, text, uniqueIndex } from "drizzle-orm/sqlite-core";
+import { check, foreignKey, index, integer, primaryKey, sqliteTable, text, uniqueIndex } from "drizzle-orm/sqlite-core";
 
 export const campaigns = sqliteTable("campaigns", {
   id: text("id").primaryKey(), title: text("title").notNull(), formation: text("formation").notNull(),
@@ -77,6 +77,21 @@ export const evidenceSources = sqliteTable("evidence_sources", {
     "ck_evidence_sources_media_type_and_size",
     sql`${table.mediaType} IN ('application/pdf', 'text/plain', 'text/markdown') AND ${table.byteSize} BETWEEN 0 AND 20971520`,
   ),
+]);
+
+export const evidenceMutationReceipts = sqliteTable("evidence_mutation_receipts", {
+  id: text("id").primaryKey(),
+  bundleId: text("bundle_id").notNull().references(() => evidenceBundles.id, { onDelete: "cascade" }),
+  sourceId: text("source_id").notNull(),
+  createdAt: integer("created_at", { mode: "timestamp_ms" }).notNull(),
+}, (table) => [index("idx_evidence_mutation_receipts_bundle_source").on(table.bundleId, table.sourceId)]);
+
+export const scenarioEvidenceSources = sqliteTable("scenario_evidence_sources", {
+  scenarioId: text("scenario_id").notNull().references(() => scenarios.id, { onDelete: "cascade" }),
+  sourceId: text("source_id").notNull().references(() => evidenceSources.id, { onDelete: "restrict" }),
+}, (table) => [
+  primaryKey({ columns: [table.scenarioId, table.sourceId] }),
+  index("idx_scenario_evidence_sources_source").on(table.sourceId),
 ]);
 
 export const evidenceVideoClips = sqliteTable("evidence_video_clips", {

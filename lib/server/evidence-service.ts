@@ -24,13 +24,35 @@ export class D1EvidenceServiceRepository implements EvidenceServiceRepository {
   async findSource(id:string){return this.db.prepare("SELECT id,bundle_id AS bundleId,original_file_name AS originalFileName,media_type AS mediaType,byte_size AS byteSize,content_hash AS contentHash,storage_key AS storageKey,extracted_text_key AS extractedTextKey,extraction_status AS extractionStatus,extraction_error AS extractionError FROM evidence_sources WHERE id=?").bind(id).first<StoredEvidenceFile>()}
   async listVideoClips(bundleId:string){return (await this.db.prepare("SELECT id,bundle_id AS bundleId,url,start_ms AS startMs,end_ms AS endMs,observation,created_at AS createdAt,updated_at AS updatedAt FROM evidence_video_clips WHERE bundle_id=?").bind(bundleId).all<EvidenceVideoClipRecord>()).results}
   async findSourceByHash(bundleId:string,hash:string){return this.db.prepare("SELECT id,bundle_id AS bundleId,original_file_name AS originalFileName,media_type AS mediaType,byte_size AS byteSize,content_hash AS contentHash,storage_key AS storageKey,extracted_text_key AS extractedTextKey,extraction_status AS extractionStatus,extraction_error AS extractionError FROM evidence_sources WHERE bundle_id=? AND content_hash=?").bind(bundleId,hash).first<StoredEvidenceFile>()}
-  async describeDeleteImpact(sourceId:string){const [cards,scenarios]=await Promise.all([this.db.prepare("SELECT DISTINCT c.id FROM tactic_cards c JOIN tactic_card_citations x ON x.card_id=c.id JOIN evidence_chunks h ON h.id=x.chunk_id WHERE h.source_id=?").bind(sourceId).all<{id:string}>(),this.db.prepare("SELECT id FROM scenarios WHERE review_status='draft' AND content_json LIKE '%' || ? || '%'").bind(sourceId).all<{id:string}>()]);return{sourceId,cardIds:cards.results.map(x=>x.id),scenarioDraftIds:scenarios.results.map(x=>x.id)}}
+  async describeDeleteImpact(sourceId:string){const [cards,scenarios]=await Promise.all([this.db.prepare("SELECT DISTINCT c.id FROM tactic_cards c JOIN tactic_card_citations x ON x.card_id=c.id JOIN evidence_chunks h ON h.id=x.chunk_id WHERE h.source_id=?").bind(sourceId).all<{id:string}>(),this.db.prepare("SELECT DISTINCT s.id FROM scenario_evidence_sources x JOIN scenarios s ON s.id=x.scenario_id WHERE x.source_id=? AND s.review_status='draft'").bind(sourceId).all<{id:string}>()]);return{sourceId,cardIds:cards.results.map(x=>x.id),scenarioDraftIds:scenarios.results.map(x=>x.id)}}
   async createBundle(b:EvidenceBundleRecord,a:EvidenceAuditEventInput){await this.db.batch([this.db.prepare("INSERT INTO evidence_bundles (id,title,purpose,version,content_version,created_at,updated_at) VALUES (?,?,?,?,?,?,?)").bind(b.id,b.title,b.purpose,b.version,b.contentVersion,b.createdAt,b.updatedAt),this.audit(a,"EXISTS (SELECT 1 FROM evidence_bundles WHERE id=?)",[b.id])])}
   async applyMutation(mutation: EvidenceMutation) {
     const current = mutation.current;
     const next = mutation.next;
     const oldState = [current.id, current.version, current.contentVersion];
     const statements: EvidenceD1Statement[] = [];
+    let dependentGuard = guard;
+    let dependentGuardValues: unknown[] = oldState;
+
+    if (mutation.sourceToDelete) {
+      // D1 does not fail a batch when a required DELETE affects zero rows. This
+      // durable receipt materializes target existence so every later write,
+      // including the final CAS, can depend on the same SQL precondition.
+      const receiptId = mutation.audit.id;
+      statements.push(this.db.prepare(
+        `INSERT INTO evidence_mutation_receipts (id,bundle_id,source_id,created_at)
+          SELECT ?,?,?,? FROM evidence_sources
+          WHERE id=? AND bundle_id=? AND ${guard}`,
+      ).bind(
+        receiptId, current.id, mutation.sourceToDelete, next.updatedAt,
+        mutation.sourceToDelete, current.id, ...oldState,
+      ));
+      dependentGuard = `${guard} AND EXISTS (
+        SELECT 1 FROM evidence_mutation_receipts
+        WHERE id=? AND bundle_id=? AND source_id=?
+      )`;
+      dependentGuardValues = [...oldState, receiptId, current.id, mutation.sourceToDelete];
+    }
 
     if (mutation.sourceToInsert) {
       const source = mutation.sourceToInsert;
@@ -45,8 +67,8 @@ export class D1EvidenceServiceRepository implements EvidenceServiceRepository {
     }
     if (mutation.sourceToDelete) {
       statements.push(this.db.prepare(
-        `DELETE FROM evidence_sources WHERE id=? AND ${guard}`,
-      ).bind(mutation.sourceToDelete, ...oldState));
+        `DELETE FROM evidence_sources WHERE id=? AND bundle_id=? AND ${dependentGuard}`,
+      ).bind(mutation.sourceToDelete, current.id, ...dependentGuardValues));
     }
     if (mutation.clipToInsert) {
       const clip = mutation.clipToInsert;
@@ -66,21 +88,29 @@ export class D1EvidenceServiceRepository implements EvidenceServiceRepository {
             status=CASE WHEN status IN ('queued','running','review_ready') THEN 'failed' ELSE status END,
             error_message=CASE WHEN status IN ('queued','running','review_ready') THEN 'evidence version superseded' ELSE error_message END,
             updated_at=?
-          WHERE bundle_id=? AND input_version<>? AND ${guard}`,
-      ).bind(next.updatedAt, current.id, next.contentVersion, ...oldState),
+          WHERE bundle_id=? AND input_version<>? AND ${dependentGuard}`,
+      ).bind(next.updatedAt, current.id, next.contentVersion, ...dependentGuardValues),
       this.db.prepare(
         `UPDATE tactic_cards
           SET is_stale=1,
             status=CASE WHEN status IN ('analysis_draft','owner_reviewed','coach_reviewed') THEN 'held' ELSE status END,
             updated_at=?
-          WHERE bundle_id=? AND bundle_version<>? AND ${guard}`,
-      ).bind(next.updatedAt, current.id, next.contentVersion, ...oldState),
-      this.audit(mutation.audit, guard, oldState),
+          WHERE bundle_id=? AND bundle_version<>? AND ${dependentGuard}`,
+      ).bind(next.updatedAt, current.id, next.contentVersion, ...dependentGuardValues),
+      this.audit(mutation.audit, dependentGuard, dependentGuardValues),
       // D1 batch statements execute sequentially. The CAS must remain last so
       // every dependent old-state guard is true on success and false on a miss.
       this.db.prepare(
-        "UPDATE evidence_bundles SET title=?,purpose=?,version=?,content_version=?,updated_at=? WHERE id=? AND version=? AND content_version=?",
-      ).bind(next.title, next.purpose, next.version, next.contentVersion, next.updatedAt, ...oldState),
+        `UPDATE evidence_bundles
+          SET title=?,purpose=?,version=?,content_version=?,updated_at=?
+          WHERE id=? AND version=? AND content_version=?${mutation.sourceToDelete ? ` AND EXISTS (
+            SELECT 1 FROM evidence_mutation_receipts
+            WHERE id=? AND bundle_id=? AND source_id=?
+          )` : ""}`,
+      ).bind(
+        next.title, next.purpose, next.version, next.contentVersion, next.updatedAt, ...oldState,
+        ...(mutation.sourceToDelete ? [mutation.audit.id, current.id, mutation.sourceToDelete] : []),
+      ),
     );
 
     const results = await this.db.batch(statements);
@@ -96,7 +126,47 @@ export class EvidenceService {
   sourceRegistration(a:EvidenceAdmin){return{findExisting:(b:string,h:string)=>this.d.repository.findSourceByHash(b,h),register:(s:StoredEvidenceFile)=>this.addSource(s,a)}}
   async addSource(s:StoredEvidenceFile,a:EvidenceAdmin){const c=await this.need(s.bundleId),now=this.now(),n={...c,version:c.version+1,contentVersion:await this.hash(c.purpose,[...await this.d.repository.listSources(c.id),s],await this.d.repository.listVideoClips(c.id)),updatedAt:now};await this.commit({current:c,next:n,sourceToInsert:s,audit:this.audit(n,a,"source.added","source",s.id,{contentHash:s.contentHash},now)});return s}
   async describeDeleteImpact(id:string){return this.d.repository.describeDeleteImpact(id)}
-  async removeSource(id:string,a:EvidenceAdmin){const s=await this.d.repository.findSource(id);if(!s)throw new Error("근거 파일을 찾을 수 없습니다.");this.links(await this.describeDeleteImpact(id));if(!this.d.fileStore)throw new Error("근거 파일 저장소가 구성되지 않았습니다.");return this.d.fileStore.deleteFilePairWithCompensation(s.storageKey,s.extractedTextKey,async()=>{this.links(await this.describeDeleteImpact(id));const c=await this.need(s.bundleId),now=this.now(),n={...c,version:c.version+1,contentVersion:await this.hash(c.purpose,(await this.d.repository.listSources(c.id)).filter(x=>x.id!==id),await this.d.repository.listVideoClips(c.id)),updatedAt:now};await this.commit({current:c,next:n,sourceToDelete:id,audit:this.audit(n,a,"source.removed","source",id,{},now)});return n})}
+  async removeSource(id: string, admin: EvidenceAdmin) {
+    const source = await this.d.repository.findSource(id);
+    if (!source) throw new Error("근거 파일을 찾을 수 없습니다.");
+    this.links(await this.describeDeleteImpact(id));
+    if (!this.d.fileStore) throw new Error("근거 파일 저장소가 구성되지 않았습니다.");
+
+    return this.d.fileStore.deleteFilePairWithCompensation(
+      source.storageKey,
+      source.extractedTextKey,
+      async () => {
+        this.links(await this.describeDeleteImpact(id));
+        const current = await this.need(source.bundleId);
+        const now = this.now();
+        const next = {
+          ...current,
+          version: current.version + 1,
+          contentVersion: await this.hash(
+            current.purpose,
+            (await this.d.repository.listSources(current.id)).filter((item) => item.id !== id),
+            await this.d.repository.listVideoClips(current.id),
+          ),
+          updatedAt: now,
+        };
+        try {
+          await this.commit({
+            current,
+            next,
+            sourceToDelete: id,
+            audit: this.audit(next, admin, "source.removed", "source", id, {}, now),
+          });
+        } catch (error) {
+          // A relation can appear after both advisory impact checks. Translate
+          // the authoritative FK/trigger rollback into the public domain error.
+          this.links(await this.describeDeleteImpact(id));
+          throw error;
+        }
+        return next;
+      },
+      async () => await this.d.repository.findSource(id) !== null,
+    );
+  }
   async getBundleForAdmin(id:string,a:EvidenceAdmin):Promise<EvidenceBundleDetail|null>{void a;const b=await this.d.repository.getBundle(id);return b?{...b,sources:await this.d.repository.listSources(id),videoClips:await this.d.repository.listVideoClips(id)}:null} async listBundlesForAdmin(a:EvidenceAdmin){void a;return this.d.repository.listBundles()}
   private async commit(m:EvidenceMutation){if(!await this.d.repository.applyMutation(m))throw new EvidenceConflictError()} private async need(id:string){const b=await this.d.repository.getBundle(id);if(!b)throw new Error("근거 묶음을 찾을 수 없습니다.");return b} private hash(p:string,s:Pick<StoredEvidenceFile,"contentHash">[],c:VideoClipInput[]){return computeEvidenceVersion({purpose:p,sourceHashes:s.map(x=>x.contentHash),clips:c,...this.d.settings})} private links(x:EvidenceDeleteImpact){if(x.cardIds.length||x.scenarioDraftIds.length)throw new Error("연결된 카드 또는 시나리오 초안이 있어 근거를 삭제할 수 없습니다.")} private audit(b:EvidenceBundleRecord,a:EvidenceAdmin,ac:string,t:string,id:string,o:object,at:number):EvidenceAuditEventInput{return{id:this.id(),bundleId:b.id,actorUserId:a.userId,action:ac,targetType:t,targetId:id,detailsJson:JSON.stringify(o),createdAt:at}}private now(){return this.d.now?.()??Date.now()}private id(){return this.d.newId?.()??crypto.randomUUID()}
 }

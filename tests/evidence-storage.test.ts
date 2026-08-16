@@ -360,11 +360,35 @@ test("restores both R2 objects when the later authoritative mutation fails", asy
   bucket.objects.set("extracted", "extracted");
 
   await assert.rejects(
-    () => store.deleteFilePairWithCompensation("original", "extracted", async () => { throw new Error("late D1 failure"); }),
+    () => store.deleteFilePairWithCompensation(
+      "original",
+      "extracted",
+      async () => { throw new Error("late D1 failure"); },
+      async () => true,
+    ),
     /late D1 failure/,
   );
   assert.equal(await store.getFile("original"), "original");
   assert.equal(await store.getFile("extracted"), "extracted");
+});
+
+test("does not restore R2 objects when authoritative D1 says the source was deleted", async () => {
+  const bucket = new FakeR2();
+  const store = new EvidenceFileStore({ bucket, registration: new FakeD1() });
+  bucket.objects.set("original", "original");
+  bucket.objects.set("extracted", "extracted");
+
+  await assert.rejects(
+    () => store.deleteFilePairWithCompensation(
+      "original",
+      "extracted",
+      async () => { throw new Error("lost delete CAS"); },
+      async () => false,
+    ),
+    /lost delete CAS/,
+  );
+  assert.equal(await store.getFile("original"), null);
+  assert.equal(await store.getFile("extracted"), null);
 });
 
 test("bounds Cloudflare R2 stream snapshots before attempting pair deletion", async () => {
