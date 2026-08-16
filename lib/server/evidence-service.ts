@@ -1,4 +1,15 @@
-import { computeEvidenceVersion, parseBundleInput, parseVideoClip, type EvidenceBundleInput, type VideoClipInput } from "../domain/evidence.ts";
+import { parseScenarioContent, type ScenarioContent } from "../domain/content.ts";
+import {
+  assertCardReviewTransition,
+  computeEvidenceVersion,
+  parseBundleInput,
+  parseTacticCardContent,
+  parseVideoClip,
+  type CardReviewStatus,
+  type EvidenceBundleInput,
+  type TacticCardContent,
+  type VideoClipInput,
+} from "../domain/evidence.ts";
 import type { EvidenceAdmin } from "./evidence-auth.ts";
 import type { EvidenceFileStore, StoredEvidenceFile } from "./evidence-storage.ts";
 
@@ -10,11 +21,149 @@ export type EvidenceDeleteImpact={sourceId:string;cardIds:string[];scenarioDraft
 export type EvidenceBundleDetail=EvidenceBundleRecord&{sources:StoredEvidenceFile[];videoClips:EvidenceVideoClipRecord[]};
 export type EvidenceBundleUpdate=Partial<EvidenceBundleInput>;
 export class EvidenceConflictError extends Error { readonly status=409; constructor(){super("근거 묶음이 다른 변경으로 갱신되었습니다. 다시 시도해 주세요.");} }
+export type EvidenceCardRecord = {
+  id: string;
+  bundleId: string;
+  jobId: string;
+  bundleVersion: string;
+  currentBundleVersion: string;
+  status: CardReviewStatus;
+  draftContentJson: string;
+  currentContentJson: string;
+  isStale: boolean;
+  createdAt: number;
+  updatedAt: number;
+};
+export type EvidenceCitationSnapshot = {
+  chunkId: string;
+  sourceId: string | null;
+  videoClipId: string | null;
+  locationLabel: string;
+  content: string;
+  contentHash: string;
+};
+export type EvidenceCardReviewRecord = {
+  id: string;
+  cardId: string;
+  actorUserId: string;
+  status: CardReviewStatus;
+  contentJson: string;
+  citationSnapshotJson: string;
+  bundleVersion: string;
+  createdAt: number;
+};
+export type EvidenceCardReviewCommand = {
+  status: CardReviewStatus;
+  content: unknown;
+  expectedUpdatedAt: number;
+};
+export type EvidenceScenarioDraftInput = {
+  expectedUpdatedAt: number;
+  campaignId: string;
+  role: "fixo" | "ala" | "pivo" | "recap";
+  principle: "width" | "support" | "pivot" | "transition";
+  prompt: string;
+  hint: string;
+  explanation: string;
+  orderIndex: number;
+  content: unknown;
+};
+export type EvidenceScenarioDraftRecord = {
+  id: string;
+  campaignId: string;
+  role: EvidenceScenarioDraftInput["role"];
+  principle: EvidenceScenarioDraftInput["principle"];
+  prompt: string;
+  hint: string;
+  explanation: string;
+  pitchJson: string;
+  answerJson: string;
+  contentJson: string;
+  reviewStatus: "draft";
+  orderIndex: number;
+};
+export type EvidenceCardReviewMutation = {
+  card: EvidenceCardRecord;
+  expectedUpdatedAt: number;
+  nextUpdatedAt: number;
+  status: CardReviewStatus;
+  contentJson: string;
+  originalReview: EvidenceCardReviewRecord;
+  review: EvidenceCardReviewRecord;
+  audit: EvidenceAuditEventInput;
+};
+export type EvidenceScenarioDraftMutation = {
+  card: EvidenceCardRecord;
+  review: EvidenceCardReviewRecord;
+  expectedUpdatedAt: number;
+  scenario: EvidenceScenarioDraftRecord;
+  sourceIds: string[];
+  audit: EvidenceAuditEventInput;
+  createdAt: number;
+};
 export type EvidenceMutation={current:EvidenceBundleRecord;next:EvidenceBundleRecord;audit:EvidenceAuditEventInput;sourceToInsert?:StoredEvidenceFile;sourceToDelete?:string;clipToInsert?:EvidenceVideoClipRecord};
 export type EvidenceD1Statement={bind(...values:unknown[]):EvidenceD1Statement;first<T>():Promise<T|null>;all<T>():Promise<{results:T[]}>;run():Promise<{meta?:{changes?:number}}>};
 export type EvidenceD1Database={prepare(query:string):EvidenceD1Statement;batch(statements:EvidenceD1Statement[]):Promise<{meta?:{changes?:number}}[]>};
-export type EvidenceServiceRepository={getBundle(id:string):Promise<EvidenceBundleRecord|null>;listBundles():Promise<EvidenceBundleRecord[]>;listSources(bundleId:string):Promise<StoredEvidenceFile[]>;findSource(sourceId:string):Promise<StoredEvidenceFile|null>;listVideoClips(bundleId:string):Promise<EvidenceVideoClipRecord[]>;findSourceByHash(bundleId:string,hash:string):Promise<StoredEvidenceFile|null>;describeDeleteImpact(sourceId:string):Promise<EvidenceDeleteImpact>;createBundle(bundle:EvidenceBundleRecord,audit:EvidenceAuditEventInput):Promise<void>;applyMutation(mutation:EvidenceMutation):Promise<boolean>};
+export type EvidenceServiceRepository={
+  getBundle(id:string):Promise<EvidenceBundleRecord|null>;
+  listBundles():Promise<EvidenceBundleRecord[]>;
+  listSources(bundleId:string):Promise<StoredEvidenceFile[]>;
+  findSource(sourceId:string):Promise<StoredEvidenceFile|null>;
+  listVideoClips(bundleId:string):Promise<EvidenceVideoClipRecord[]>;
+  findSourceByHash(bundleId:string,hash:string):Promise<StoredEvidenceFile|null>;
+  describeDeleteImpact(sourceId:string):Promise<EvidenceDeleteImpact>;
+  createBundle(bundle:EvidenceBundleRecord,audit:EvidenceAuditEventInput):Promise<void>;
+  applyMutation(mutation:EvidenceMutation):Promise<boolean>;
+  findCard(cardId:string):Promise<EvidenceCardRecord|null>;
+  listCardCitations(cardId:string):Promise<(EvidenceCitationSnapshot&{inputVersion:string})[]>;
+  findCurrentCardReview(cardId:string):Promise<EvidenceCardReviewRecord|null>;
+  applyCardReview(mutation:EvidenceCardReviewMutation):Promise<boolean>;
+  findScenarioDraftByReview(reviewId:string):Promise<EvidenceScenarioDraftRecord|null>;
+  createScenarioDraft(mutation:EvidenceScenarioDraftMutation):Promise<boolean>;
+};
 const guard="EXISTS (SELECT 1 FROM evidence_bundles WHERE id=? AND version=? AND content_version=?)";
+const CARD_REVIEW_STATUSES: readonly CardReviewStatus[] = ["analysis_draft", "owner_reviewed", "coach_reviewed", "held", "rejected"];
+const SCENARIO_ROLES: readonly EvidenceScenarioDraftInput["role"][] = ["fixo", "ala", "pivo", "recap"];
+const SCENARIO_PRINCIPLES: readonly EvidenceScenarioDraftInput["principle"][] = ["width", "support", "pivot", "transition"];
+
+function cardCitationIds(content: TacticCardContent): string[] {
+  return [...new Set(
+    [...content.preferred, ...content.alternatives, ...content.risky].flatMap((action) => action.citationIds),
+  )].sort();
+}
+
+function exactCitationSnapshot(
+  content: TacticCardContent,
+  citations: (EvidenceCitationSnapshot & { inputVersion: string })[],
+  bundleVersion: string,
+): EvidenceCitationSnapshot[] {
+  const current = new Map(
+    citations.filter((citation) => citation.inputVersion === bundleVersion).map((citation) => [citation.chunkId, citation]),
+  );
+  const ids = cardCitationIds(content);
+  if (ids.some((id) => !current.has(id))) throw new Error("현재 카드의 유효한 근거를 확인할 수 없어 검수할 수 없습니다.");
+  return ids.map((id) => {
+    const citation = current.get(id)!;
+    return {
+      chunkId: citation.chunkId,
+      sourceId: citation.sourceId,
+      videoClipId: citation.videoClipId,
+      locationLabel: citation.locationLabel,
+      content: citation.content,
+      contentHash: citation.contentHash,
+    };
+  });
+}
+
+function expectedTimestamp(value: number): number {
+  if (!Number.isInteger(value) || value < 0) throw new Error("expectedUpdatedAt이 필요합니다.");
+  return value;
+}
+
+function requiredText(value: unknown, field: string): string {
+  if (typeof value !== "string" || value.trim() === "") throw new Error(`${field}이 필요합니다.`);
+  return value;
+}
 /** Production D1 adapter: every dependent write shares an optimistic-CAS guard in one atomic batch. */
 export class D1EvidenceServiceRepository implements EvidenceServiceRepository {
   constructor(private readonly db:EvidenceD1Database){}
@@ -116,6 +265,136 @@ export class D1EvidenceServiceRepository implements EvidenceServiceRepository {
     const results = await this.db.batch(statements);
     return (results.at(-1)?.meta?.changes ?? 0) === 1;
   }
+  async findCard(cardId: string): Promise<EvidenceCardRecord | null> {
+    const row = await this.db.prepare(
+      `SELECT card.id,card.bundle_id AS bundleId,card.job_id AS jobId,card.bundle_version AS bundleVersion,
+        bundle.content_version AS currentBundleVersion,card.status,card.draft_content_json AS draftContentJson,
+        card.current_content_json AS currentContentJson,card.is_stale AS isStale,
+        card.created_at AS createdAt,card.updated_at AS updatedAt
+        FROM tactic_cards AS card
+        JOIN evidence_bundles AS bundle ON bundle.id=card.bundle_id
+        WHERE card.id=?`,
+    ).bind(cardId).first<EvidenceCardRecord>();
+    return row === null ? null : { ...row, isStale: Boolean(row.isStale) };
+  }
+  async listCardCitations(cardId: string): Promise<(EvidenceCitationSnapshot & { inputVersion: string })[]> {
+    return (await this.db.prepare(
+      `SELECT chunk.id AS chunkId,chunk.source_id AS sourceId,chunk.video_clip_id AS videoClipId,
+        chunk.location_label AS locationLabel,chunk.content,chunk.content_hash AS contentHash,chunk.input_version AS inputVersion
+        FROM tactic_card_citations AS citation
+        JOIN evidence_chunks AS chunk ON chunk.id=citation.chunk_id AND chunk.bundle_id=citation.bundle_id
+        WHERE citation.card_id=? ORDER BY chunk.id`,
+    ).bind(cardId).all<EvidenceCitationSnapshot & { inputVersion: string }>()).results;
+  }
+  async findCurrentCardReview(cardId: string): Promise<EvidenceCardReviewRecord | null> {
+    return this.db.prepare(
+      `SELECT review.id,review.card_id AS cardId,review.actor_user_id AS actorUserId,review.status,
+        review.content_json AS contentJson,review.citation_snapshot_json AS citationSnapshotJson,
+        review.bundle_version AS bundleVersion,review.created_at AS createdAt
+        FROM tactic_card_reviews AS review
+        JOIN tactic_cards AS card ON card.id=review.card_id
+        WHERE review.card_id=? AND review.status=card.status
+          AND review.content_json=card.current_content_json AND review.bundle_version=card.bundle_version
+        ORDER BY review.created_at DESC,review.rowid DESC LIMIT 1`,
+    ).bind(cardId).first<EvidenceCardReviewRecord>();
+  }
+  async applyCardReview(mutation: EvidenceCardReviewMutation): Promise<boolean> {
+    const reviewGuard = `EXISTS (
+      SELECT 1 FROM tactic_cards AS card
+      JOIN evidence_bundles AS bundle ON bundle.id=card.bundle_id
+      WHERE card.id=? AND card.updated_at=? AND card.is_stale=0
+        AND card.bundle_version=bundle.content_version
+    )`;
+    const guardValues = [mutation.card.id, mutation.expectedUpdatedAt];
+    const original = mutation.originalReview;
+    const review = mutation.review;
+    const statements = [
+      this.db.prepare(
+        `INSERT INTO tactic_card_reviews
+          (id,card_id,actor_user_id,status,content_json,citation_snapshot_json,bundle_version,created_at)
+          SELECT ?,?,?,?,?,?,?,? WHERE ${reviewGuard}
+            AND NOT EXISTS (SELECT 1 FROM tactic_card_reviews WHERE card_id=?)`,
+      ).bind(
+        original.id, original.cardId, original.actorUserId, original.status, original.contentJson,
+        original.citationSnapshotJson, original.bundleVersion, original.createdAt, ...guardValues, mutation.card.id,
+      ),
+      this.db.prepare(
+        `INSERT INTO tactic_card_reviews
+          (id,card_id,actor_user_id,status,content_json,citation_snapshot_json,bundle_version,created_at)
+          SELECT ?,?,?,?,?,?,?,? WHERE ${reviewGuard}`,
+      ).bind(
+        review.id, review.cardId, review.actorUserId, review.status, review.contentJson,
+        review.citationSnapshotJson, review.bundleVersion, review.createdAt, ...guardValues,
+      ),
+      this.audit(mutation.audit, reviewGuard, guardValues),
+      this.db.prepare(
+        `UPDATE tactic_cards SET status=?,current_content_json=?,updated_at=?
+          WHERE id=? AND updated_at=? AND is_stale=0
+            AND bundle_version=(SELECT content_version FROM evidence_bundles WHERE id=bundle_id)`,
+      ).bind(
+        mutation.status, mutation.contentJson, mutation.nextUpdatedAt,
+        mutation.card.id, mutation.expectedUpdatedAt,
+      ),
+    ];
+    const results = await this.db.batch(statements);
+    return (results.at(-1)?.meta?.changes ?? 0) === 1;
+  }
+  async findScenarioDraftByReview(reviewId: string): Promise<EvidenceScenarioDraftRecord | null> {
+    return this.db.prepare(
+      `SELECT scenario.id,scenario.campaign_id AS campaignId,scenario.role,scenario.principle,
+        scenario.prompt,scenario.hint,scenario.explanation,scenario.pitch_json AS pitchJson,
+        scenario.answer_json AS answerJson,scenario.content_json AS contentJson,
+        scenario.review_status AS reviewStatus,scenario.order_index AS orderIndex
+        FROM scenario_tactic_card_reviews AS provenance
+        JOIN scenarios AS scenario ON scenario.id=provenance.scenario_id
+        WHERE provenance.card_review_id=?`,
+    ).bind(reviewId).first<EvidenceScenarioDraftRecord>();
+  }
+  async createScenarioDraft(mutation: EvidenceScenarioDraftMutation): Promise<boolean> {
+    const scenario = mutation.scenario;
+    const conversionGuard = `EXISTS (
+      SELECT 1 FROM tactic_cards AS card
+      JOIN evidence_bundles AS bundle ON bundle.id=card.bundle_id
+      JOIN tactic_card_reviews AS review ON review.id=? AND review.card_id=card.id
+      WHERE card.id=? AND card.updated_at=? AND card.is_stale=0
+        AND card.bundle_version=bundle.content_version
+        AND card.status IN ('owner_reviewed','coach_reviewed')
+        AND review.status=card.status AND review.content_json=card.current_content_json
+        AND review.bundle_version=card.bundle_version
+    )`;
+    const guardValues = [mutation.review.id, mutation.card.id, mutation.expectedUpdatedAt];
+    const statements: EvidenceD1Statement[] = [
+      this.db.prepare(
+        `INSERT INTO scenarios
+          (id,campaign_id,role,principle,prompt,hint,explanation,pitch_json,answer_json,content_json,review_status,order_index)
+          SELECT ?,?,?,?,?,?,?,?,?,?,'draft',? WHERE ${conversionGuard}
+            AND NOT EXISTS (SELECT 1 FROM scenario_tactic_card_reviews WHERE card_review_id=?)`,
+      ).bind(
+        scenario.id, scenario.campaignId, scenario.role, scenario.principle, scenario.prompt, scenario.hint,
+        scenario.explanation, scenario.pitchJson, scenario.answerJson, scenario.contentJson, scenario.orderIndex,
+        ...guardValues, mutation.review.id,
+      ),
+      this.db.prepare(
+        `INSERT INTO scenario_tactic_card_reviews (scenario_id,card_id,card_review_id,created_at)
+          VALUES (?,?,?,?)`,
+      ).bind(scenario.id, mutation.card.id, mutation.review.id, mutation.createdAt),
+    ];
+    for (const sourceId of mutation.sourceIds) {
+      statements.push(this.db.prepare(
+        "INSERT INTO scenario_evidence_sources (scenario_id,source_id) VALUES (?,?)",
+      ).bind(scenario.id, sourceId));
+    }
+    statements.push(this.db.prepare(
+      `INSERT INTO evidence_audit_events
+        (id,bundle_id,actor_user_id,action,target_type,target_id,details_json,created_at)
+        VALUES (?,?,?,?,?,?,?,?)`,
+    ).bind(
+      mutation.audit.id, mutation.audit.bundleId, mutation.audit.actorUserId, mutation.audit.action,
+      mutation.audit.targetType, mutation.audit.targetId, mutation.audit.detailsJson, mutation.audit.createdAt,
+    ));
+    const results = await this.db.batch(statements);
+    return (results[0]?.meta?.changes ?? 0) === 1;
+  }
   private audit(a:EvidenceAuditEventInput,w:string,v:unknown[]){return this.db.prepare(`INSERT INTO evidence_audit_events (id,bundle_id,actor_user_id,action,target_type,target_id,details_json,created_at) SELECT ?,?,?,?,?,?,?,? WHERE ${w}`).bind(a.id,a.bundleId,a.actorUserId,a.action,a.targetType,a.targetId,a.detailsJson,a.createdAt,...v)}
 }
 export class EvidenceService {
@@ -167,6 +446,137 @@ export class EvidenceService {
       async () => await this.d.repository.findSource(id) !== null,
     );
   }
+  async reviewCard(cardId: string, command: EvidenceCardReviewCommand, admin: EvidenceAdmin): Promise<EvidenceCardRecord> {
+    if (!CARD_REVIEW_STATUSES.includes(command.status)) throw new Error("카드 검수 상태가 올바르지 않습니다.");
+    const expectedUpdatedAt = expectedTimestamp(command.expectedUpdatedAt);
+    const card = await this.d.repository.findCard(cardId);
+    if (card === null) throw new Error("전술 카드를 찾을 수 없습니다.");
+    if (card.updatedAt !== expectedUpdatedAt) throw new EvidenceConflictError();
+    this.assertCurrentCard(card);
+
+    const content = parseTacticCardContent(command.content);
+    const citations = await this.d.repository.listCardCitations(card.id);
+    const snapshot = exactCitationSnapshot(content, citations, card.bundleVersion);
+    assertCardReviewTransition(command.status, content, new Set(snapshot.map((citation) => citation.chunkId)));
+
+    const original = parseTacticCardContent(card.draftContentJson);
+    const originalSnapshot = exactCitationSnapshot(original, citations, card.bundleVersion);
+    const now = Math.max(this.now(), card.updatedAt + 1);
+    const originalReview: EvidenceCardReviewRecord = {
+      id: this.id(),
+      cardId: card.id,
+      actorUserId: admin.userId,
+      status: "analysis_draft",
+      contentJson: JSON.stringify(original),
+      citationSnapshotJson: JSON.stringify(originalSnapshot),
+      bundleVersion: card.bundleVersion,
+      createdAt: now,
+    };
+    const review: EvidenceCardReviewRecord = {
+      id: this.id(),
+      cardId: card.id,
+      actorUserId: admin.userId,
+      status: command.status,
+      contentJson: JSON.stringify(content),
+      citationSnapshotJson: JSON.stringify(snapshot),
+      bundleVersion: card.bundleVersion,
+      createdAt: now,
+    };
+    const audit = this.audit(
+      { id: card.bundleId }, admin, "card.reviewed", "tactic_card", card.id,
+      { reviewId: review.id, status: command.status, bundleVersion: card.bundleVersion, citationSnapshot: snapshot }, now,
+    );
+    const applied = await this.d.repository.applyCardReview({
+      card,
+      expectedUpdatedAt,
+      nextUpdatedAt: now,
+      status: command.status,
+      contentJson: review.contentJson,
+      originalReview,
+      review,
+      audit,
+    });
+    if (!applied) throw new EvidenceConflictError();
+    return { ...card, status: command.status, currentContentJson: review.contentJson, updatedAt: now };
+  }
+  async createScenarioDraft(
+    cardId: string,
+    input: EvidenceScenarioDraftInput,
+    admin: EvidenceAdmin,
+  ): Promise<EvidenceScenarioDraftRecord> {
+    const expectedUpdatedAt = expectedTimestamp(input.expectedUpdatedAt);
+    const card = await this.d.repository.findCard(cardId);
+    if (card === null) throw new Error("전술 카드를 찾을 수 없습니다.");
+    if (card.updatedAt !== expectedUpdatedAt) throw new EvidenceConflictError();
+    this.assertCurrentCard(card);
+    if (card.status !== "owner_reviewed" && card.status !== "coach_reviewed") {
+      throw new Error("승인된 전술 카드만 시나리오 초안으로 전환할 수 있습니다.");
+    }
+    const reviewedCard = parseTacticCardContent(card.currentContentJson);
+    if (!reviewedCard.scenarioSuitable || !reviewedCard.animationSuitable) {
+      throw new Error("문제와 애니메이션 제작에 적합한 카드만 전환할 수 있습니다.");
+    }
+    const review = await this.d.repository.findCurrentCardReview(card.id);
+    if (review === null) throw new Error("현재 카드의 승인 스냅샷을 찾을 수 없습니다.");
+    const existing = await this.d.repository.findScenarioDraftByReview(review.id);
+    if (existing !== null) return existing;
+
+    const citations = await this.d.repository.listCardCitations(card.id);
+    const snapshot = exactCitationSnapshot(reviewedCard, citations, card.bundleVersion);
+    if (JSON.stringify(snapshot) !== review.citationSnapshotJson) {
+      throw new Error("현재 카드의 근거가 승인 스냅샷과 일치하지 않습니다.");
+    }
+    if (!SCENARIO_ROLES.includes(input.role)) throw new Error("role이 올바르지 않습니다.");
+    if (!SCENARIO_PRINCIPLES.includes(input.principle)) throw new Error("principle이 올바르지 않습니다.");
+    if (!Number.isInteger(input.orderIndex) || input.orderIndex < 0) throw new Error("orderIndex가 올바르지 않습니다.");
+    const content: ScenarioContent = parseScenarioContent({
+      ...parseScenarioContent(input.content),
+      review: { sourceReviewed: false, timelineReviewed: false, explanationsReviewed: false },
+    });
+    const now = this.now();
+    const scenario: EvidenceScenarioDraftRecord = {
+      id: this.id(),
+      campaignId: requiredText(input.campaignId, "campaignId"),
+      role: input.role,
+      principle: input.principle,
+      prompt: requiredText(input.prompt, "prompt"),
+      hint: requiredText(input.hint, "hint"),
+      explanation: requiredText(input.explanation, "explanation"),
+      pitchJson: JSON.stringify(content.pitch),
+      answerJson: JSON.stringify(content.answer),
+      contentJson: JSON.stringify(content),
+      reviewStatus: "draft",
+      orderIndex: input.orderIndex,
+    };
+    const sourceIds = [...new Set(snapshot.flatMap((citation) => citation.sourceId === null ? [] : [citation.sourceId]))].sort();
+    const audit = this.audit(
+      { id: card.bundleId }, admin, "scenario.draft_created", "scenario", scenario.id,
+      { cardId: card.id, reviewId: review.id, bundleVersion: card.bundleVersion, citationSnapshot: snapshot }, now,
+    );
+    try {
+      const created = await this.d.repository.createScenarioDraft({
+        card, review, expectedUpdatedAt, scenario, sourceIds, audit, createdAt: now,
+      });
+      if (!created) throw new EvidenceConflictError();
+    } catch (error) {
+      const winner = await this.d.repository.findScenarioDraftByReview(review.id);
+      if (winner !== null) return winner;
+      const current = await this.d.repository.findCard(card.id);
+      if (current === null || current.updatedAt !== expectedUpdatedAt || current.isStale
+        || current.bundleVersion !== current.currentBundleVersion) {
+        throw new EvidenceConflictError();
+      }
+      throw error;
+    }
+    const created = await this.d.repository.findScenarioDraftByReview(review.id);
+    if (created === null) throw new Error("시나리오 초안 저장 결과를 확인할 수 없습니다.");
+    return created;
+  }
   async getBundleForAdmin(id:string,a:EvidenceAdmin):Promise<EvidenceBundleDetail|null>{void a;const b=await this.d.repository.getBundle(id);return b?{...b,sources:await this.d.repository.listSources(id),videoClips:await this.d.repository.listVideoClips(id)}:null} async listBundlesForAdmin(a:EvidenceAdmin){void a;return this.d.repository.listBundles()}
-  private async commit(m:EvidenceMutation){if(!await this.d.repository.applyMutation(m))throw new EvidenceConflictError()} private async need(id:string){const b=await this.d.repository.getBundle(id);if(!b)throw new Error("근거 묶음을 찾을 수 없습니다.");return b} private hash(p:string,s:Pick<StoredEvidenceFile,"contentHash">[],c:VideoClipInput[]){return computeEvidenceVersion({purpose:p,sourceHashes:s.map(x=>x.contentHash),clips:c,...this.d.settings})} private links(x:EvidenceDeleteImpact){if(x.cardIds.length||x.scenarioDraftIds.length)throw new Error("연결된 카드 또는 시나리오 초안이 있어 근거를 삭제할 수 없습니다.")} private audit(b:EvidenceBundleRecord,a:EvidenceAdmin,ac:string,t:string,id:string,o:object,at:number):EvidenceAuditEventInput{return{id:this.id(),bundleId:b.id,actorUserId:a.userId,action:ac,targetType:t,targetId:id,detailsJson:JSON.stringify(o),createdAt:at}}private now(){return this.d.now?.()??Date.now()}private id(){return this.d.newId?.()??crypto.randomUUID()}
+  private assertCurrentCard(card: EvidenceCardRecord): void {
+    if (card.isStale || card.bundleVersion !== card.currentBundleVersion) {
+      throw new Error("오래된 근거 묶음 버전의 카드는 검수하거나 전환할 수 없습니다.");
+    }
+  }
+  private async commit(m:EvidenceMutation){if(!await this.d.repository.applyMutation(m))throw new EvidenceConflictError()} private async need(id:string){const b=await this.d.repository.getBundle(id);if(!b)throw new Error("근거 묶음을 찾을 수 없습니다.");return b} private hash(p:string,s:Pick<StoredEvidenceFile,"contentHash">[],c:VideoClipInput[]){return computeEvidenceVersion({purpose:p,sourceHashes:s.map(x=>x.contentHash),clips:c,...this.d.settings})} private links(x:EvidenceDeleteImpact){if(x.cardIds.length||x.scenarioDraftIds.length)throw new Error("연결된 카드 또는 시나리오 초안이 있어 근거를 삭제할 수 없습니다.")} private audit(b:Pick<EvidenceBundleRecord,"id">,a:EvidenceAdmin,ac:string,t:string,id:string,o:object,at:number):EvidenceAuditEventInput{return{id:this.id(),bundleId:b.id,actorUserId:a.userId,action:ac,targetType:t,targetId:id,detailsJson:JSON.stringify(o),createdAt:at}}private now(){return this.d.now?.()??Date.now()}private id(){return this.d.newId?.()??crypto.randomUUID()}
 }

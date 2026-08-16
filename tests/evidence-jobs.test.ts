@@ -25,6 +25,14 @@ const admin: EvidenceAdmin = {
 };
 const settings = { analyzerModel: "model-1", promptVersion: "prompt-1", schemaVersion: "schema-1" };
 
+function applyMigrationsBefore(database: DatabaseSync, targetPrefix: string): string {
+  const migrations = readdirSync("drizzle").filter((value) => /^\d{4}_.*\.sql$/.test(value)).sort();
+  const targetIndex = migrations.findIndex((name) => name.startsWith(targetPrefix));
+  assert.notEqual(targetIndex, -1, `Expected migration ${targetPrefix}`);
+  for (const name of migrations.slice(0, targetIndex)) database.exec(readFileSync(`drizzle/${name}`, "utf8"));
+  return migrations[targetIndex];
+}
+
 class SQLiteD1Statement implements EvidenceD1Statement {
   private values: SQLInputValue[] = [];
 
@@ -348,8 +356,7 @@ async function drainScheduled(scheduled: Promise<unknown>[]): Promise<void> {
 test("migration preserves legacy resume progress while adding durable checkpoints", () => {
   const database = new DatabaseSync(":memory:");
   database.exec("PRAGMA foreign_keys = ON");
-  const migrations = readdirSync("drizzle").filter((value) => /^\d{4}_.*\.sql$/.test(value)).sort();
-  for (const name of migrations.slice(0, -1)) database.exec(readFileSync(`drizzle/${name}`, "utf8"));
+  const migration = applyMigrationsBefore(database, "0007_");
   database.prepare(
     "INSERT INTO evidence_bundles (id,title,purpose,version,content_version,created_at,updated_at) VALUES (?,?,?,?,?,?,?)",
   ).run("legacy-bundle", "Legacy", "Resume", 1, "legacy-input", 1, 1);
@@ -370,7 +377,7 @@ test("migration preserves legacy resume progress while adding durable checkpoint
     "cards_generated", "dead-runner", 10, 0, 1, 1,
   );
 
-  database.exec(readFileSync(`drizzle/${migrations.at(-1)}`, "utf8"));
+  database.exec(readFileSync(`drizzle/${migration}`, "utf8"));
 
   assert.deepEqual({ ...database.prepare(
     `SELECT stage,attempt_count AS attemptCount,extracted_evidence_json AS extractedEvidenceJson,
@@ -389,8 +396,7 @@ test("migration preserves legacy resume progress while adding durable checkpoint
 test("migration upgrades the exact old queued default and runs validation first", async () => {
   const database = new DatabaseSync(":memory:");
   database.exec("PRAGMA foreign_keys = ON");
-  const migrations = readdirSync("drizzle").filter((value) => /^\d{4}_.*\.sql$/.test(value)).sort();
-  for (const name of migrations.slice(0, -1)) database.exec(readFileSync(`drizzle/${name}`, "utf8"));
+  const migration = applyMigrationsBefore(database, "0007_");
   const inputVersion = await computeEvidenceVersion({
     purpose: "Resume", sourceHashes: [], clips: [], ...settings,
   });
@@ -402,7 +408,7 @@ test("migration upgrades the exact old queued default and runs validation first"
       (id,bundle_id,input_version,analyzer_model,prompt_version,schema_version,is_stale,created_at,updated_at)
       VALUES (?,?,?,?,?,?,?,?,?)`,
   ).run("queued-job", "queued-bundle", inputVersion, "model-1", "prompt-1", "schema-1", 0, 1, 1);
-  database.exec(readFileSync(`drizzle/${migrations.at(-1)}`, "utf8"));
+  database.exec(readFileSync(`drizzle/${migration}`, "utf8"));
   const d1 = new SQLiteD1Database(database, false);
   const scheduled: Promise<unknown>[] = [];
   const scheduledStages: string[] = [];
@@ -424,8 +430,7 @@ test("migration upgrades the exact old queued default and runs validation first"
 test("migration preserves durable decisions and quarantines invalid draft-only legacy output before rewind", async () => {
   const database = new DatabaseSync(":memory:");
   database.exec("PRAGMA foreign_keys = ON");
-  const migrations = readdirSync("drizzle").filter((value) => /^\d{4}_.*\.sql$/.test(value)).sort();
-  for (const name of migrations.slice(0, -1)) database.exec(readFileSync(`drizzle/${name}`, "utf8"));
+  const migration = applyMigrationsBefore(database, "0007_");
   for (const suffix of ["complete", "incomplete"]) {
     database.prepare(
       "INSERT INTO evidence_bundles (id,title,purpose,version,content_version,created_at,updated_at) VALUES (?,?,?,?,?,?,?)",
@@ -517,7 +522,7 @@ test("migration preserves durable decisions and quarantines invalid draft-only l
     '{"citationIds":["complete-chunk","historical-only-chunk"]}', "historical-input", 1,
   );
 
-  database.exec(readFileSync(`drizzle/${migrations.at(-1)}`, "utf8"));
+  database.exec(readFileSync(`drizzle/${migration}`, "utf8"));
   assert.deepEqual({ ...database.prepare(
     "SELECT status,stage FROM evidence_analysis_jobs WHERE id='complete-job'",
   ).get() }, { status: "review_ready", stage: "done" });
@@ -603,8 +608,7 @@ test("migration preserves durable decisions and quarantines invalid draft-only l
 test("migration rewinds done draft-only jobs and quarantines current drafts despite durable review history", async () => {
   const database = new DatabaseSync(":memory:");
   database.exec("PRAGMA foreign_keys = ON");
-  const migrations = readdirSync("drizzle").filter((value) => /^\d{4}_.*\.sql$/.test(value)).sort();
-  for (const name of migrations.slice(0, -1)) database.exec(readFileSync(`drizzle/${name}`, "utf8"));
+  const migration = applyMigrationsBefore(database, "0007_");
   const cases = [
     { id: "review-ready", status: "review_ready", review: null },
     { id: "completed", status: "completed", review: null },
@@ -653,7 +657,7 @@ test("migration rewinds done draft-only jobs and quarantines current drafts desp
     }
   }
 
-  database.exec(readFileSync(`drizzle/${migrations.at(-1)}`, "utf8"));
+  database.exec(readFileSync(`drizzle/${migration}`, "utf8"));
   for (const item of cases) {
     assert.deepEqual({ ...database.prepare(
       "SELECT status,is_stale AS isStale FROM tactic_cards WHERE id=?",

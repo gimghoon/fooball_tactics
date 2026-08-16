@@ -57,6 +57,13 @@
       "when": 1786869646631,
       "tag": "0007_amazing_barracuda",
       "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "6",
+      "when": 1786873347296,
+      "tag": "0008_lyrical_daredevil",
+      "breakpoints": true
     }
   ]
 }

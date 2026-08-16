@@ -223,6 +223,21 @@ export const tacticCardReviews = sqliteTable("tactic_card_reviews", {
   createdAt: integer("created_at", { mode: "timestamp_ms" }).notNull(),
 }, (table) => [
   check("ck_tactic_card_reviews_status", sql`${table.status} IN ('analysis_draft', 'owner_reviewed', 'coach_reviewed', 'held', 'rejected')`),
+  uniqueIndex("idx_tactic_card_reviews_id_card").on(table.id, table.cardId),
+]);
+
+export const scenarioTacticCardReviews = sqliteTable("scenario_tactic_card_reviews", {
+  scenarioId: text("scenario_id").primaryKey().references(() => scenarios.id, { onDelete: "cascade" }),
+  cardId: text("card_id").notNull(),
+  cardReviewId: text("card_review_id").notNull(),
+  createdAt: integer("created_at", { mode: "timestamp_ms" }).notNull(),
+}, (table) => [
+  uniqueIndex("idx_scenario_tactic_card_reviews_review").on(table.cardReviewId),
+  foreignKey({
+    name: "fk_scenario_tactic_card_reviews_review_card",
+    columns: [table.cardReviewId, table.cardId],
+    foreignColumns: [tacticCardReviews.id, tacticCardReviews.cardId],
+  }).onDelete("restrict"),
 ]);
 
 export const evidenceAuditEvents = sqliteTable("evidence_audit_events", {
