@@ -2,11 +2,14 @@ import type { ChatGPTUser } from "../../app/chatgpt-auth.ts";
 
 export type EvidenceAdmin = ChatGPTUser;
 
-export type EvidenceAdminAuthDependencies = {
-  getUser?: () => Promise<ChatGPTUser | null>;
-  adminUserIds?: string;
-  redirect?: (path: string) => never;
-};
+export type EvidenceAdminPageDecision =
+  | { kind: "admin"; admin: EvidenceAdmin }
+  | { kind: "signin"; returnTo: string }
+  | { kind: "forbidden" };
+
+export type EvidenceAdminApiDecision =
+  | { kind: "admin"; admin: EvidenceAdmin }
+  | { kind: "response"; status: 401 | 403; error: string };
 
 const ADMIN_USER_IDS_ENV = "EVIDENCE_ADMIN_USER_IDS";
 
@@ -27,50 +30,55 @@ export function authorizeEvidenceAdmin(
   return user;
 }
 
-async function authenticatedUser(
-  dependencies?: EvidenceAdminAuthDependencies,
-): Promise<ChatGPTUser | null> {
-  if (dependencies?.getUser) return dependencies.getUser();
-  const { getChatGPTUser } = await import("../../app/chatgpt-auth.ts");
-  return getChatGPTUser();
+export function decideEvidenceAdminPage(
+  user: ChatGPTUser | null,
+  raw: string | undefined,
+  returnTo: string,
+): EvidenceAdminPageDecision {
+  if (!user) return { kind: "signin", returnTo };
+  const admin = authorizeEvidenceAdmin(user, raw);
+  return admin ? { kind: "admin", admin } : { kind: "forbidden" };
 }
 
-function configuredAdminUserIds(
-  dependencies?: EvidenceAdminAuthDependencies,
-): string | undefined {
-  return dependencies?.adminUserIds ?? process.env[ADMIN_USER_IDS_ENV];
+export function decideEvidenceAdminApi(
+  user: ChatGPTUser | null,
+  raw: string | undefined,
+): EvidenceAdminApiDecision {
+  const admin = authorizeEvidenceAdmin(user, raw);
+  if (admin) return { kind: "admin", admin };
+  return user
+    ? { kind: "response", status: 403, error: "자료 관리자 권한이 필요해요." }
+    : { kind: "response", status: 401, error: "로그인이 필요해요." };
 }
 
 export async function requireEvidenceAdminPage(
   returnTo: string,
-  dependencies?: EvidenceAdminAuthDependencies,
 ): Promise<EvidenceAdmin> {
-  const user = await authenticatedUser(dependencies);
-  if (!user) {
-    const { requireChatGPTUser } = await import("../../app/chatgpt-auth.ts");
-    return requireChatGPTUser(returnTo);
-  }
+  const { getChatGPTUser, requireChatGPTUser } = await import("../../app/chatgpt-auth.ts");
+  const decision = decideEvidenceAdminPage(
+    await getChatGPTUser(),
+    process.env[ADMIN_USER_IDS_ENV],
+    returnTo,
+  );
+  if (decision.kind === "admin") return decision.admin;
+  if (decision.kind === "signin") return requireChatGPTUser(decision.returnTo);
 
-  const admin = authorizeEvidenceAdmin(user, configuredAdminUserIds(dependencies));
-  if (admin) return admin;
-
-  if (dependencies?.redirect) return dependencies.redirect("/");
   const { redirect } = await import("next/navigation");
   return redirect("/");
 }
 
 export async function requireEvidenceAdminApi(
   request: Request,
-  dependencies?: EvidenceAdminAuthDependencies,
 ): Promise<EvidenceAdmin | Response> {
   void request;
-  const user = await authenticatedUser(dependencies);
-  const admin = authorizeEvidenceAdmin(user, configuredAdminUserIds(dependencies));
-  if (!admin) {
-    return Response.json(
-      { error: user ? "자료 관리자 권한이 필요해요." : "로그인이 필요해요." },
-      { status: user ? 403 : 401 },
-    );
-  }
-  return admin;
+  const { getChatGPTUser } = await import("../../app/chatgpt-auth.ts");
+  const decision = decideEvidenceAdminApi(
+    await getChatGPTUser(),
+    process.env[ADMIN_USER_IDS_ENV],
+  );
+  if (decision.kind === "admin") return decision.admin;
+  return Response.json(
+    { error: decision.error },
+    { status: decision.status },
+  );
 }

@@ -3,9 +3,9 @@ import test from "node:test";
 
 import {
   authorizeEvidenceAdmin,
+  decideEvidenceAdminApi,
+  decideEvidenceAdminPage,
   parseAdminUserIds,
-  requireEvidenceAdminApi,
-  type EvidenceAdminAuthDependencies,
 } from "../lib/server/evidence-auth.ts";
 import type { ChatGPTUser } from "../app/chatgpt-auth.ts";
 
@@ -15,21 +15,6 @@ const user: ChatGPTUser = {
   displayName: "A",
   fullName: null,
 };
-
-function request(headers: Record<string, string> = {}) {
-  return new Request("http://localhost/api/admin/evidence", { headers });
-}
-
-function requireEvidenceAdminApiWith(
-  authenticatedUser: ChatGPTUser | null,
-  adminUserIds: string | undefined,
-) {
-  const dependencies: EvidenceAdminAuthDependencies = {
-    getUser: async () => authenticatedUser,
-    adminUserIds,
-  };
-  return requireEvidenceAdminApi(request(), dependencies);
-}
 
 test("only exact allowlisted user IDs are admins", () => {
   assert.equal(authorizeEvidenceAdmin(user, "user-1,user-2")?.userId, "user-2");
@@ -41,24 +26,46 @@ test("admin IDs are trimmed and empty entries are discarded", () => {
   assert.deepEqual(parseAdminUserIds(undefined), new Set());
 });
 
-test("missing login is 401 and logged-in non-admin is 403", async () => {
-  assert.equal((await requireEvidenceAdminApiWith(null, "user-1")).status, 401);
-  assert.equal((await requireEvidenceAdminApiWith({ ...user, userId: "user-2" }, "user-1")).status, 403);
+test("page decision sends missing login through ChatGPT sign-in with the requested return path", () => {
+  assert.deepEqual(decideEvidenceAdminPage(null, "user-1", "/admin/evidence?step=2"), {
+    kind: "signin",
+    returnTo: "/admin/evidence?step=2",
+  });
 });
 
-test("API authority ignores request headers and accepts only the authenticated user ID", async () => {
-  const response = await requireEvidenceAdminApi(
-    request({
-      "x-evidence-admin-user-id": "user-1",
-      "x-user-id": "user-1",
-      cookie: "evidence-admin=user-1",
-    }),
-    {
-      getUser: async () => user,
-      adminUserIds: "user-2",
-    },
-  );
+test("page decision forbids a logged-in non-admin and admits an exact admin", () => {
+  assert.deepEqual(decideEvidenceAdminPage({ ...user, userId: "user-2" }, "user-1", "/admin/evidence"), {
+    kind: "forbidden",
+  });
+  assert.deepEqual(decideEvidenceAdminPage(user, "user-2", "/admin/evidence"), {
+    kind: "admin",
+    admin: user,
+  });
+});
 
-  assert.equal(response instanceof Response, false);
-  assert.equal((response as ChatGPTUser).userId, "user-2");
+test("API decision is 401 for missing login and 403 for a logged-in non-admin", () => {
+  assert.deepEqual(decideEvidenceAdminApi(null, "user-1"), {
+    kind: "response",
+    status: 401,
+    error: "로그인이 필요해요.",
+  });
+  assert.deepEqual(decideEvidenceAdminApi({ ...user, userId: "user-2" }, "user-1"), {
+    kind: "response",
+    status: 403,
+    error: "자료 관리자 권한이 필요해요.",
+  });
+});
+
+test("API decision ignores spoofed headers and uses only the exact authenticated user ID", () => {
+  const spoofedHeaders = {
+    "x-evidence-admin-user-id": "user-1",
+    "x-user-id": "user-1",
+    cookie: "evidence-admin=user-1",
+  };
+  void spoofedHeaders;
+
+  assert.deepEqual(decideEvidenceAdminApi(user, "user-2"), {
+    kind: "admin",
+    admin: user,
+  });
 });
