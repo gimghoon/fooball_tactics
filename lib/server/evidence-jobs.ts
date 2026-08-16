@@ -13,6 +13,7 @@ import type {
   EvidenceD1Database,
   EvidenceD1Statement,
 } from "./evidence-service.ts";
+import { EvidenceConflictError, EvidenceJobConfigurationConflictError, EvidenceNotFoundError } from "./evidence-errors.ts";
 
 const LEASE_MS = 60_000;
 const MAX_ANALYZER_ATTEMPTS = 3;
@@ -217,7 +218,7 @@ export class EvidenceAnalysisJobs {
   async startAnalysis(bundleId: string, admin: EvidenceAdmin): Promise<EvidenceAnalysisJobRecord> {
     void admin;
     const bundle = await this.refreshBundleVersion(bundleId);
-    if (bundle === null) throw new Error("근거 묶음을 찾을 수 없습니다.");
+    if (bundle === null) throw new EvidenceNotFoundError("근거 묶음을 찾을 수 없습니다.");
 
     const now = this.now();
     const id = this.id();
@@ -303,15 +304,13 @@ export class EvidenceAnalysisJobs {
   async retryAnalysis(jobId: string, admin: EvidenceAdmin): Promise<EvidenceAnalysisJobRecord> {
     void admin;
     const job = await this.getAnalysisStatus(jobId);
-    if (job === null) throw new Error("근거 분석 작업을 찾을 수 없습니다.");
+    if (job === null) throw new EvidenceNotFoundError("근거 분석 작업을 찾을 수 없습니다.");
     if (job.status === "review_ready" || job.status === "completed") {
-      throw new Error("완료된 근거 분석 작업은 재시도할 수 없습니다.");
+      throw new EvidenceConflictError("완료된 근거 분석 작업은 재시도할 수 없습니다.");
     }
     if (this.configurationMismatch(job)) {
       await this.failConfigurationMismatch(job);
-      const failed = await this.getAnalysisStatus(job.id);
-      if (failed === null) throw new Error("근거 분석 작업을 찾을 수 없습니다.");
-      return failed;
+      throw new EvidenceJobConfigurationConflictError();
     }
     const now = this.now();
     const result = await this.dependencies.db.prepare(
@@ -325,11 +324,11 @@ export class EvidenceAnalysisJobs {
     };
     if (asChanges(result) !== 1) {
       await this.markStaleIfSuperseded(job);
-      throw new Error("근거 분석 작업을 아직 재시도할 수 없습니다.");
+      throw new EvidenceConflictError("근거 분석 작업을 아직 재시도할 수 없습니다.");
     }
     this.scheduleStep(job.id);
     const retried = await this.getAnalysisStatus(job.id);
-    if (retried === null) throw new Error("근거 분석 작업을 찾을 수 없습니다.");
+    if (retried === null) throw new EvidenceNotFoundError("근거 분석 작업을 찾을 수 없습니다.");
     return retried;
   }
 
@@ -671,7 +670,7 @@ export class EvidenceAnalysisJobs {
     const bundle = await this.dependencies.db.prepare(
       "SELECT id,purpose,content_version AS contentVersion FROM evidence_bundles WHERE id=?",
     ).bind(bundleId).first<{ id: string; purpose: string; contentVersion: string }>();
-    if (bundle === null) throw new Error("근거 묶음을 찾을 수 없습니다.");
+    if (bundle === null) throw new EvidenceNotFoundError("근거 묶음을 찾을 수 없습니다.");
     const sourceHashes = (await this.dependencies.db.prepare(
       "SELECT content_hash AS contentHash FROM evidence_sources WHERE bundle_id=? ORDER BY content_hash",
     ).bind(bundleId).all<{ contentHash: string }>()).results.map((source) => source.contentHash);
@@ -703,7 +702,8 @@ export class EvidenceAnalysisJobs {
         "UPDATE evidence_bundles SET content_version=?,version=version+1,updated_at=? WHERE id=? AND content_version=?",
       ).bind(contentVersion, now, bundleId, bundle.contentVersion),
     ]);
-    if (asChanges(results.at(-1)) !== 1) throw new Error("근거 묶음 버전이 변경되어 분석을 시작할 수 없습니다.");
+    if (asChanges(results.at(-1)) !== 1)
+      throw new EvidenceConflictError("근거 묶음 버전이 변경되어 분석을 시작할 수 없습니다.");
     return { id: bundle.id, contentVersion };
   }
 

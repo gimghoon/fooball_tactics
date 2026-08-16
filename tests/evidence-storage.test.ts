@@ -461,3 +461,19 @@ test("preserves a scanned PDF and marks extraction as failed without OCR", async
   assert.equal(source.extractedTextKey, null);
   assert.equal(bucket.putKeys.length, 1);
 });
+
+test("rejects an unparseable PDF before persisting objects or metadata", async () => {
+  const bucket = new FakeR2();
+  const registration = new FakeD1();
+  const store = new EvidenceFileStore({ bucket, registration });
+
+  await assert.rejects(() => store.putValidatedFile({
+    bundleId: "bundle-1",
+    name: "broken.pdf",
+    type: "application/pdf",
+    bytes: new TextEncoder().encode("%PDF-1.7\n%%EOF"),
+  }), /PDF 파일을 확인할 수 없습니다/);
+
+  assert.equal(bucket.objects.size, 0);
+  assert.equal(registration.rows.length, 0);
+});

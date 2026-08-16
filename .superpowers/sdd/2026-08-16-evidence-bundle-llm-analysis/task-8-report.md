@@ -61,3 +61,35 @@ The production build enumerated all ten admin evidence route shapes, including d
 
 - The repository's `npm test` script does not yet include the evidence-specific suites, so the complete 144-test evidence matrix was run explicitly in addition to `npm test`.
 - Citation excerpts are deliberately capped at 2,000 characters at the HTTP boundary; the UI should treat them as review context, not as a full-document viewer.
+
+## Fix Round 1
+
+Status: all six Important findings and the Minor finding from `task-8-review.md` are addressed.
+
+- Multipart uploads now reject an oversized `Content-Length` without reading the stream and enforce a hard 20 MiB + 64 KiB envelope cap while consuming chunked bodies. Only one `file` part is accepted; duplicate and unexpected parts are rejected.
+- PDF.js parse failures now become validation failures before any original/extracted R2 object or source metadata is written. Valid scan-only PDFs retain the existing stored-with-extraction-failed policy.
+- Retry under incompatible persisted analyzer/prompt/schema settings now fails the job and throws a typed configuration conflict, producing HTTP 409 instead of 202.
+- Scenario conversion verifies campaign existence before conversion and again through the atomic D1 insert guard. A campaign deletion between the advisory check and batch returns typed 404 without partial provenance/audit writes.
+- Admin JSON response creation is centralized with `Cache-Control: private, no-store`; authorization responses are also normalized and permissive CORS is removed. Authenticated download headers remain unchanged.
+- Message-substring routing was removed. Typed public 400/404/409/413/415/503 errors map to fixed messages, while unknown D1/R2/provider messages are redacted as 500/503.
+- Job polling now pages cards at 20, caps citations at 20 per card, caps each excerpt at 2,000 UTF-8 bytes and aggregate excerpts at 32 KiB, and returns `count`, `totalCount`, and `nextCursor` metadata. Repository queries apply SQL `LIMIT`/`OFFSET` and bounded citation reads.
+
+Fix-round regression coverage includes auth-before-stream-read, declared/chunked multipart overflow, duplicate/unexpected parts, real-store malformed PDF cleanup, active-setting retry conflicts, nonexistent/deleted campaign conversion, header/CORS policy, malicious upstream routing strings/secrets, UTF-8 aggregate polling caps, continuation metadata, and public projection leak checks.
+
+Verification:
+
+```text
+npx tsx --test tests/evidence-analyzer.test.ts tests/evidence-auth.test.ts tests/evidence-domain.test.ts tests/evidence-jobs.test.ts tests/evidence-review.test.ts tests/evidence-routes.test.ts tests/evidence-service.test.ts tests/evidence-storage.test.ts
+149 passed, 0 failed
+
+npm test
+47 domain + 16 route/component + production build + 3 rendered HTML tests passed
+
+npm run lint
+passed
+
+git diff --check
+passed
+```
+
+Fix Round 1 concern: the repository's standalone `tsc --noEmit` command remains unusable because the existing TypeScript configuration rejects the project's `.ts` import convention and lacks Cloudflare ambient types, alongside unrelated pre-existing application type errors. The required lint, production build, full project tests, and complete evidence matrix pass.

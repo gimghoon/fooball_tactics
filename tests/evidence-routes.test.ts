@@ -5,6 +5,8 @@ import { EvidenceValidationError } from "../lib/domain/evidence.ts";
 import { serializePublicTrainingScenario } from "../lib/domain/content.ts";
 import type { EvidenceAdmin } from "../lib/server/evidence-auth.ts";
 import { EvidenceConflictError } from "../lib/server/evidence-service.ts";
+import { EvidenceFileStore, type StoredEvidenceFile } from "../lib/server/evidence-storage.ts";
+import { EvidenceJobConfigurationConflictError, EvidenceNotFoundError, EvidenceRequestValidationError, EvidenceUnavailableError } from "../lib/server/evidence-errors.ts";
 import {
   bindEvidenceSchedule,
   handleEvidenceAnalyzeStart,
@@ -79,7 +81,7 @@ function runtime(overrides: Partial<EvidenceRouteRuntime> = {}): EvidenceRouteRu
         prompt: "prompt", hint: "hint", explanation: "explanation", pitchJson: "{\"secret\":true}",
         answerJson: "{\"secret\":true}", contentJson: "{\"draftContentJson\":true}", reviewStatus: "draft", orderIndex: 1,
       }),
-      listCardsForJob: async () => [],
+      listCardsForJob: async () => ({ cards: [], totalCount: 0, nextOffset: null }),
     },
     fileStore: {
       putValidatedFile: async () => source,
@@ -117,6 +119,17 @@ function jsonRequest(path: string, body: unknown, method = "POST") {
   });
 }
 
+function streamingRequest(bodyStream: ReadableStream<Uint8Array>, contentType: string, contentLength?: number) {
+  const headers = new Headers({ "content-type": contentType });
+  if (contentLength !== undefined) headers.set("content-length", String(contentLength));
+  return new Request("http://localhost/api/admin/evidence/bundle-1/files", {
+    method: "POST",
+    headers,
+    body: bodyStream,
+    duplex: "half",
+  } as RequestInit & { duplex: "half" });
+}
+
 async function body(response: Response): Promise<Record<string, unknown>> {
   return await response.json() as Record<string, unknown>;
 }
@@ -139,7 +152,7 @@ test("every evidence endpoint authorizes before parsing or creating runtime reso
     () => handleEvidenceFileDelete(context({ bundleId: "missing", sourceId: "missing" }), runtime()),
     () => handleEvidenceClipCreate(request, context({ bundleId: "missing" }), runtime()),
     () => handleEvidenceAnalyzeStart(context({ bundleId: "missing" }), runtime()),
-    () => handleEvidenceJobStatus(context({ jobId: "missing" }), runtime()),
+    () => handleEvidenceJobStatus(new Request("http://test/"), context({ jobId: "missing" }), runtime()),
     () => handleEvidenceJobRetry(context({ jobId: "missing" }), runtime()),
     () => handleEvidenceCardReview(request, context({ cardId: "missing" }), runtime()),
     () => handleEvidenceScenarioDraft(request, context({ cardId: "missing" }), runtime()),
@@ -243,6 +256,148 @@ test("multipart upload returns 413 for oversize, 415 for mismatch, and never ret
   assert.equal(serialized.includes("extractedTextKey"), false);
 });
 
+test("multipart upload caps the whole envelope before parsing extra parts", async () => {
+  const encoder = new TextEncoder();
+  const boundary = "envelope-boundary";
+  let phase = 0;
+  let cancelled = false;
+  const stream = new ReadableStream<Uint8Array>({
+    pull(controller) {
+      if (cancelled) return;
+      if (phase === 0) {
+        phase += 1;
+        controller.enqueue(encoder.encode(`--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="small.txt"\r\nContent-Type: text/plain\r\n\r\nx\r\n--${boundary}\r\nContent-Disposition: form-data; name="junk"\r\n\r\n`));
+        return;
+      }
+      phase += 1;
+      controller.enqueue(new Uint8Array(1024 * 1024).fill(0x61));
+    },
+    cancel() { cancelled = true; },
+  }, { highWaterMark: 0 });
+
+  const response = await handleEvidenceFileUpload(
+    streamingRequest(stream, `multipart/form-data; boundary=${boundary}`),
+    context({ bundleId: bundle.id }),
+    runtime(),
+  );
+
+  assert.equal(response.status, 413);
+});
+
+test("chunked multipart overflow is 413 without a Content-Length header", async () => {
+  const encoder = new TextEncoder();
+  const boundary = "chunked-boundary";
+  let phase = 0;
+  const request = streamingRequest(new ReadableStream<Uint8Array>({
+    pull(controller) {
+      if (phase === 0) {
+        phase += 1;
+        controller.enqueue(encoder.encode(
+          `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="large.txt"\r\nContent-Type: text/plain\r\n\r\n`,
+        ));
+        return;
+      }
+      if (phase <= 21) {
+        phase += 1;
+        controller.enqueue(new Uint8Array(1024 * 1024).fill(0x61));
+        return;
+      }
+      controller.enqueue(encoder.encode(`\r\n--${boundary}--\r\n`));
+      controller.close();
+    },
+  }), `multipart/form-data; boundary=${boundary}`);
+
+  const response = await handleEvidenceFileUpload(request, context({ bundleId: bundle.id }), runtime());
+
+  assert.equal(response.status, 413);
+});
+
+test("Content-Length rejects an oversized multipart request without reading its stream", async () => {
+  let reads = 0;
+  const request = streamingRequest(new ReadableStream<Uint8Array>({
+    pull(controller) {
+      reads += 1;
+      controller.close();
+    },
+  }, { highWaterMark: 0 }), "multipart/form-data; boundary=unused", 21 * 1024 * 1024);
+
+  const response = await handleEvidenceFileUpload(request, context({ bundleId: bundle.id }), runtime());
+
+  assert.equal(response.status, 413);
+  assert.equal(reads, 0);
+});
+
+test("multipart upload rejects duplicate file and unexpected form parts", async () => {
+  const duplicate = new FormData();
+  duplicate.append("file", new File(["one"], "one.txt", { type: "text/plain" }));
+  duplicate.append("file", new File(["two"], "two.txt", { type: "text/plain" }));
+  const duplicateResponse = await handleEvidenceFileUpload(
+    new Request("http://localhost", { method: "POST", body: duplicate }),
+    context({ bundleId: bundle.id }),
+    runtime(),
+  );
+  assert.equal(duplicateResponse.status, 400);
+
+  const unexpected = new FormData();
+  unexpected.append("file", new File(["one"], "one.txt", { type: "text/plain" }));
+  unexpected.append("notes", "unexpected");
+  const unexpectedResponse = await handleEvidenceFileUpload(
+    new Request("http://localhost", { method: "POST", body: unexpected }),
+    context({ bundleId: bundle.id }),
+    runtime(),
+  );
+  assert.equal(unexpectedResponse.status, 400);
+});
+
+test("malformed PDF is 415 through the real store and leaves no object or metadata", async () => {
+  const objects = new Map<string, unknown>();
+  const rows: StoredEvidenceFile[] = [];
+  const store = new EvidenceFileStore({
+    bucket: {
+      async put(key, value) { objects.set(key, value); },
+      async get(key) { return objects.get(key) ?? null; },
+      async delete(key) { objects.delete(key); },
+    },
+    registration: {
+      async findExisting() { return null; },
+      async register(value) { rows.push(value); return value; },
+    },
+  });
+  const form = new FormData();
+  form.set("file", new File(["%PDF-1.7\n%%EOF"], "broken.pdf", { type: "application/pdf" }));
+
+  const response = await handleEvidenceFileUpload(
+    new Request("http://localhost", { method: "POST", body: form }),
+    context({ bundleId: bundle.id }),
+    runtime({ fileStore: store }),
+  );
+
+  assert.equal(response.status, 415);
+  assert.equal(objects.size, 0);
+  assert.equal(rows.length, 0);
+});
+
+test("upload authorization completes before the counting stream reads any byte", async () => {
+  let reads = 0;
+  const request = streamingRequest(new ReadableStream<Uint8Array>({
+    pull(controller) {
+      reads += 1;
+      controller.enqueue(new Uint8Array([1]));
+      controller.close();
+    },
+  }, { highWaterMark: 0 }), "multipart/form-data; boundary=auth-first");
+
+  const response = await runEvidenceAdminRoute(
+    request,
+    async () => Response.json({ error: "denied" }, { status: 401 }),
+    async () => runtime(),
+    (authorized) => handleEvidenceFileUpload(request, context({ bundleId: bundle.id }), authorized),
+  );
+
+  assert.equal(response.status, 401);
+  assert.equal(reads, 0);
+});
+
 test("clip validation is 400 and a missing authorized bundle is 404", async () => {
   const invalid = await handleEvidenceClipCreate(jsonRequest("/", {
     url: "http://example.test/video", startMs: 10, endMs: 5, observation: "관찰",
@@ -259,7 +414,7 @@ test("clip validation is 400 and a missing authorized bundle is 404", async () =
   }), context({ bundleId: "missing" }), runtime({
     service: {
       ...runtime().service,
-      addVideoClip: async () => { throw new Error("근거 묶음을 찾을 수 없습니다."); },
+      addVideoClip: async () => { throw new EvidenceNotFoundError("근거 묶음을 찾을 수 없습니다."); },
     },
   }));
   assert.equal(missing.status, 404);
@@ -275,7 +430,7 @@ test("analysis start and retry expose safe status while GET polling remains read
     },
   });
   const started = await handleEvidenceAnalyzeStart(context({ bundleId: bundle.id }), jobRuntime);
-  const polled = await handleEvidenceJobStatus(context({ jobId: "job-1" }), jobRuntime);
+  const polled = await handleEvidenceJobStatus(new Request("http://test/"), context({ jobId: "job-1" }), jobRuntime);
   const retried = await handleEvidenceJobRetry(context({ jobId: "job-1" }), jobRuntime);
   assert.equal(started.status, 202);
   assert.equal(polled.status, 200);
@@ -287,10 +442,14 @@ test("analysis start and retry expose safe status while GET polling remains read
       assert.equal(serialized.includes(secret), false);
     }
   }
+  const incompatible = await handleEvidenceJobRetry(context({ jobId: "job-1" }), runtime({
+    jobs: { ...runtime().jobs, retryAnalysis: async () => { throw new EvidenceJobConfigurationConflictError(); } },
+  }));
+  assert.equal(incompatible.status, 409);
 });
 
 test("job polling replaces any persisted provider error with a stable public message", async () => {
-  const response = await handleEvidenceJobStatus(context({ jobId: "job-1" }), runtime({
+  const response = await handleEvidenceJobStatus(new Request("http://test/"), context({ jobId: "job-1" }), runtime({
     jobs: {
       ...runtime().jobs,
       getAnalysisStatus: async () => ({ ...jobRecord(), status: "failed", errorMessage: "HTTP 500 provider-secret-key" }),
@@ -304,23 +463,24 @@ test("job polling replaces any persisted provider error with a stable public mes
 
 test("review-ready job polling returns discoverable cards and bounded citation excerpts", async () => {
   const longExcerpt = `근거-${"가".repeat(3_000)}`;
-  const response = await handleEvidenceJobStatus(context({ jobId: "job-1" }), runtime({
+  const response = await handleEvidenceJobStatus(new Request("http://test/"), context({ jobId: "job-1" }), runtime({
     jobs: {
       ...runtime().jobs,
       getAnalysisStatus: async () => ({ ...jobRecord(), status: "review_ready" }),
     },
     service: {
       ...runtime().service,
-      listCardsForJob: async () => [{
+      listCardsForJob: async () => ({ cards: [{
         id: "card-1", bundleId: bundle.id, jobId: "job-1", bundleVersion: bundle.contentVersion,
         currentBundleVersion: bundle.contentVersion, currentReviewId: null, producerModel: "secret-model",
         status: "analysis_draft", draftContentJson: "{\"llm\":true}",
         currentContentJson: "{\"situation\":\"측면 압박\"}", isStale: false, createdAt: 1, updatedAt: 2,
+        citationCount: 1,
         citations: [{
           chunkId: "chunk-1", sourceId: source.id, videoClipId: null, locationLabel: "문서 1쪽",
           content: longExcerpt, contentHash: "secret-hash",
         }],
-      }],
+      }], totalCount: 1, nextOffset: null }),
     },
   }));
   assert.equal(response.status, 200);
@@ -335,6 +495,80 @@ test("review-ready job polling returns discoverable cards and bounded citation e
   for (const secret of ["producerModel", "secret-model", "draftContentJson", "currentContentJson", "contentHash", "secret-hash"]) {
     assert.equal(serialized.includes(secret), false);
   }
+});
+
+test("job polling caps cards, citations, and aggregate UTF-8 excerpts with continuation metadata", async () => {
+  let requestedOffset = -1;
+  const card = {
+    id: "card", bundleId: bundle.id, jobId: "job-1", bundleVersion: bundle.contentVersion,
+    currentBundleVersion: bundle.contentVersion, currentReviewId: null, producerModel: "model",
+    status: "analysis_draft" as const, draftContentJson: "{}", currentContentJson: "{}",
+    isStale: false, createdAt: 1, updatedAt: 2, citationCount: 30,
+    citations: Array.from({ length: 30 }, (_, index) => ({
+      chunkId: `chunk-${index}`, sourceId: source.id, videoClipId: null,
+      locationLabel: `page:${index}`, content: "가".repeat(4_000), contentHash: "hash",
+    })),
+  };
+  const response = await handleEvidenceJobStatus(
+    new Request("http://test/?cursor=20"), context({ jobId: "job-1" }), runtime({
+      jobs: { ...runtime().jobs, getAnalysisStatus: async () => ({ ...jobRecord(), status: "review_ready" }) },
+      service: {
+        ...runtime().service,
+        listCardsForJob: async (_jobId, _admin, options) => {
+          requestedOffset = options?.offset ?? -1;
+          return { cards: Array.from({ length: 50 }, (_, index) => ({ ...card, id: `card-${index}` })), totalCount: 70, nextOffset: 40 };
+        },
+      },
+    }),
+  );
+  const value = await body(response);
+  const cards = value.cards as Array<{ citations: Array<{ excerpt: string }> }>;
+  const excerptBytes = cards.flatMap((item) => item.citations)
+    .reduce((sum, citation) => sum + new TextEncoder().encode(citation.excerpt).byteLength, 0);
+
+  assert.equal(requestedOffset, 20);
+  assert.equal(cards.length, 20);
+  assert.equal(cards.every((item) => item.citations.length <= 20), true);
+  assert.equal(excerptBytes <= 32 * 1024, true);
+  assert.equal(JSON.stringify(value).includes("가".repeat(4_000)), false);
+  assert.deepEqual(value.pagination, { count: 20, totalCount: 70, nextCursor: "40" });
+});
+
+test("admin JSON responses are private no-store and malicious upstream messages are never routed or leaked", async () => {
+  const success = await handleEvidenceCollectionList(runtime());
+  const detail = await handleEvidenceBundleGet(context({ bundleId: bundle.id }), runtime());
+  const status = await handleEvidenceJobStatus(new Request("http://test/"), context({ jobId: "job-1" }), runtime());
+  const impact = await handleEvidenceFileImpact(context({ bundleId: bundle.id, sourceId: source.id }), runtime());
+  const knownError = await handleEvidenceCollectionCreate(new Request("http://test/", { method: "POST", body: "{" }), runtime());
+  const unknown = await handleEvidenceClipCreate(
+    jsonRequest("/", {}), context({ bundleId: bundle.id }), runtime({
+      service: { ...runtime().service, addVideoClip: async () => {
+        throw new Error("찾을 수 없습니다 필요합니다 구성되지 않았습니다 SECRET_TOKEN");
+      } },
+    }),
+  );
+  const typedMalicious = await handleEvidenceClipCreate(
+    jsonRequest("/", {}), context({ bundleId: bundle.id }), runtime({
+      service: { ...runtime().service, addVideoClip: async () => {
+        throw new EvidenceConflictError("SECRET_TYPED");
+      } },
+    }),
+  );
+  const guarded = await runEvidenceAdminRoute(
+    new Request("http://test/"),
+    async () => Response.json({ error: "denied" }, { status: 403, headers: { "access-control-allow-origin": "*" } }),
+    async () => runtime(),
+    async () => Response.json({ unreachable: true }),
+  );
+
+  for (const response of [success, detail, status, impact, knownError, unknown, typedMalicious, guarded]) {
+    assert.equal(response.headers.get("cache-control"), "private, no-store");
+    assert.equal(response.headers.has("access-control-allow-origin"), false);
+  }
+  assert.equal(unknown.status, 500);
+  assert.equal(JSON.stringify(await body(unknown)).includes("SECRET_TOKEN"), false);
+  assert.equal(typedMalicious.status, 409);
+  assert.equal(JSON.stringify(await body(typedMalicious)).includes("SECRET_TYPED"), false);
 });
 
 test("production schedule adapter forwards the exact continuation to waitUntil", async () => {
@@ -390,7 +624,7 @@ test("malformed review and scenario inputs are 400 while unavailable source stor
   const invalidReview = await handleEvidenceCardReview(jsonRequest("/", {}), context({ cardId: "card-1" }), runtime({
     service: {
       ...runtime().service,
-      reviewCard: async () => { throw new Error("카드 검수 상태가 올바르지 않습니다."); },
+      reviewCard: async () => { throw new EvidenceRequestValidationError("카드 검수 상태가 올바르지 않습니다."); },
     },
   }));
   assert.equal(invalidReview.status, 400);
@@ -398,7 +632,7 @@ test("malformed review and scenario inputs are 400 while unavailable source stor
   const invalidScenario = await handleEvidenceScenarioDraft(jsonRequest("/", {}), context({ cardId: "card-1" }), runtime({
     service: {
       ...runtime().service,
-      createScenarioDraft: async () => { throw new Error("campaignId이 필요합니다."); },
+      createScenarioDraft: async () => { throw new EvidenceRequestValidationError("campaignId이 필요합니다."); },
     },
   }));
   assert.equal(invalidScenario.status, 400);
@@ -415,7 +649,7 @@ test("malformed review and scenario inputs are 400 while unavailable source stor
   const snapshotFailure = await handleEvidenceFileDelete(context({ bundleId: bundle.id, sourceId: source.id }), runtime({
     service: {
       ...runtime().service,
-      removeSource: async () => { throw new EvidenceValidationError("삭제 복구용 파일 본문에서 provider-secret"); },
+      removeSource: async () => { throw new EvidenceUnavailableError("근거 파일 저장소를 사용할 수 없습니다."); },
     },
   }));
   assert.equal(snapshotFailure.status, 503);
@@ -443,7 +677,7 @@ test("delete impact is listed first and linked sources are blocked with 409", as
     service: {
       ...runtime().service,
       describeDeleteImpact: async (id) => ({ sourceId: id, cardIds: ["card-1"], scenarioDraftIds: ["scenario-1"] }),
-      removeSource: async () => { throw new Error("연결된 카드 또는 시나리오 초안이 있어 근거를 삭제할 수 없습니다."); },
+      removeSource: async () => { throw new EvidenceConflictError("연결된 카드 또는 시나리오 초안이 있어 근거를 삭제할 수 없습니다."); },
     },
   });
   const impact = await handleEvidenceFileImpact(context({ bundleId: bundle.id, sourceId: source.id }), impactRuntime);

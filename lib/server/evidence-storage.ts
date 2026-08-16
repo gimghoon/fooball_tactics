@@ -152,14 +152,14 @@ async function resolveKindAndMediaType(input: EvidenceFileInput): Promise<Pick<V
   if (extension === "pdf") {
     if (input.type !== "application/pdf" || !startsWith(input.bytes, [0x25, 0x50, 0x44, 0x46, 0x2d])) invalidFormat();
     if (hasUnsafePdfTrailer(input.bytes)) invalidFormat();
+    if (containsBytes(input.bytes, "/Encrypt") || hasDecodedPdfName(input.bytes, "Encrypt")) {
+      throw new EvidenceValidationError("암호화된 PDF는 업로드할 수 없습니다.");
+    }
     try {
       await assertPdfIsNotPasswordProtected(input.bytes);
     } catch (error) {
       if (error instanceof PdfPasswordProtectedError) throw new EvidenceValidationError(error.message);
-      throw error;
-    }
-    if (containsBytes(input.bytes, "/Encrypt") || hasDecodedPdfName(input.bytes, "Encrypt")) {
-      throw new EvidenceValidationError("암호화된 PDF는 업로드할 수 없습니다.");
+      throw new EvidenceValidationError("PDF 파일을 확인할 수 없습니다.");
     }
     return { kind: "pdf", mediaType: "application/pdf" };
   }

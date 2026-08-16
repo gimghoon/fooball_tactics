@@ -4,7 +4,7 @@ import { handleEvidenceJobRetry, handleEvidenceJobStatus } from "@/lib/server/ev
 type Context = { params: Promise<{ jobId: string }> };
 
 export function GET(request: Request, context: Context) {
-  return runEvidenceProductionRoute(request, (runtime) => handleEvidenceJobStatus(context, runtime));
+  return runEvidenceProductionRoute(request, (runtime) => handleEvidenceJobStatus(request, context, runtime));
 }
 
 export function POST(request: Request, context: Context) {

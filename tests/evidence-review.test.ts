@@ -538,13 +538,13 @@ test("admin job card listing returns current cards with only current-version cit
 
   const cards = await service.listCardsForJob("job-1", admin);
 
-  assert.equal(cards.length, 1);
-  assert.equal(cards[0]?.id, "card-1");
-  assert.deepEqual(cards[0]?.citations.map(({ chunkId, content }) => ({ chunkId, content })), [
+  assert.equal(cards.cards.length, 1);
+  assert.equal(cards.cards[0]?.id, "card-1");
+  assert.deepEqual(cards.cards[0]?.citations.map(({ chunkId, content }) => ({ chunkId, content })), [
     { chunkId: "chunk-1", content: "반대편 패스" },
     { chunkId: "chunk-2", content: "중앙 드리블 위험" },
   ]);
-  assert.deepEqual(await service.listCardsForJob("missing-job", admin), []);
+  assert.deepEqual(await service.listCardsForJob("missing-job", admin), { cards: [], totalCount: 0, nextOffset: null });
 });
 
 test("every subsequent owner edit appends a snapshot without rewriting history", async () => {
@@ -892,6 +892,30 @@ test("scenario conversion blocks stale, unsuitable, and citation provenance mism
       () => service.createScenarioDraft("card-1", { ...draftInput, expectedUpdatedAt: reviewed.updatedAt }, admin),
       message,
       name,
+    );
+    assert.equal(database.first<{ count: number }>("SELECT count(*) AS count FROM scenarios WHERE id LIKE 'generated-%'").count, 0);
+  }
+});
+
+test("scenario conversion returns not-found for a missing campaign and for deletion before the atomic batch", async () => {
+  for (const deletionRace of [false, true]) {
+    const { database, service } = createContext();
+    seedCard(database);
+    const reviewed = await service.reviewCard("card-1", {
+      status: "owner_reviewed",
+      content: card({ risky: [] }),
+      expectedUpdatedAt: 100,
+    }, admin);
+    const campaignId = deletionRace ? draftInput.campaignId : "missing-campaign";
+    if (deletionRace) {
+      database.beforeNextBatch = () => {
+        database.run("DELETE FROM campaigns WHERE id=?", campaignId);
+      };
+    }
+
+    await assert.rejects(
+      () => service.createScenarioDraft("card-1", { ...draftInput, campaignId, expectedUpdatedAt: reviewed.updatedAt }, admin),
+      (error: unknown) => error instanceof Error && error.name === "EvidenceNotFoundError",
     );
     assert.equal(database.first<{ count: number }>("SELECT count(*) AS count FROM scenarios WHERE id LIKE 'generated-%'").count, 0);
   }

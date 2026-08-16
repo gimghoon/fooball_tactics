@@ -823,6 +823,20 @@ test("persisted model, prompt, and schema mismatches fail before lease acquisiti
   }
 });
 
+test("retrying a job with incompatible active settings is a typed conflict and is not scheduled", async () => {
+  const context = createContext();
+  seedBundle(context.database);
+  seedJob(context.database, { status: "failed", analyzerModel: "model-old" });
+
+  await assert.rejects(
+    () => context.jobs.retryAnalysis("job-1", admin),
+    (error: unknown) => error instanceof Error && error.name === "EvidenceJobConfigurationConflictError",
+  );
+
+  assert.equal((await context.jobs.getAnalysisStatus("job-1"))?.status, "failed");
+  assert.equal(context.scheduled.length, 0);
+});
+
 test("one runner cannot execute the same leased stage concurrently", async () => {
   const gate = deferred<void>();
   const started = deferred<void>();

@@ -1,9 +1,17 @@
 import { EvidenceValidationError } from "../domain/evidence.ts";
 import { EvidenceAnalyzerError } from "./evidence-analyzer.ts";
 import type { EvidenceAdmin } from "./evidence-auth.ts";
-import type { EvidenceAnalysisJobRecord, EvidenceAnalysisJobs } from "./evidence-jobs.ts";
 import {
-  EvidenceConflictError,
+  EvidencePayloadTooLargeError,
+  EvidencePublicError,
+  EvidenceRequestValidationError,
+  EvidenceUnsupportedMediaTypeError,
+} from "./evidence-errors.ts";
+import type {
+  EvidenceAnalysisJobRecord,
+  EvidenceAnalysisJobs,
+} from "./evidence-jobs.ts";
+import {
   type EvidenceBundleDetail,
   type EvidenceBundleRecord,
   type EvidenceCardAdminDetail,
@@ -11,15 +19,24 @@ import {
   type EvidenceScenarioDraftRecord,
   type EvidenceService,
 } from "./evidence-service.ts";
-import type { EvidenceFileStore, StoredEvidenceFile } from "./evidence-storage.ts";
+import type {
+  EvidenceFileStore,
+  StoredEvidenceFile,
+} from "./evidence-storage.ts";
 
 const MAX_EVIDENCE_FILE_BYTES = 20 * 1024 * 1024;
+const MAX_MULTIPART_REQUEST_BYTES = MAX_EVIDENCE_FILE_BYTES + 64 * 1024;
+const JOB_CARD_PAGE_SIZE = 20;
+const JOB_CARD_CITATION_LIMIT = 20;
+const JOB_EXCERPT_MAX_BYTES = 2_000;
+const JOB_AGGREGATE_EXCERPT_MAX_BYTES = 32 * 1024;
 
 type RouteContext<T extends Record<string, string>> = { params: Promise<T> };
 
 export type EvidenceRouteRuntime = {
   admin: EvidenceAdmin;
-  service: Pick<EvidenceService,
+  service: Pick<
+    EvidenceService,
     | "listBundlesForAdmin"
     | "createBundle"
     | "getBundleForAdmin"
@@ -32,47 +49,60 @@ export type EvidenceRouteRuntime = {
     | "listCardsForJob"
   >;
   fileStore: Pick<EvidenceFileStore, "putValidatedFile" | "getFile">;
-  jobs: Pick<EvidenceAnalysisJobs, "startAnalysis" | "retryAnalysis" | "getAnalysisStatus">;
+  jobs: Pick<
+    EvidenceAnalysisJobs,
+    "startAnalysis" | "retryAnalysis" | "getAnalysisStatus"
+  >;
 };
 
-type EvidenceAuthorizer = (request: Request) => Promise<EvidenceAdmin | Response>;
-type EvidenceRuntimeFactory = (admin: EvidenceAdmin) => EvidenceRouteRuntime | Promise<EvidenceRouteRuntime>;
+type EvidenceAuthorizer = (
+  request: Request,
+) => Promise<EvidenceAdmin | Response>;
+type EvidenceRuntimeFactory = (
+  admin: EvidenceAdmin,
+) => EvidenceRouteRuntime | Promise<EvidenceRouteRuntime>;
+
+function adminJson(body: unknown, init: ResponseInit = {}): Response {
+  const headers = new Headers(init.headers);
+  headers.set("cache-control", "private, no-store");
+  headers.delete("access-control-allow-origin");
+  return Response.json(body, { ...init, headers });
+}
+
+function protectAdminResponse(response: Response): Response {
+  const headers = new Headers(response.headers);
+  headers.set("cache-control", "private, no-store");
+  headers.delete("access-control-allow-origin");
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers,
+  });
+}
 
 function jsonError(message: string, status: number): Response {
-  return Response.json({ error: message }, { status });
-}
-
-function isMissing(error: Error): boolean {
-  return error.message.includes("찾을 수 없습니다") || error.message.includes("존재하지 않습니다");
-}
-
-function isConflict(error: Error): boolean {
-  return error.message.includes("연결된 카드")
-    || error.message.includes("오래된 근거")
-    || error.message.includes("승인된 전술 카드")
-    || error.message.includes("적합한 카드")
-    || error.message.includes("승인 스냅샷")
-    || error.message.includes("현재 카드의 근거")
-    || error.message.includes("재시도할 수 없습니다")
-    || error.message.includes("버전이 변경")
-    || error.message.includes("변경되어");
+  return adminJson({ error: message }, { status });
 }
 
 function routeFailure(error: unknown): Response {
-  if (error instanceof EvidenceConflictError) return jsonError(error.message, 409);
-  if (error instanceof EvidenceValidationError) return jsonError(error.message, 400);
+  if (error instanceof EvidencePublicError) {
+    const messages = {
+      400: "근거 자료 요청이 올바르지 않습니다.",
+      404: "요청한 근거 자료를 찾을 수 없습니다.",
+      409: "근거 자료가 다른 변경으로 갱신되었습니다. 다시 시도해 주세요.",
+      413: "업로드 요청이 허용된 크기를 초과했습니다.",
+      415: "지원하지 않거나 올바르지 않은 파일 형식입니다.",
+      503: "근거 자료 서비스를 사용할 수 없습니다.",
+    } as const;
+    return jsonError(messages[error.status], error.status);
+  }
+  if (error instanceof EvidenceValidationError)
+    return jsonError("근거 자료 요청이 올바르지 않습니다.", 400);
   if (error instanceof EvidenceAnalyzerError) {
     return jsonError("근거 분석 서비스를 사용할 수 없습니다.", 503);
   }
-  if (error instanceof AggregateError) return jsonError("근거 파일 저장소를 사용할 수 없습니다.", 503);
-  if (error instanceof Error && isConflict(error)) return jsonError(error.message, 409);
-  if (error instanceof Error && isMissing(error)) return jsonError(error.message, 404);
-  if (error instanceof Error && error.message.includes("구성되지 않았습니다")) {
-    return jsonError("근거 자료 서비스를 사용할 수 없습니다.", 503);
-  }
-  if (error instanceof Error && (error.message.includes("올바르지 않습니다") || error.message.includes("필요합니다"))) {
-    return jsonError(error.message, 400);
-  }
+  if (error instanceof AggregateError)
+    return jsonError("근거 파일 저장소를 사용할 수 없습니다.", 503);
   return jsonError("근거 자료 요청을 처리하지 못했습니다.", 500);
 }
 
@@ -80,7 +110,7 @@ async function parseJson(request: Request): Promise<unknown> {
   try {
     return await request.json();
   } catch {
-    throw new EvidenceValidationError("요청 JSON을 확인할 수 없습니다.");
+    throw new EvidenceRequestValidationError("요청 JSON을 확인할 수 없습니다.");
   }
 }
 
@@ -93,7 +123,10 @@ function safeSource(source: StoredEvidenceFile) {
     byteSize: source.byteSize,
     contentHash: source.contentHash,
     extractionStatus: source.extractionStatus,
-    extractionError: source.extractionError === null ? null : "근거 텍스트를 준비하지 못했습니다.",
+    extractionError:
+      source.extractionError === null
+        ? null
+        : "근거 텍스트를 준비하지 못했습니다.",
   };
 }
 
@@ -124,7 +157,10 @@ function safeJob(job: EvidenceAnalysisJobRecord) {
     inputVersion: job.inputVersion,
     status: job.status,
     stage: job.stage,
-    errorMessage: job.errorMessage === null ? null : "근거 분석 작업을 완료하지 못했습니다.",
+    errorMessage:
+      job.errorMessage === null
+        ? null
+        : "근거 분석 작업을 완료하지 못했습니다.",
     startedAt: job.startedAt,
     completedAt: job.completedAt,
     attemptCount: job.attemptCount,
@@ -154,16 +190,25 @@ function safeCard(card: EvidenceCardRecord) {
   };
 }
 
-function safeCardDetail(card: EvidenceCardAdminDetail) {
+function truncateUtf8(value: string, maximumBytes: number): string {
+  if (maximumBytes <= 0) return "";
+  const encoder = new TextEncoder();
+  if (encoder.encode(value).byteLength <= maximumBytes) return value;
+  const buffer = new Uint8Array(maximumBytes);
+  const { read } = encoder.encodeInto(value, buffer);
+  return value.slice(0, read);
+}
+
+function safeCardDetail(card: EvidenceCardAdminDetail, budget: { remaining: number }) {
   return {
     ...safeCard(card),
-    citations: card.citations.map((citation) => ({
-      chunkId: citation.chunkId,
-      sourceId: citation.sourceId,
-      videoClipId: citation.videoClipId,
-      locationLabel: citation.locationLabel,
-      excerpt: citation.content.slice(0, 2_000),
-    })),
+    citationCount: card.citationCount,
+    citations: card.citations.slice(0, JOB_CARD_CITATION_LIMIT).map((citation) => {
+      const excerpt = truncateUtf8(citation.content, Math.min(JOB_EXCERPT_MAX_BYTES, budget.remaining));
+      budget.remaining -= new TextEncoder().encode(excerpt).byteLength;
+      return { chunkId: citation.chunkId, sourceId: citation.sourceId, videoClipId: citation.videoClipId,
+        locationLabel: citation.locationLabel, excerpt };
+    }),
   };
 }
 
@@ -185,8 +230,13 @@ async function bundleWithSource(
   bundleId: string,
   sourceId: string,
   runtime: EvidenceRouteRuntime,
-): Promise<{ bundle: EvidenceBundleDetail; source: StoredEvidenceFile } | Response> {
-  const bundle = await runtime.service.getBundleForAdmin(bundleId, runtime.admin);
+): Promise<
+  { bundle: EvidenceBundleDetail; source: StoredEvidenceFile } | Response
+> {
+  const bundle = await runtime.service.getBundleForAdmin(
+    bundleId,
+    runtime.admin,
+  );
   if (bundle === null) return jsonError("근거 묶음을 찾을 수 없습니다.", 404);
   const source = bundle.sources.find((candidate) => candidate.id === sourceId);
   if (!source) return jsonError("근거 파일을 찾을 수 없습니다.", 404);
@@ -204,7 +254,7 @@ export async function runEvidenceAdminRoute(
   handle: (runtime: EvidenceRouteRuntime) => Promise<Response>,
 ): Promise<Response> {
   const decision = await authorize(request);
-  if (decision instanceof Response) return decision;
+  if (decision instanceof Response) return protectAdminResponse(decision);
   let runtime: EvidenceRouteRuntime;
   try {
     runtime = await createRuntime(decision);
@@ -212,29 +262,39 @@ export async function runEvidenceAdminRoute(
     return jsonError("근거 자료 서비스를 사용할 수 없습니다.", 503);
   }
   try {
-    return await handle(runtime);
+    return protectAdminResponse(await handle(runtime));
   } catch (error) {
     return routeFailure(error);
   }
 }
 
-export function bindEvidenceSchedule(waitUntil: (promise: Promise<unknown>) => void) {
+export function bindEvidenceSchedule(
+  waitUntil: (promise: Promise<unknown>) => void,
+) {
   return (promise: Promise<unknown>): void => waitUntil(promise);
 }
 
-export async function handleEvidenceCollectionList(runtime: EvidenceRouteRuntime): Promise<Response> {
+export async function handleEvidenceCollectionList(
+  runtime: EvidenceRouteRuntime,
+): Promise<Response> {
   try {
     const bundles = await runtime.service.listBundlesForAdmin(runtime.admin);
-    return Response.json({ bundles: bundles.map(safeBundle) });
+    return adminJson({ bundles: bundles.map(safeBundle) });
   } catch (error) {
     return routeFailure(error);
   }
 }
 
-export async function handleEvidenceCollectionCreate(request: Request, runtime: EvidenceRouteRuntime): Promise<Response> {
+export async function handleEvidenceCollectionCreate(
+  request: Request,
+  runtime: EvidenceRouteRuntime,
+): Promise<Response> {
   try {
-    const bundle = await runtime.service.createBundle(await parseJson(request), runtime.admin);
-    return Response.json({ bundle: safeBundle(bundle) }, { status: 201 });
+    const bundle = await runtime.service.createBundle(
+      await parseJson(request),
+      runtime.admin,
+    );
+    return adminJson({ bundle: safeBundle(bundle) }, { status: 201 });
   } catch (error) {
     return routeFailure(error);
   }
@@ -246,10 +306,13 @@ export async function handleEvidenceBundleGet(
 ): Promise<Response> {
   try {
     const { bundleId } = await context.params;
-    const bundle = await runtime.service.getBundleForAdmin(bundleId, runtime.admin);
+    const bundle = await runtime.service.getBundleForAdmin(
+      bundleId,
+      runtime.admin,
+    );
     return bundle === null
       ? jsonError("근거 묶음을 찾을 수 없습니다.", 404)
-      : Response.json({ bundle: safeBundleDetail(bundle) });
+      : adminJson({ bundle: safeBundleDetail(bundle) });
   } catch (error) {
     return routeFailure(error);
   }
@@ -266,8 +329,12 @@ export async function handleEvidenceBundleUpdate(
     if (typeof input !== "object" || input === null || Array.isArray(input)) {
       throw new EvidenceValidationError("근거 묶음 수정 입력이 필요합니다.");
     }
-    const bundle = await runtime.service.updateBundle(bundleId, input, runtime.admin);
-    return Response.json({ bundle: safeBundle(bundle) });
+    const bundle = await runtime.service.updateBundle(
+      bundleId,
+      input,
+      runtime.admin,
+    );
+    return adminJson({ bundle: safeBundle(bundle) });
   } catch (error) {
     return routeFailure(error);
   }
@@ -280,19 +347,63 @@ export async function handleEvidenceFileUpload(
 ): Promise<Response> {
   try {
     const { bundleId } = await context.params;
-    const bundle = await runtime.service.getBundleForAdmin(bundleId, runtime.admin);
+    const bundle = await runtime.service.getBundleForAdmin(
+      bundleId,
+      runtime.admin,
+    );
     if (bundle === null) return jsonError("근거 묶음을 찾을 수 없습니다.", 404);
-    if (!(request.headers.get("content-type") ?? "").toLowerCase().startsWith("multipart/form-data")) {
+    if (!/^multipart\/form-data(?:\s*;|$)/i.test(request.headers.get("content-type") ?? "")) {
       return jsonError("multipart/form-data 파일 업로드가 필요합니다.", 415);
     }
+    const declaredLength = request.headers.get("content-length");
+    if (declaredLength !== null) {
+      if (!/^\d+$/.test(declaredLength))
+        return jsonError("Content-Length가 올바르지 않습니다.", 400);
+      if (Number(declaredLength) > MAX_MULTIPART_REQUEST_BYTES) {
+        return routeFailure(new EvidencePayloadTooLargeError());
+      }
+    }
+    if (request.body === null)
+      return jsonError("업로드할 파일이 필요합니다.", 400);
+    let total = 0;
+    let overflowed = false;
+    const reader = request.body.getReader();
+    const boundedBody = new ReadableStream<Uint8Array>({
+      async pull(controller) {
+        const { done, value } = await reader.read();
+        if (done) {
+          controller.close();
+          return;
+        }
+        total += value.byteLength;
+        if (total > MAX_MULTIPART_REQUEST_BYTES) {
+          overflowed = true;
+          controller.error(new EvidencePayloadTooLargeError());
+          await reader.cancel().catch(() => undefined);
+          return;
+        }
+        controller.enqueue(value);
+      },
+      async cancel(reason) {
+        await reader.cancel(reason).catch(() => undefined);
+      },
+    });
     let form: FormData;
     try {
-      form = await request.formData();
+      form = await new Response(boundedBody, {
+        headers: { "content-type": request.headers.get("content-type")! },
+      }).formData();
     } catch {
+      if (overflowed) return routeFailure(new EvidencePayloadTooLargeError());
       return jsonError("파일 업로드 형식을 확인할 수 없습니다.", 400);
     }
-    const candidate = form.get("file");
-    if (!(candidate instanceof File)) return jsonError("업로드할 파일이 필요합니다.", 400);
+    const entries = [...form.entries()];
+    if (entries.length !== 1 || entries[0]?.[0] !== "file") {
+      return jsonError("하나의 file 항목만 업로드할 수 있습니다.", 400);
+    }
+    const candidate = entries[0][1];
+    if (!(candidate instanceof File))
+      return jsonError("업로드할 파일이 필요합니다.", 400);
     if (candidate.size > MAX_EVIDENCE_FILE_BYTES) {
       return jsonError("파일은 20MB 이하여야 합니다.", 413);
     }
@@ -303,12 +414,10 @@ export async function handleEvidenceFileUpload(
         type: candidate.type,
         bytes: new Uint8Array(await candidate.arrayBuffer()),
       });
-      return Response.json({ source: safeSource(source) }, { status: 201 });
+      return adminJson({ source: safeSource(source) }, { status: 201 });
     } catch (error) {
-      if (error instanceof EvidenceValidationError) {
-        const status = error.message.includes("20MB") || error.message.includes("크기") ? 413 : 415;
-        return jsonError(error.message, status);
-      }
+      if (error instanceof EvidenceValidationError)
+        return routeFailure(new EvidenceUnsupportedMediaTypeError());
       return jsonError("근거 파일 저장소를 사용할 수 없습니다.", 503);
     }
   } catch (error) {
@@ -317,10 +426,18 @@ export async function handleEvidenceFileUpload(
 }
 
 function cleanDisplayFilename(value: string): string {
-  const cleaned = [...value.normalize("NFC")].map((character) => {
-    const codePoint = character.codePointAt(0) ?? 0;
-    return codePoint <= 31 || codePoint === 127 || character === "/" || character === "\\" ? "_" : character;
-  }).join("").trim();
+  const cleaned = [...value.normalize("NFC")]
+    .map((character) => {
+      const codePoint = character.codePointAt(0) ?? 0;
+      return codePoint <= 31 ||
+        codePoint === 127 ||
+        character === "/" ||
+        character === "\\"
+        ? "_"
+        : character;
+    })
+    .join("")
+    .trim();
   return cleaned || "evidence-file";
 }
 
@@ -360,11 +477,14 @@ export async function handleEvidenceFileDownload(
     }
     if (object === null) return jsonError("근거 파일을 찾을 수 없습니다.", 404);
     const body = downloadBody(object);
-    if (body === null) return jsonError("근거 파일 저장소를 사용할 수 없습니다.", 503);
+    if (body === null)
+      return jsonError("근거 파일 저장소를 사용할 수 없습니다.", 503);
     return new Response(body, {
       headers: {
         "cache-control": "private, no-store",
-        "content-disposition": attachmentDisposition(located.source.originalFileName),
+        "content-disposition": attachmentDisposition(
+          located.source.originalFileName,
+        ),
         "content-length": String(located.source.byteSize),
         "content-type": located.source.mediaType,
         "x-content-type-options": "nosniff",
@@ -383,7 +503,9 @@ export async function handleEvidenceFileImpact(
     const { bundleId, sourceId } = await context.params;
     const located = await bundleWithSource(bundleId, sourceId, runtime);
     if (located instanceof Response) return located;
-    return Response.json({ impact: await runtime.service.describeDeleteImpact(sourceId) });
+    return adminJson({
+      impact: await runtime.service.describeDeleteImpact(sourceId),
+    });
   } catch (error) {
     return routeFailure(error);
   }
@@ -398,13 +520,9 @@ export async function handleEvidenceFileDelete(
     const located = await bundleWithSource(bundleId, sourceId, runtime);
     if (located instanceof Response) return located;
     const bundle = await runtime.service.removeSource(sourceId, runtime.admin);
-    return Response.json({ bundle: safeBundle(bundle), removedSourceId: sourceId });
+    return adminJson({ bundle: safeBundle(bundle), removedSourceId: sourceId });
   } catch (error) {
-    if (error instanceof EvidenceConflictError || (error instanceof Error && isConflict(error))) {
-      return jsonError(error.message, 409);
-    }
-    if (error instanceof Error && isMissing(error)) return jsonError(error.message, 404);
-    return jsonError("근거 파일 저장소를 사용할 수 없습니다.", 503);
+    return routeFailure(error);
   }
 }
 
@@ -415,8 +533,12 @@ export async function handleEvidenceClipCreate(
 ): Promise<Response> {
   try {
     const { bundleId } = await context.params;
-    const bundle = await runtime.service.addVideoClip(bundleId, await parseJson(request), runtime.admin);
-    return Response.json({ bundle: safeBundle(bundle) }, { status: 201 });
+    const bundle = await runtime.service.addVideoClip(
+      bundleId,
+      await parseJson(request),
+      runtime.admin,
+    );
+    return adminJson({ bundle: safeBundle(bundle) }, { status: 201 });
   } catch (error) {
     return routeFailure(error);
   }
@@ -429,24 +551,47 @@ export async function handleEvidenceAnalyzeStart(
   try {
     const { bundleId } = await context.params;
     const job = await runtime.jobs.startAnalysis(bundleId, runtime.admin);
-    return Response.json({ job: safeJob(job) }, { status: 202 });
+    return adminJson({ job: safeJob(job) }, { status: 202 });
   } catch (error) {
     return routeFailure(error);
   }
 }
 
 export async function handleEvidenceJobStatus(
+  request: Request,
   context: RouteContext<{ jobId: string }>,
   runtime: EvidenceRouteRuntime,
 ): Promise<Response> {
   try {
     const { jobId } = await context.params;
+    const cursorValue = new URL(request.url).searchParams.get("cursor");
+    if (cursorValue !== null && !/^\d+$/.test(cursorValue))
+      throw new EvidenceRequestValidationError("페이지 커서가 올바르지 않습니다.");
+    const offset = cursorValue === null ? 0 : Number(cursorValue);
+    if (!Number.isSafeInteger(offset))
+      throw new EvidenceRequestValidationError("페이지 커서가 올바르지 않습니다.");
     const job = await runtime.jobs.getAnalysisStatus(jobId);
-    if (job === null) return jsonError("근거 분석 작업을 찾을 수 없습니다.", 404);
-    const cards = job.status === "review_ready" || job.status === "completed"
-      ? await runtime.service.listCardsForJob(jobId, runtime.admin)
-      : [];
-    return Response.json({ job: safeJob(job), cards: cards.map(safeCardDetail) });
+    if (job === null)
+      return jsonError("근거 분석 작업을 찾을 수 없습니다.", 404);
+    const page =
+      job.status === "review_ready" || job.status === "completed"
+        ? await runtime.service.listCardsForJob(jobId, runtime.admin, {
+            offset,
+            limit: JOB_CARD_PAGE_SIZE,
+            citationLimit: JOB_CARD_CITATION_LIMIT,
+          })
+        : { cards: [], totalCount: 0, nextOffset: null };
+    const excerptBudget = { remaining: JOB_AGGREGATE_EXCERPT_MAX_BYTES };
+    const cards = page.cards.slice(0, JOB_CARD_PAGE_SIZE).map((card) => safeCardDetail(card, excerptBudget));
+    return adminJson({
+      job: safeJob(job),
+      cards,
+      pagination: {
+        count: cards.length,
+        totalCount: page.totalCount,
+        nextCursor: page.nextOffset === null ? null : String(page.nextOffset),
+      },
+    });
   } catch (error) {
     return routeFailure(error);
   }
@@ -459,7 +604,7 @@ export async function handleEvidenceJobRetry(
   try {
     const { jobId } = await context.params;
     const job = await runtime.jobs.retryAnalysis(jobId, runtime.admin);
-    return Response.json({ job: safeJob(job) }, { status: 202 });
+    return adminJson({ job: safeJob(job) }, { status: 202 });
   } catch (error) {
     return routeFailure(error);
   }
@@ -476,8 +621,12 @@ export async function handleEvidenceCardReview(
     if (typeof input !== "object" || input === null || Array.isArray(input)) {
       throw new EvidenceValidationError("카드 검수 입력이 필요합니다.");
     }
-    const card = await runtime.service.reviewCard(cardId, input as never, runtime.admin);
-    return Response.json({ card: safeCard(card) });
+    const card = await runtime.service.reviewCard(
+      cardId,
+      input as never,
+      runtime.admin,
+    );
+    return adminJson({ card: safeCard(card) });
   } catch (error) {
     return routeFailure(error);
   }
@@ -494,8 +643,12 @@ export async function handleEvidenceScenarioDraft(
     if (typeof input !== "object" || input === null || Array.isArray(input)) {
       throw new EvidenceValidationError("시나리오 초안 입력이 필요합니다.");
     }
-    const scenario = await runtime.service.createScenarioDraft(cardId, input as never, runtime.admin);
-    return Response.json({ scenario: safeScenario(scenario) }, { status: 201 });
+    const scenario = await runtime.service.createScenarioDraft(
+      cardId,
+      input as never,
+      runtime.admin,
+    );
+    return adminJson({ scenario: safeScenario(scenario) }, { status: 201 });
   } catch (error) {
     return routeFailure(error);
   }

@@ -180,6 +180,7 @@ export async function assertPdfIsNotPasswordProtected(bytes: Uint8Array): Promis
       throw new PdfPasswordProtectedError();
     }
     if (error instanceof ExtractionInterruptedError) throw error;
+    throw error;
   } finally {
     guard.dispose();
     await destroy();
