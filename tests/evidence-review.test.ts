@@ -97,6 +97,18 @@ class SQLiteD1Database implements EvidenceD1Database {
   }
 }
 
+class HookedEvidenceRepository extends D1EvidenceServiceRepository {
+  afterFindCard: (() => void | Promise<void>) | null = null;
+
+  override async findCard(cardId: string) {
+    const card = await super.findCard(cardId);
+    const hook = this.afterFindCard;
+    this.afterFindCard = null;
+    await hook?.();
+    return card;
+  }
+}
+
 function card(overrides: Partial<TacticCardContent> = {}): TacticCardContent {
   return {
     situation: "전방 압박을 받는 빌드업",
@@ -165,7 +177,7 @@ const draftInput = {
 
 function createContext() {
   const database = new SQLiteD1Database();
-  const repository = new D1EvidenceServiceRepository(database);
+  const repository = new HookedEvidenceRepository(database);
   let generatedId = 0;
   let now = 1_000;
   const service = new EvidenceService({
@@ -174,7 +186,7 @@ function createContext() {
     now: () => ++now,
     newId: () => `generated-${++generatedId}`,
   });
-  return { database, service };
+  return { database, repository, service };
 }
 
 function seedCard(
@@ -239,6 +251,141 @@ function seedCard(
   }
 }
 
+function citationSnapshot(database: SQLiteD1Database, chunkIds: string[]): string {
+  return JSON.stringify(chunkIds.sort().map((chunkId) => database.first<{
+    chunkId: string;
+    sourceId: string | null;
+    videoClipId: string | null;
+    locationLabel: string;
+    content: string;
+    contentHash: string;
+  }>(`SELECT id AS chunkId,source_id AS sourceId,video_clip_id AS videoClipId,
+      location_label AS locationLabel,content,content_hash AS contentHash
+      FROM evidence_chunks WHERE id=?`, chunkId)));
+}
+
+function insertReviewVersion(
+  database: SQLiteD1Database,
+  input: {
+    id: string;
+    status: "analysis_draft" | "owner_reviewed" | "coach_reviewed" | "held" | "rejected";
+    kind: "llm_draft" | "owner_edit" | "coach_edit" | "status_change";
+    content?: TacticCardContent;
+    actorUserId?: string;
+    createdAt?: number;
+    producerJobId?: string | null;
+    producerModel?: string | null;
+  },
+): void {
+  const content = input.content ?? card();
+  const ids = [...new Set(
+    [...content.preferred, ...content.alternatives, ...content.risky].flatMap((action) => action.citationIds),
+  )];
+  database.run(
+    `INSERT INTO tactic_card_reviews
+      (id,card_id,actor_user_id,status,version_kind,producer_job_id,producer_model,
+       content_json,citation_snapshot_json,bundle_version,created_at)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+    input.id, "card-1", input.actorUserId ?? "admin-2", input.status, input.kind,
+    input.producerJobId ?? null, input.producerModel ?? null, JSON.stringify(content), citationSnapshot(database, ids),
+    "bundle-v1", input.createdAt ?? 2_000,
+  );
+}
+
+function insertScenarioForReview(database: SQLiteD1Database, scenarioId: string, reviewId: string): void {
+  const content = {
+    ...scenarioContent,
+    review: { sourceReviewed: false, timelineReviewed: false, explanationsReviewed: false },
+  };
+  database.run(
+    `INSERT INTO scenarios
+      (id,campaign_id,role,principle,prompt,hint,explanation,pitch_json,answer_json,content_json,review_status,order_index)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
+    scenarioId, draftInput.campaignId, draftInput.role, draftInput.principle, draftInput.prompt,
+    draftInput.hint, draftInput.explanation, JSON.stringify(content.pitch), JSON.stringify(content.answer),
+    JSON.stringify(content), "draft", draftInput.orderIndex,
+  );
+  database.run(
+    "INSERT INTO scenario_tactic_card_reviews (scenario_id,card_id,card_review_id,created_at) VALUES (?,?,?,?)",
+    scenarioId, "card-1", reviewId, 2_000,
+  );
+}
+
+test("migration 0009 backfills the current review fence without claiming legacy rows are LLM originals", () => {
+  const database = new DatabaseSync(":memory:");
+  database.exec("PRAGMA foreign_keys = ON");
+  const migrations = readdirSync("drizzle").filter((value) => /^\d{4}_.*\.sql$/.test(value)).sort();
+  const migrationIndex = migrations.findIndex((name) => name.startsWith("0009_"));
+  assert.notEqual(migrationIndex, -1, "Expected additive migration 0009");
+  for (const name of migrations.slice(0, migrationIndex)) database.exec(readFileSync(`drizzle/${name}`, "utf8"));
+  database.prepare(
+    "INSERT INTO evidence_bundles (id,title,purpose,version,content_version,created_at,updated_at) VALUES (?,?,?,?,?,?,?)",
+  ).run("legacy-bundle", "Legacy", "review", 1, "legacy-version", 1, 1);
+  database.prepare(
+    `INSERT INTO evidence_analysis_jobs
+      (id,bundle_id,input_version,status,analyzer_model,prompt_version,schema_version,stage,is_stale,created_at,updated_at)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+  ).run("legacy-job", "legacy-bundle", "legacy-version", "review_ready", "legacy-model", "p1", "s1", "done", 0, 1, 1);
+  database.prepare(
+    `INSERT INTO tactic_cards
+      (id,bundle_id,job_id,bundle_version,status,draft_content_json,current_content_json,is_stale,created_at,updated_at)
+      VALUES (?,?,?,?,?,?,?,?,?,?)`,
+  ).run("legacy-card", "legacy-bundle", "legacy-job", "legacy-version", "owner_reviewed", "{}", "{}", 0, 1, 20);
+  for (const [id, status, createdAt] of [
+    ["legacy-held", "held", 10],
+    ["legacy-owner", "owner_reviewed", 20],
+  ] as const) {
+    database.prepare(
+      `INSERT INTO tactic_card_reviews
+        (id,card_id,actor_user_id,status,content_json,citation_snapshot_json,bundle_version,created_at)
+        VALUES (?,?,?,?,?,?,?,?)`,
+    ).run(
+      id, "legacy-card", "legacy-admin", status, "{}",
+      id === "legacy-owner" ? '[{"chunkId":"legacy-chunk"}]' : "[]", "legacy-version", createdAt,
+    );
+  }
+  database.prepare(
+    `INSERT INTO evidence_sources
+      (id,bundle_id,original_file_name,media_type,byte_size,content_hash,storage_key,extraction_status,created_at,updated_at)
+      VALUES (?,?,?,?,?,?,?,?,?,?)`,
+  ).run("legacy-source", "legacy-bundle", "legacy.md", "text/markdown", 1, "legacy-hash", "legacy-key", "completed", 1, 1);
+  database.prepare(
+    `INSERT INTO evidence_chunks
+      (id,bundle_id,input_version,source_id,video_clip_id,ordinal,location_label,content,content_hash,created_at)
+      VALUES (?,?,?,?,?,?,?,?,?,?)`,
+  ).run("legacy-chunk", "legacy-bundle", "legacy-version", "legacy-source", null, 0, "p.1", "legacy", "chunk-hash", 1);
+  database.prepare(
+    `INSERT INTO scenarios
+      (id,campaign_id,role,principle,prompt,hint,explanation,pitch_json,answer_json,content_json,review_status,order_index)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
+  ).run("legacy-scenario", "diamond-121-intro", "ala", "width", "p", "h", "e", "{}", "{}", "{}", "draft", 90);
+  database.prepare(
+    "INSERT INTO scenario_tactic_card_reviews (scenario_id,card_id,card_review_id,created_at) VALUES (?,?,?,?)",
+  ).run("legacy-scenario", "legacy-card", "legacy-owner", 20);
+
+  database.exec(readFileSync(`drizzle/${migrations[migrationIndex]}`, "utf8"));
+
+  assert.deepEqual(database.prepare(
+    "SELECT id,version_kind AS versionKind,producer_job_id AS producerJobId,producer_model AS producerModel FROM tactic_card_reviews ORDER BY created_at",
+  ).all().map((row) => ({ ...row })), [
+    { id: "legacy-held", versionKind: "status_change", producerJobId: null, producerModel: null },
+    { id: "legacy-owner", versionKind: "status_change", producerJobId: null, producerModel: null },
+  ]);
+  assert.equal(database.prepare(
+    "SELECT current_review_id AS currentReviewId FROM tactic_cards WHERE id='legacy-card'",
+  ).get()?.currentReviewId, "legacy-owner");
+  assert.equal(database.prepare(
+    "SELECT count(*) AS count FROM tactic_card_reviews WHERE version_kind='llm_draft'",
+  ).get()?.count, 0);
+  assert.equal(database.prepare(
+    "SELECT chunk_id AS chunkId FROM scenario_evidence_chunks WHERE scenario_id='legacy-scenario'",
+  ).get()?.chunkId, "legacy-chunk");
+  assert.equal(database.prepare(
+    "SELECT source_id AS sourceId FROM scenario_evidence_sources WHERE scenario_id='legacy-scenario'",
+  ).get()?.sourceId, "legacy-source");
+  assert.deepEqual(database.prepare("PRAGMA foreign_key_check").all(), []);
+});
+
 test("owner edits retain the untouched LLM draft and exact immutable review snapshots", async () => {
   const { database, service } = createContext();
   seedCard(database);
@@ -257,15 +404,20 @@ test("owner edits retain the untouched LLM draft and exact immutable review snap
   assert.equal(reviewed.updatedAt, 1001);
   const versions = database.all<{
     status: string;
+    versionKind: string;
     actorUserId: string;
+    producerJobId: string | null;
+    producerModel: string | null;
     contentJson: string;
     citationSnapshotJson: string;
     bundleVersion: string;
     createdAt: number;
-  }>(`SELECT status,actor_user_id AS actorUserId,content_json AS contentJson,
+  }>(`SELECT status,version_kind AS versionKind,actor_user_id AS actorUserId,
+      producer_job_id AS producerJobId,producer_model AS producerModel,content_json AS contentJson,
       citation_snapshot_json AS citationSnapshotJson,bundle_version AS bundleVersion,created_at AS createdAt
       FROM tactic_card_reviews WHERE card_id='card-1' ORDER BY rowid`);
   assert.deepEqual(versions.map((version) => version.status), ["analysis_draft", "owner_reviewed"]);
+  assert.deepEqual(versions.map((version) => version.versionKind), ["llm_draft", "owner_edit"]);
   assert.deepEqual(JSON.parse(versions[0].contentJson), card());
   assert.deepEqual(JSON.parse(versions[1].contentJson), edited);
   assert.deepEqual(JSON.parse(versions[1].citationSnapshotJson), [{
@@ -276,10 +428,18 @@ test("owner edits retain the untouched LLM draft and exact immutable review snap
     content: "반대편 패스",
     contentHash: "chunk-hash-1",
   }]);
-  assert.deepEqual(versions.map(({ actorUserId, bundleVersion, createdAt }) => ({ actorUserId, bundleVersion, createdAt })), [
-    { actorUserId: "admin-1", bundleVersion: "bundle-v1", createdAt: 1001 },
-    { actorUserId: "admin-1", bundleVersion: "bundle-v1", createdAt: 1001 },
+  assert.deepEqual(versions.map(({ actorUserId, producerJobId, producerModel, bundleVersion, createdAt }) => ({
+    actorUserId, producerJobId, producerModel, bundleVersion, createdAt,
+  })), [
+    { actorUserId: "job-1", producerJobId: "job-1", producerModel: "model-1", bundleVersion: "bundle-v1", createdAt: 1 },
+    { actorUserId: "admin-1", producerJobId: null, producerModel: null, bundleVersion: "bundle-v1", createdAt: 1001 },
   ]);
+  const cardFence = database.first<{ currentReviewId: string }>(
+    "SELECT current_review_id AS currentReviewId FROM tactic_cards WHERE id='card-1'",
+  );
+  assert.equal(cardFence.currentReviewId, database.first<{ id: string }>(
+    "SELECT id FROM tactic_card_reviews WHERE card_id='card-1' AND version_kind='owner_edit'",
+  ).id);
   assert.equal(database.first<{ count: number }>("SELECT count(*) AS count FROM evidence_audit_events WHERE action='card.reviewed'").count, 1);
 });
 
@@ -305,6 +465,115 @@ test("every subsequent owner edit appends a snapshot without rewriting history",
     "전방 압박을 받는 빌드업",
     "첫 수정",
     "두 번째 수정",
+  ]);
+});
+
+test("a missing LLM original is inserted despite held and rejected history and remains uniquely identifiable", async () => {
+  const { database, service } = createContext();
+  seedCard(database);
+  insertReviewVersion(database, {
+    id: "held-history",
+    status: "held",
+    kind: "status_change",
+    actorUserId: "admin-old",
+    createdAt: 50,
+  });
+  insertReviewVersion(database, {
+    id: "rejected-history",
+    status: "rejected",
+    kind: "status_change",
+    actorUserId: "admin-old",
+    createdAt: 60,
+  });
+
+  await service.reviewCard("card-1", {
+    status: "owner_reviewed",
+    content: card({ situation: "검수된 카드" }),
+    expectedUpdatedAt: 100,
+  }, admin);
+
+  assert.deepEqual(database.all<{ kind: string }>(
+    "SELECT version_kind AS kind FROM tactic_card_reviews WHERE card_id='card-1' ORDER BY rowid",
+  ).map(({ kind }) => kind), ["status_change", "status_change", "llm_draft", "owner_edit"]);
+  assert.equal(database.first<{ count: number }>(
+    "SELECT count(*) AS count FROM tactic_card_reviews WHERE card_id='card-1' AND version_kind='llm_draft'",
+  ).count, 1);
+});
+
+test("a concurrent original insertion cannot create a duplicate LLM version", async () => {
+  const { database, service } = createContext();
+  seedCard(database);
+  database.beforeNextBatch = () => {
+    insertReviewVersion(database, {
+      id: "winning-original",
+      status: "analysis_draft",
+      kind: "llm_draft",
+      actorUserId: "job-1",
+      producerJobId: "job-1",
+      producerModel: "model-1",
+      createdAt: 1,
+    });
+  };
+
+  await service.reviewCard("card-1", {
+    status: "owner_reviewed",
+    content: card({ situation: "동시 검수" }),
+    expectedUpdatedAt: 100,
+  }, admin);
+
+  assert.equal(database.first<{ count: number }>(
+    "SELECT count(*) AS count FROM tactic_card_reviews WHERE card_id='card-1' AND version_kind='llm_draft'",
+  ).count, 1);
+  assert.throws(() => insertReviewVersion(database, {
+    id: "duplicate-original",
+    status: "analysis_draft",
+    kind: "llm_draft",
+    actorUserId: "job-1",
+    producerJobId: "job-1",
+    producerModel: "model-1",
+    createdAt: 1,
+  }), /UNIQUE/);
+});
+
+test("an analysis-draft status command is distinct from the original LLM version", async () => {
+  const { database, service } = createContext();
+  seedCard(database);
+
+  await service.reviewCard("card-1", {
+    status: "analysis_draft",
+    content: card({ situation: "운영자가 되돌린 초안" }),
+    expectedUpdatedAt: 100,
+  }, admin);
+
+  assert.deepEqual(database.all<{ status: string; kind: string }>(
+    "SELECT status,version_kind AS kind FROM tactic_card_reviews WHERE card_id='card-1' ORDER BY rowid",
+  ).map((row) => ({ ...row })), [
+    { status: "analysis_draft", kind: "llm_draft" },
+    { status: "analysis_draft", kind: "status_change" },
+  ]);
+});
+
+test("coach approval appends a coach-edit identity after the owner edit", async () => {
+  const { database, service } = createContext();
+  seedCard(database);
+  const owner = await service.reviewCard("card-1", {
+    status: "owner_reviewed",
+    content: card({ situation: "운영자 수정" }),
+    expectedUpdatedAt: 100,
+  }, admin);
+
+  await service.reviewCard("card-1", {
+    status: "coach_reviewed",
+    content: card({ situation: "코치 수정" }),
+    expectedUpdatedAt: owner.updatedAt,
+  }, { ...admin, userId: "coach-1" });
+
+  assert.deepEqual(database.all<{ kind: string; actor: string }>(
+    "SELECT version_kind AS kind,actor_user_id AS actor FROM tactic_card_reviews WHERE card_id='card-1' ORDER BY rowid",
+  ).map((row) => ({ ...row })), [
+    { kind: "llm_draft", actor: "job-1" },
+    { kind: "owner_edit", actor: "admin-1" },
+    { kind: "coach_edit", actor: "coach-1" },
   ]);
 });
 
@@ -397,6 +666,11 @@ test("a current approved suitable card creates only one unpublished draft with e
       .map((row) => ({ ...row })),
     [{ sourceId: "source-1" }],
   );
+  assert.deepEqual(
+    database.all<{ chunkId: string }>("SELECT chunk_id AS chunkId FROM scenario_evidence_chunks WHERE scenario_id=?", first.id)
+      .map((row) => ({ ...row })),
+    [{ chunkId: "chunk-1" }],
+  );
   const provenance = database.first<{ cardId: string; reviewId: string }>(
     "SELECT card_id AS cardId,card_review_id AS reviewId FROM scenario_tactic_card_reviews WHERE scenario_id=?",
     first.id,
@@ -405,6 +679,74 @@ test("a current approved suitable card creates only one unpublished draft with e
   assert.match(provenance.reviewId, /^generated-/);
   assert.equal(database.first<{ count: number }>("SELECT count(*) AS count FROM scenarios WHERE review_status='reviewed' AND id=?", first.id).count, 0);
   assert.equal(database.first<{ count: number }>("SELECT count(*) AS count FROM evidence_audit_events WHERE action='scenario.draft_created'").count, 1);
+});
+
+test("file-only, video-only, and mixed scenarios normalize every cited chunk with deletion integrity", async () => {
+  const cases = [
+    {
+      name: "file-only",
+      content: card({ risky: [] }),
+      chunks: ["chunk-1"],
+      sources: ["source-1"],
+      deletes: ["DELETE FROM evidence_sources WHERE id='source-1'"],
+    },
+    {
+      name: "video-only",
+      content: card({ preferred: [{ action: "dribble", reason: "영상 근거", citationIds: ["chunk-2"] }], risky: [] }),
+      chunks: ["chunk-2"],
+      sources: [],
+      deletes: ["DELETE FROM evidence_video_clips WHERE id='clip-1'"],
+    },
+    {
+      name: "mixed",
+      content: card(),
+      chunks: ["chunk-1", "chunk-2"],
+      sources: ["source-1"],
+      deletes: [
+        "DELETE FROM evidence_sources WHERE id='source-1'",
+        "DELETE FROM evidence_video_clips WHERE id='clip-1'",
+      ],
+    },
+  ] as const;
+
+  for (const item of cases) {
+    const { database, service } = createContext();
+    seedCard(database);
+    const reviewed = await service.reviewCard("card-1", {
+      status: "owner_reviewed",
+      content: item.content,
+      expectedUpdatedAt: 100,
+    }, admin);
+    const scenario = await service.createScenarioDraft(
+      "card-1", { ...draftInput, expectedUpdatedAt: reviewed.updatedAt }, admin,
+    );
+
+    assert.deepEqual(database.all<{ chunkId: string }>(
+      "SELECT chunk_id AS chunkId FROM scenario_evidence_chunks WHERE scenario_id=? ORDER BY chunk_id",
+      scenario.id,
+    ).map(({ chunkId }) => chunkId), [...item.chunks], item.name);
+    assert.deepEqual(database.all<{ sourceId: string }>(
+      "SELECT source_id AS sourceId FROM scenario_evidence_sources WHERE scenario_id=? ORDER BY source_id",
+      scenario.id,
+    ).map(({ sourceId }) => sourceId), [...item.sources], item.name);
+    for (const deletion of item.deletes) assert.throws(() => database.run(deletion), /./, item.name);
+    database.run("DELETE FROM tactic_card_citations WHERE card_id='card-1'");
+    for (const deletion of item.deletes) {
+      assert.throws(() => database.run(deletion), /constraint|FOREIGN KEY/i, `${item.name} normalized chunk FK`);
+    }
+    assert.throws(() => database.run(
+      "INSERT INTO scenario_evidence_chunks (scenario_id,chunk_id) VALUES (?,?)",
+      scenario.id,
+      "missing-chunk",
+    ), /constraint|FOREIGN KEY/i, item.name);
+
+    database.run("DELETE FROM scenarios WHERE id=?", scenario.id);
+    assert.equal(database.first<{ count: number }>(
+      "SELECT count(*) AS count FROM scenario_evidence_chunks WHERE scenario_id=?",
+      scenario.id,
+    ).count, 0);
+    for (const deletion of item.deletes) assert.doesNotThrow(() => database.run(deletion), item.name);
+  }
 });
 
 test("scenario conversion blocks stale, unsuitable, and citation provenance mismatches", async () => {
@@ -457,10 +799,94 @@ test("a competing conversion of the same immutable review wins idempotently", as
       "INSERT INTO scenario_tactic_card_reviews (scenario_id,card_id,card_review_id,created_at) VALUES (?,?,?,?)",
       "winner-scenario", "card-1", reviewId, 999,
     );
+    database.run(
+      "INSERT INTO scenario_evidence_sources (scenario_id,source_id) VALUES (?,?)",
+      "winner-scenario", "source-1",
+    );
+    database.run(
+      "INSERT INTO scenario_evidence_chunks (scenario_id,chunk_id) VALUES (?,?)",
+      "winner-scenario", "chunk-1",
+    );
   };
 
   const result = await service.createScenarioDraft("card-1", { ...draftInput, expectedUpdatedAt: reviewed.updatedAt }, admin);
 
   assert.equal(result.id, "winner-scenario");
   assert.equal(database.first<{ count: number }>("SELECT count(*) AS count FROM scenario_tactic_card_reviews WHERE card_review_id=?", reviewId).count, 1);
+});
+
+test("a newer review scenario cannot satisfy a stale conversion through the early idempotency path", async () => {
+  const { database, repository, service } = createContext();
+  seedCard(database);
+  const reviewed = await service.reviewCard("card-1", {
+    status: "owner_reviewed",
+    content: card({ risky: [] }),
+    expectedUpdatedAt: 100,
+  }, admin);
+  repository.afterFindCard = () => {
+    insertReviewVersion(database, {
+      id: "review-new",
+      status: "owner_reviewed",
+      kind: "owner_edit",
+      content: card({ risky: [] }),
+      createdAt: reviewed.updatedAt + 1,
+    });
+    database.run(
+      "UPDATE tactic_cards SET current_review_id='review-new',updated_at=? WHERE id='card-1'",
+      reviewed.updatedAt + 1,
+    );
+    insertScenarioForReview(database, "scenario-new", "review-new");
+  };
+
+  await assert.rejects(
+    () => service.createScenarioDraft("card-1", { ...draftInput, expectedUpdatedAt: reviewed.updatedAt }, admin),
+    EvidenceConflictError,
+  );
+  assert.equal(database.first<{ count: number }>(
+    "SELECT count(*) AS count FROM scenario_tactic_card_reviews WHERE card_review_id='review-new'",
+  ).count, 1);
+});
+
+test("a same-review winner cannot satisfy a stale conversion after a newer review wins the card CAS", async () => {
+  const { database, service } = createContext();
+  seedCard(database);
+  const reviewed = await service.reviewCard("card-1", {
+    status: "owner_reviewed",
+    content: card({ risky: [] }),
+    expectedUpdatedAt: 100,
+  }, admin);
+  const reviewId = database.first<{ currentReviewId: string }>(
+    "SELECT current_review_id AS currentReviewId FROM tactic_cards WHERE id='card-1'",
+  ).currentReviewId;
+  database.beforeNextBatch = () => {
+    insertScenarioForReview(database, "same-review-winner", reviewId);
+    database.run(
+      "INSERT INTO scenario_evidence_sources (scenario_id,source_id) VALUES (?,?)",
+      "same-review-winner", "source-1",
+    );
+    database.run(
+      "INSERT INTO scenario_evidence_chunks (scenario_id,chunk_id) VALUES (?,?)",
+      "same-review-winner", "chunk-1",
+    );
+    insertReviewVersion(database, {
+      id: "review-new",
+      status: "owner_reviewed",
+      kind: "owner_edit",
+      content: card({ risky: [] }),
+      createdAt: reviewed.updatedAt + 1,
+    });
+    database.run(
+      "UPDATE tactic_cards SET current_review_id='review-new',updated_at=? WHERE id='card-1'",
+      reviewed.updatedAt + 1,
+    );
+  };
+
+  await assert.rejects(
+    () => service.createScenarioDraft("card-1", { ...draftInput, expectedUpdatedAt: reviewed.updatedAt }, admin),
+    EvidenceConflictError,
+  );
+  assert.equal(database.first<{ count: number }>(
+    "SELECT count(*) AS count FROM scenario_tactic_card_reviews WHERE card_review_id=?",
+    reviewId,
+  ).count, 1);
 });

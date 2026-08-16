@@ -27,6 +27,8 @@ export type EvidenceCardRecord = {
   jobId: string;
   bundleVersion: string;
   currentBundleVersion: string;
+  currentReviewId: string | null;
+  producerModel: string;
   status: CardReviewStatus;
   draftContentJson: string;
   currentContentJson: string;
@@ -34,6 +36,7 @@ export type EvidenceCardRecord = {
   createdAt: number;
   updatedAt: number;
 };
+export type EvidenceCardReviewVersionKind = "llm_draft" | "owner_edit" | "coach_edit" | "status_change";
 export type EvidenceCitationSnapshot = {
   chunkId: string;
   sourceId: string | null;
@@ -47,6 +50,9 @@ export type EvidenceCardReviewRecord = {
   cardId: string;
   actorUserId: string;
   status: CardReviewStatus;
+  versionKind: EvidenceCardReviewVersionKind;
+  producerJobId: string | null;
+  producerModel: string | null;
   contentJson: string;
   citationSnapshotJson: string;
   bundleVersion: string;
@@ -97,6 +103,7 @@ export type EvidenceScenarioDraftMutation = {
   review: EvidenceCardReviewRecord;
   expectedUpdatedAt: number;
   scenario: EvidenceScenarioDraftRecord;
+  chunkIds: string[];
   sourceIds: string[];
   audit: EvidenceAuditEventInput;
   createdAt: number;
@@ -116,9 +123,9 @@ export type EvidenceServiceRepository={
   applyMutation(mutation:EvidenceMutation):Promise<boolean>;
   findCard(cardId:string):Promise<EvidenceCardRecord|null>;
   listCardCitations(cardId:string):Promise<(EvidenceCitationSnapshot&{inputVersion:string})[]>;
-  findCurrentCardReview(cardId:string):Promise<EvidenceCardReviewRecord|null>;
+  findCardReview(reviewId:string,cardId:string):Promise<EvidenceCardReviewRecord|null>;
   applyCardReview(mutation:EvidenceCardReviewMutation):Promise<boolean>;
-  findScenarioDraftByReview(reviewId:string):Promise<EvidenceScenarioDraftRecord|null>;
+  findScenarioDraftByReview(reviewId:string,cardId:string,expectedUpdatedAt:number):Promise<EvidenceScenarioDraftRecord|null>;
   createScenarioDraft(mutation:EvidenceScenarioDraftMutation):Promise<boolean>;
 };
 const guard="EXISTS (SELECT 1 FROM evidence_bundles WHERE id=? AND version=? AND content_version=?)";
@@ -163,6 +170,12 @@ function expectedTimestamp(value: number): number {
 function requiredText(value: unknown, field: string): string {
   if (typeof value !== "string" || value.trim() === "") throw new Error(`${field}이 필요합니다.`);
   return value;
+}
+
+function reviewVersionKind(status: CardReviewStatus): EvidenceCardReviewVersionKind {
+  if (status === "owner_reviewed") return "owner_edit";
+  if (status === "coach_reviewed") return "coach_edit";
+  return "status_change";
 }
 /** Production D1 adapter: every dependent write shares an optimistic-CAS guard in one atomic batch. */
 export class D1EvidenceServiceRepository implements EvidenceServiceRepository {
@@ -268,11 +281,13 @@ export class D1EvidenceServiceRepository implements EvidenceServiceRepository {
   async findCard(cardId: string): Promise<EvidenceCardRecord | null> {
     const row = await this.db.prepare(
       `SELECT card.id,card.bundle_id AS bundleId,card.job_id AS jobId,card.bundle_version AS bundleVersion,
-        bundle.content_version AS currentBundleVersion,card.status,card.draft_content_json AS draftContentJson,
+        bundle.content_version AS currentBundleVersion,card.current_review_id AS currentReviewId,
+        job.analyzer_model AS producerModel,card.status,card.draft_content_json AS draftContentJson,
         card.current_content_json AS currentContentJson,card.is_stale AS isStale,
         card.created_at AS createdAt,card.updated_at AS updatedAt
         FROM tactic_cards AS card
         JOIN evidence_bundles AS bundle ON bundle.id=card.bundle_id
+        JOIN evidence_analysis_jobs AS job ON job.id=card.job_id AND job.bundle_id=card.bundle_id
         WHERE card.id=?`,
     ).bind(cardId).first<EvidenceCardRecord>();
     return row === null ? null : { ...row, isStale: Boolean(row.isStale) };
@@ -286,17 +301,14 @@ export class D1EvidenceServiceRepository implements EvidenceServiceRepository {
         WHERE citation.card_id=? ORDER BY chunk.id`,
     ).bind(cardId).all<EvidenceCitationSnapshot & { inputVersion: string }>()).results;
   }
-  async findCurrentCardReview(cardId: string): Promise<EvidenceCardReviewRecord | null> {
+  async findCardReview(reviewId: string, cardId: string): Promise<EvidenceCardReviewRecord | null> {
     return this.db.prepare(
       `SELECT review.id,review.card_id AS cardId,review.actor_user_id AS actorUserId,review.status,
+        review.version_kind AS versionKind,review.producer_job_id AS producerJobId,review.producer_model AS producerModel,
         review.content_json AS contentJson,review.citation_snapshot_json AS citationSnapshotJson,
         review.bundle_version AS bundleVersion,review.created_at AS createdAt
-        FROM tactic_card_reviews AS review
-        JOIN tactic_cards AS card ON card.id=review.card_id
-        WHERE review.card_id=? AND review.status=card.status
-          AND review.content_json=card.current_content_json AND review.bundle_version=card.bundle_version
-        ORDER BY review.created_at DESC,review.rowid DESC LIMIT 1`,
-    ).bind(cardId).first<EvidenceCardReviewRecord>();
+        FROM tactic_card_reviews AS review WHERE review.id=? AND review.card_id=?`,
+    ).bind(reviewId, cardId).first<EvidenceCardReviewRecord>();
   }
   async applyCardReview(mutation: EvidenceCardReviewMutation): Promise<boolean> {
     const reviewGuard = `EXISTS (
@@ -311,35 +323,43 @@ export class D1EvidenceServiceRepository implements EvidenceServiceRepository {
     const statements = [
       this.db.prepare(
         `INSERT INTO tactic_card_reviews
-          (id,card_id,actor_user_id,status,content_json,citation_snapshot_json,bundle_version,created_at)
-          SELECT ?,?,?,?,?,?,?,? WHERE ${reviewGuard}
-            AND NOT EXISTS (SELECT 1 FROM tactic_card_reviews WHERE card_id=?)`,
+          (id,card_id,actor_user_id,status,version_kind,producer_job_id,producer_model,
+           content_json,citation_snapshot_json,bundle_version,created_at)
+          SELECT ?,?,?,?,?,?,?,?,?,?,? WHERE ${reviewGuard}
+            AND NOT EXISTS (SELECT 1 FROM tactic_card_reviews WHERE card_id=? AND version_kind='llm_draft')`,
       ).bind(
-        original.id, original.cardId, original.actorUserId, original.status, original.contentJson,
+        original.id, original.cardId, original.actorUserId, original.status, original.versionKind,
+        original.producerJobId, original.producerModel, original.contentJson,
         original.citationSnapshotJson, original.bundleVersion, original.createdAt, ...guardValues, mutation.card.id,
       ),
       this.db.prepare(
         `INSERT INTO tactic_card_reviews
-          (id,card_id,actor_user_id,status,content_json,citation_snapshot_json,bundle_version,created_at)
-          SELECT ?,?,?,?,?,?,?,? WHERE ${reviewGuard}`,
+          (id,card_id,actor_user_id,status,version_kind,producer_job_id,producer_model,
+           content_json,citation_snapshot_json,bundle_version,created_at)
+          SELECT ?,?,?,?,?,?,?,?,?,?,? WHERE ${reviewGuard}`,
       ).bind(
-        review.id, review.cardId, review.actorUserId, review.status, review.contentJson,
+        review.id, review.cardId, review.actorUserId, review.status, review.versionKind,
+        review.producerJobId, review.producerModel, review.contentJson,
         review.citationSnapshotJson, review.bundleVersion, review.createdAt, ...guardValues,
       ),
       this.audit(mutation.audit, reviewGuard, guardValues),
       this.db.prepare(
-        `UPDATE tactic_cards SET status=?,current_content_json=?,updated_at=?
+        `UPDATE tactic_cards SET status=?,current_content_json=?,current_review_id=?,updated_at=?
           WHERE id=? AND updated_at=? AND is_stale=0
             AND bundle_version=(SELECT content_version FROM evidence_bundles WHERE id=bundle_id)`,
       ).bind(
-        mutation.status, mutation.contentJson, mutation.nextUpdatedAt,
+        mutation.status, mutation.contentJson, review.id, mutation.nextUpdatedAt,
         mutation.card.id, mutation.expectedUpdatedAt,
       ),
     ];
     const results = await this.db.batch(statements);
     return (results.at(-1)?.meta?.changes ?? 0) === 1;
   }
-  async findScenarioDraftByReview(reviewId: string): Promise<EvidenceScenarioDraftRecord | null> {
+  async findScenarioDraftByReview(
+    reviewId: string,
+    cardId: string,
+    expectedUpdatedAt: number,
+  ): Promise<EvidenceScenarioDraftRecord | null> {
     return this.db.prepare(
       `SELECT scenario.id,scenario.campaign_id AS campaignId,scenario.role,scenario.principle,
         scenario.prompt,scenario.hint,scenario.explanation,scenario.pitch_json AS pitchJson,
@@ -347,8 +367,16 @@ export class D1EvidenceServiceRepository implements EvidenceServiceRepository {
         scenario.review_status AS reviewStatus,scenario.order_index AS orderIndex
         FROM scenario_tactic_card_reviews AS provenance
         JOIN scenarios AS scenario ON scenario.id=provenance.scenario_id
-        WHERE provenance.card_review_id=?`,
-    ).bind(reviewId).first<EvidenceScenarioDraftRecord>();
+        JOIN tactic_cards AS card ON card.id=provenance.card_id
+        JOIN evidence_bundles AS bundle ON bundle.id=card.bundle_id
+        JOIN tactic_card_reviews AS review ON review.id=provenance.card_review_id AND review.card_id=card.id
+        WHERE provenance.card_review_id=? AND provenance.card_id=?
+          AND card.current_review_id=? AND card.updated_at=? AND card.is_stale=0
+          AND card.bundle_version=bundle.content_version
+          AND card.status IN ('owner_reviewed','coach_reviewed')
+          AND review.status=card.status AND review.content_json=card.current_content_json
+          AND review.bundle_version=card.bundle_version`,
+    ).bind(reviewId, cardId, reviewId, expectedUpdatedAt).first<EvidenceScenarioDraftRecord>();
   }
   async createScenarioDraft(mutation: EvidenceScenarioDraftMutation): Promise<boolean> {
     const scenario = mutation.scenario;
@@ -358,6 +386,7 @@ export class D1EvidenceServiceRepository implements EvidenceServiceRepository {
       JOIN tactic_card_reviews AS review ON review.id=? AND review.card_id=card.id
       WHERE card.id=? AND card.updated_at=? AND card.is_stale=0
         AND card.bundle_version=bundle.content_version
+        AND card.current_review_id=review.id
         AND card.status IN ('owner_reviewed','coach_reviewed')
         AND review.status=card.status AND review.content_json=card.current_content_json
         AND review.bundle_version=card.bundle_version
@@ -383,6 +412,11 @@ export class D1EvidenceServiceRepository implements EvidenceServiceRepository {
       statements.push(this.db.prepare(
         "INSERT INTO scenario_evidence_sources (scenario_id,source_id) VALUES (?,?)",
       ).bind(scenario.id, sourceId));
+    }
+    for (const chunkId of mutation.chunkIds) {
+      statements.push(this.db.prepare(
+        "INSERT INTO scenario_evidence_chunks (scenario_id,chunk_id) VALUES (?,?)",
+      ).bind(scenario.id, chunkId));
     }
     statements.push(this.db.prepare(
       `INSERT INTO evidence_audit_events
@@ -465,18 +499,24 @@ export class EvidenceService {
     const originalReview: EvidenceCardReviewRecord = {
       id: this.id(),
       cardId: card.id,
-      actorUserId: admin.userId,
+      actorUserId: card.jobId,
       status: "analysis_draft",
+      versionKind: "llm_draft",
+      producerJobId: card.jobId,
+      producerModel: card.producerModel,
       contentJson: JSON.stringify(original),
       citationSnapshotJson: JSON.stringify(originalSnapshot),
       bundleVersion: card.bundleVersion,
-      createdAt: now,
+      createdAt: card.createdAt,
     };
     const review: EvidenceCardReviewRecord = {
       id: this.id(),
       cardId: card.id,
       actorUserId: admin.userId,
       status: command.status,
+      versionKind: reviewVersionKind(command.status),
+      producerJobId: null,
+      producerModel: null,
       contentJson: JSON.stringify(content),
       citationSnapshotJson: JSON.stringify(snapshot),
       bundleVersion: card.bundleVersion,
@@ -497,7 +537,13 @@ export class EvidenceService {
       audit,
     });
     if (!applied) throw new EvidenceConflictError();
-    return { ...card, status: command.status, currentContentJson: review.contentJson, updatedAt: now };
+    return {
+      ...card,
+      status: command.status,
+      currentContentJson: review.contentJson,
+      currentReviewId: review.id,
+      updatedAt: now,
+    };
   }
   async createScenarioDraft(
     cardId: string,
@@ -516,16 +562,16 @@ export class EvidenceService {
     if (!reviewedCard.scenarioSuitable || !reviewedCard.animationSuitable) {
       throw new Error("문제와 애니메이션 제작에 적합한 카드만 전환할 수 있습니다.");
     }
-    const review = await this.d.repository.findCurrentCardReview(card.id);
+    if (card.currentReviewId === null) throw new Error("현재 카드의 승인 스냅샷을 찾을 수 없습니다.");
+    const review = await this.d.repository.findCardReview(card.currentReviewId, card.id);
     if (review === null) throw new Error("현재 카드의 승인 스냅샷을 찾을 수 없습니다.");
-    const existing = await this.d.repository.findScenarioDraftByReview(review.id);
-    if (existing !== null) return existing;
-
     const citations = await this.d.repository.listCardCitations(card.id);
     const snapshot = exactCitationSnapshot(reviewedCard, citations, card.bundleVersion);
     if (JSON.stringify(snapshot) !== review.citationSnapshotJson) {
       throw new Error("현재 카드의 근거가 승인 스냅샷과 일치하지 않습니다.");
     }
+    const existing = await this.d.repository.findScenarioDraftByReview(review.id, card.id, expectedUpdatedAt);
+    if (existing !== null) return existing;
     if (!SCENARIO_ROLES.includes(input.role)) throw new Error("role이 올바르지 않습니다.");
     if (!SCENARIO_PRINCIPLES.includes(input.principle)) throw new Error("principle이 올바르지 않습니다.");
     if (!Number.isInteger(input.orderIndex) || input.orderIndex < 0) throw new Error("orderIndex가 올바르지 않습니다.");
@@ -549,26 +595,27 @@ export class EvidenceService {
       orderIndex: input.orderIndex,
     };
     const sourceIds = [...new Set(snapshot.flatMap((citation) => citation.sourceId === null ? [] : [citation.sourceId]))].sort();
+    const chunkIds = snapshot.map((citation) => citation.chunkId);
     const audit = this.audit(
       { id: card.bundleId }, admin, "scenario.draft_created", "scenario", scenario.id,
       { cardId: card.id, reviewId: review.id, bundleVersion: card.bundleVersion, citationSnapshot: snapshot }, now,
     );
     try {
       const created = await this.d.repository.createScenarioDraft({
-        card, review, expectedUpdatedAt, scenario, sourceIds, audit, createdAt: now,
+        card, review, expectedUpdatedAt, scenario, chunkIds, sourceIds, audit, createdAt: now,
       });
       if (!created) throw new EvidenceConflictError();
     } catch (error) {
-      const winner = await this.d.repository.findScenarioDraftByReview(review.id);
+      const winner = await this.d.repository.findScenarioDraftByReview(review.id, card.id, expectedUpdatedAt);
       if (winner !== null) return winner;
       const current = await this.d.repository.findCard(card.id);
       if (current === null || current.updatedAt !== expectedUpdatedAt || current.isStale
-        || current.bundleVersion !== current.currentBundleVersion) {
+        || current.bundleVersion !== current.currentBundleVersion || current.currentReviewId !== review.id) {
         throw new EvidenceConflictError();
       }
       throw error;
     }
-    const created = await this.d.repository.findScenarioDraftByReview(review.id);
+    const created = await this.d.repository.findScenarioDraftByReview(review.id, card.id, expectedUpdatedAt);
     if (created === null) throw new Error("시나리오 초안 저장 결과를 확인할 수 없습니다.");
     return created;
   }

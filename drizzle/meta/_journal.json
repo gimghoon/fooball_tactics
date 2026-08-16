@@ -64,6 +64,13 @@
       "when": 1786873347296,
       "tag": "0008_lyrical_daredevil",
       "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "6",
+      "when": 1786874428643,
+      "tag": "0009_smiling_synch",
+      "breakpoints": true
     }
   ]
 }

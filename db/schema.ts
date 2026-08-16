@@ -139,6 +139,14 @@ export const evidenceChunks = sqliteTable("evidence_chunks", {
   }).onDelete("cascade"),
 ]);
 
+export const scenarioEvidenceChunks = sqliteTable("scenario_evidence_chunks", {
+  scenarioId: text("scenario_id").notNull().references(() => scenarios.id, { onDelete: "cascade" }),
+  chunkId: text("chunk_id").notNull().references(() => evidenceChunks.id, { onDelete: "restrict" }),
+}, (table) => [
+  primaryKey({ columns: [table.scenarioId, table.chunkId] }),
+  index("idx_scenario_evidence_chunks_chunk").on(table.chunkId),
+]);
+
 export const evidenceAnalysisJobs = sqliteTable("evidence_analysis_jobs", {
   id: text("id").primaryKey(),
   bundleId: text("bundle_id").notNull().references(() => evidenceBundles.id, { onDelete: "cascade" }),
@@ -178,6 +186,7 @@ export const tacticCards = sqliteTable("tactic_cards", {
   status: text("status", { enum: ["analysis_draft", "owner_reviewed", "coach_reviewed", "held", "rejected"] }).notNull().default("analysis_draft"),
   draftContentJson: text("draft_content_json").notNull(),
   currentContentJson: text("current_content_json").notNull(),
+  currentReviewId: text("current_review_id"),
   isStale: integer("is_stale", { mode: "boolean" }).notNull().default(false),
   createdAt: integer("created_at", { mode: "timestamp_ms" }).notNull(),
   updatedAt: integer("updated_at", { mode: "timestamp_ms" }).notNull(),
@@ -217,12 +226,17 @@ export const tacticCardReviews = sqliteTable("tactic_card_reviews", {
   cardId: text("card_id").notNull().references(() => tacticCards.id, { onDelete: "cascade" }),
   actorUserId: text("actor_user_id").notNull(),
   status: text("status", { enum: ["analysis_draft", "owner_reviewed", "coach_reviewed", "held", "rejected"] }).notNull(),
+  versionKind: text("version_kind", { enum: ["llm_draft", "owner_edit", "coach_edit", "status_change"] }).notNull().default("status_change"),
+  producerJobId: text("producer_job_id"),
+  producerModel: text("producer_model"),
   contentJson: text("content_json").notNull(),
   citationSnapshotJson: text("citation_snapshot_json").notNull(),
   bundleVersion: text("bundle_version").notNull(),
   createdAt: integer("created_at", { mode: "timestamp_ms" }).notNull(),
 }, (table) => [
   check("ck_tactic_card_reviews_status", sql`${table.status} IN ('analysis_draft', 'owner_reviewed', 'coach_reviewed', 'held', 'rejected')`),
+  check("ck_tactic_card_reviews_version_kind", sql`${table.versionKind} IN ('llm_draft', 'owner_edit', 'coach_edit', 'status_change')`),
+  uniqueIndex("idx_tactic_card_reviews_one_llm_draft").on(table.cardId).where(sql`${table.versionKind} = 'llm_draft'`),
   uniqueIndex("idx_tactic_card_reviews_id_card").on(table.id, table.cardId),
 ]);
 
