@@ -220,8 +220,14 @@ export class EvidenceFileStore {
     preflightOptions?: EvidencePdfPreflightOptions;
   }) {}
 
-  async putValidatedFile(input: EvidenceFileInput & { bundleId: string }): Promise<StoredEvidenceFile> {
-    const file = await validateEvidenceFile(input, this.dependencies.preflightOptions);
+  async putValidatedFile(
+    input: EvidenceFileInput & { bundleId: string },
+    requestPreflightOptions: EvidencePdfPreflightOptions = {},
+  ): Promise<StoredEvidenceFile> {
+    const file = await validateEvidenceFile(input, {
+      ...this.dependencies.preflightOptions,
+      ...requestPreflightOptions,
+    });
     const existing = await this.dependencies.registration.findExisting(input.bundleId, file.sha256);
     if (existing !== null) return existing;
 

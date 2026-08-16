@@ -6,9 +6,11 @@ export const MAX_PDF_PREFLIGHT_TOKENS = 500_000;
 export const MAX_PDF_PREFLIGHT_TOKEN_BYTES = 4_096;
 export const MAX_PDF_PREFLIGHT_NESTING = 32;
 export const MAX_PDF_PREFLIGHT_STREAMS = 10_000;
-export const MAX_PDF_FLATE_DECODED_BYTES_PER_STREAM = 2 * 1024 * 1024;
-/** Intentionally below the 5 MiB extracted-text output budget. */
-export const MAX_PDF_FLATE_DECODED_BYTES_AGGREGATE = 4 * 1024 * 1024;
+// PDF streams also carry image resources, so their decoded budgets must not be
+// sized like extracted text. These bounds admit ordinary scans while still
+// preventing a <=20 MiB upload from expanding without limit in one request.
+export const MAX_PDF_FLATE_DECODED_BYTES_PER_STREAM = 64 * 1024 * 1024;
+export const MAX_PDF_FLATE_DECODED_BYTES_AGGREGATE = 128 * 1024 * 1024;
 
 export type EvidencePdfPreflightOptions = {
   maxDecodedBytesPerStream?: number;
@@ -30,7 +32,7 @@ type Token = {
 type PdfValue =
   | { kind: "number"; value: number }
   | { kind: "name"; value: string }
-  | { kind: "reference" }
+  | { kind: "reference"; objectNumber: number; generation: number }
   | { kind: "array"; values: PdfValue[] }
   | { kind: "dictionary"; values: Map<string, PdfValue> }
   | { kind: "other" };
@@ -72,27 +74,63 @@ function decodePdfName(raw: string): string {
   return decoded;
 }
 
+const SUPPORTED_FILTERS = new Set([
+  "Fl", "FlateDecode", "LZW", "LZWDecode", "DCT", "DCTDecode",
+  "JPX", "JPXDecode", "A85", "ASCII85Decode", "AHx", "ASCIIHexDecode",
+  "CCF", "CCITTFaxDecode", "RL", "RunLengthDecode", "JBIG2Decode",
+  "BrotliDecode", "Crypt",
+]);
+
+function isPdfNumber(value: string): boolean {
+  return /^[-+]?(?:\d+(?:\.\d*)?|\.\d+)$/.test(value);
+}
+
+function asciiHexDecode(bytes: Uint8Array): Uint8Array {
+  const output = new Uint8Array(Math.ceil(bytes.byteLength / 2));
+  let highNibble: number | null = null;
+  let written = 0;
+  for (const byte of bytes) {
+    if (isWhite(byte)) continue;
+    if (byte === 0x3e) break;
+    const value = Number.parseInt(String.fromCharCode(byte), 16);
+    if (!Number.isInteger(value)) invalidPdf();
+    if (highNibble === null) highNibble = value;
+    else {
+      output[written++] = (highNibble << 4) | value;
+      highNibble = null;
+    }
+  }
+  if (highNibble !== null) output[written++] = highNibble << 4;
+  return output.subarray(0, written);
+}
+
 class PdfObjectParser {
   private position = 0;
   private tokens = 0;
   private objects = 0;
   private streams = 0;
+  private readonly source: string;
 
   constructor(
     private readonly bytes: Uint8Array,
     private readonly validateFlate: (compressed: Uint8Array) => Promise<void>,
     private readonly assertActive: () => void,
-  ) {}
+  ) {
+    this.source = new TextDecoder("latin1").decode(bytes);
+  }
 
   async parse(): Promise<void> {
     while (true) {
       const first = this.nextToken();
       if (first === null) return;
-      if (first.kind !== "number") continue;
+      if (first.kind !== "number" && !(first.kind === "keyword" && isPdfNumber(first.value))) continue;
       const afterFirst = this.position;
       const second = this.nextToken();
       const third = this.nextToken();
-      if (second?.kind !== "number" || third?.kind !== "keyword" || third.value !== "obj") {
+      const candidateHeader = second !== null && isPdfNumber(second.value)
+        && third?.kind === "keyword" && third.value === "obj";
+      if (candidateHeader && (first.kind !== "number" || second.kind !== "number")) invalidPdf();
+      if (!candidateHeader) {
         this.position = afterFirst;
         continue;
       }
@@ -120,18 +158,15 @@ class PdfObjectParser {
 
     this.streams += 1;
     if (this.streams > MAX_PDF_PREFLIGHT_STREAMS) invalidPdf();
-    const length = dictionary.get("Length");
-    if (length?.kind !== "number" || !Number.isSafeInteger(length.value) || length.value < 0) invalidPdf();
+    const length = this.streamLength(dictionary.get("Length"));
     const filter = dictionary.get("Filter");
     const filters = this.filters(filter);
     const dataStart = this.streamDataStart(following.end);
-    const dataEnd = dataStart + length.value;
+    const dataEnd = dataStart + length;
     if (!Number.isSafeInteger(dataEnd) || dataEnd < dataStart || dataEnd > this.bytes.byteLength) invalidPdf();
 
-    if (filters.length > 1) invalidPdf();
-    if (filters[0] === "FlateDecode" || filters[0] === "Fl") {
-      await this.validateFlate(this.bytes.slice(dataStart, dataEnd));
-    }
+    this.validateDecodeParameters(filters, dictionary.get("DecodeParms") ?? dictionary.get("DP"));
+    await this.validateFilterPipeline(this.bytes.slice(dataStart, dataEnd), filters);
 
     this.position = dataEnd;
     const endStream = this.nextToken();
@@ -146,7 +181,55 @@ class PdfObjectParser {
     if (value.kind === "array" && value.values.every((item) => item.kind === "name")) {
       return value.values.map((item) => (item as { kind: "name"; value: string }).value);
     }
+    // Preserve valid indirect filter objects. PDF.js resolves their semantics
+    // during the immediately following page/content traversal.
+    if (value.kind === "reference") return [];
     invalidPdf();
+  }
+
+  private streamLength(value: PdfValue | undefined): number {
+    if (value?.kind === "number" && Number.isSafeInteger(value.value) && value.value >= 0) return value.value;
+    if (value?.kind !== "reference") invalidPdf();
+    const object = value.objectNumber.toString().replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const generation = value.generation.toString().replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const match = new RegExp(
+      `(?:^|[\\x00\\x09\\x0a\\x0c\\x0d\\x20])${object}[\\x00\\x09\\x0a\\x0c\\x0d\\x20]+${generation}[\\x00\\x09\\x0a\\x0c\\x0d\\x20]+obj[\\x00\\x09\\x0a\\x0c\\x0d\\x20]+([+]?[0-9]+)[\\x00\\x09\\x0a\\x0c\\x0d\\x20]+endobj(?:$|[\\x00\\x09\\x0a\\x0c\\x0d\\x20])`,
+    ).exec(this.source);
+    const length = match === null ? Number.NaN : Number(match[1]);
+    if (!Number.isSafeInteger(length) || length < 0) invalidPdf();
+    return length;
+  }
+
+  private validateDecodeParameters(filters: string[], value: PdfValue | undefined): void {
+    const parameters = value?.kind === "array" ? value.values : filters.length === 1 ? [value] : [];
+    for (const [index, filter] of filters.entries()) {
+      if (filter !== "FlateDecode" && filter !== "Fl" && filter !== "LZWDecode" && filter !== "LZW") continue;
+      const parameter = parameters[index];
+      if (parameter === undefined || parameter.kind === "other") continue;
+      if (parameter.kind === "reference") continue;
+      if (parameter.kind !== "dictionary") invalidPdf();
+      const predictor = parameter.values.get("Predictor");
+      if (predictor === undefined) continue;
+      if (predictor.kind !== "number" || !Number.isInteger(predictor.value)
+        || ![1, 2, 10, 11, 12, 13, 14, 15].includes(predictor.value)) invalidPdf();
+    }
+  }
+
+  private async validateFilterPipeline(encoded: Uint8Array, filters: string[]): Promise<void> {
+    for (const filter of filters) if (!SUPPORTED_FILTERS.has(filter)) invalidPdf();
+    const flateIndex = filters.findIndex((filter) => filter === "FlateDecode" || filter === "Fl");
+    if (flateIndex < 0) return;
+    let current = encoded;
+    for (const filter of filters.slice(0, flateIndex)) {
+      if (filter === "ASCIIHexDecode" || filter === "AHx") {
+        current = asciiHexDecode(current);
+        continue;
+      }
+      // Do not reject a PDF.js-supported pipeline merely because this bounded
+      // integrity walk cannot losslessly replay an earlier stage.
+      return;
+    }
+    await this.validateFlate(current);
   }
 
   private streamDataStart(afterKeyword: number): number {
@@ -189,7 +272,11 @@ class PdfObjectParser {
       const generation = this.nextToken();
       const reference = this.nextToken();
       if (generation?.kind === "number" && reference?.kind === "keyword" && reference.value === "R") {
-        return { kind: "reference" };
+        const objectNumber = Number(token.value);
+        const generationNumber = Number(generation.value);
+        if (!Number.isSafeInteger(objectNumber) || objectNumber < 0
+          || !Number.isSafeInteger(generationNumber) || generationNumber < 0) invalidPdf();
+        return { kind: "reference", objectNumber, generation: generationNumber };
       }
       this.position = afterNumber;
       const value = Number(token.value);
@@ -333,8 +420,13 @@ export async function validatePdfFlateStreams(
   const assertActive = () => {
     if (options.abortSignal?.aborted || now() > deadline) invalidPdf();
   };
-  const defaultDecompression = (compressed: Uint8Array) => new Blob([compressed.buffer])
-    .stream().pipeThrough(new DecompressionStream("deflate"));
+  const defaultDecompression = (compressed: Uint8Array) => {
+    // A decoded wrapper stage may return a subarray whose backing buffer is
+    // larger than the view. Copy the exact view so trailing capacity is never
+    // passed to the zlib decoder as stream data.
+    const exact = compressed.slice();
+    return new Blob([exact.buffer]).stream().pipeThrough(new DecompressionStream("deflate"));
+  };
 
   await new PdfObjectParser(bytes, async (compressed) => {
     assertActive();

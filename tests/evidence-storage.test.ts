@@ -7,6 +7,14 @@ import {
   validateEvidenceFile,
 } from "../lib/server/evidence-storage.ts";
 import { extractEvidenceText } from "../lib/server/evidence-text-extractor.ts";
+import {
+  downstreamToleratedObjectHeaderPdf,
+  imageBackedScanPdf,
+  indirectLengthTextPdf,
+  invalidPredictorPdf,
+  multiFilterTextPdf,
+  unsupportedFilterPdf,
+} from "./helpers/evidence-pdf-fixtures.ts";
 
 function textFile(bytes: Uint8Array) {
   return {
@@ -582,6 +590,49 @@ test("rejects corrupt PDF page content before persisting objects or metadata", a
 
   assert.equal(bucket.objects.size, 0);
   assert.equal(registration.rows.length, 0);
+});
+
+test("rejects PDF.js-recovered stream errors before persisting objects or metadata", async () => {
+  for (const [name, bytes] of [
+    ["invalid-predictor.pdf", invalidPredictorPdf()],
+    ["unsupported-filter.pdf", unsupportedFilterPdf()],
+    ["tolerated-object-header.pdf", downstreamToleratedObjectHeaderPdf()],
+  ] as const) {
+    const bucket = new FakeR2();
+    const registration = new FakeD1();
+    const store = new EvidenceFileStore({ bucket, registration });
+
+    await assert.rejects(() => store.putValidatedFile({
+      bundleId: "bundle-1",
+      name,
+      type: "application/pdf",
+      bytes,
+    }), /PDF 파일을 확인할 수 없습니다/);
+
+    assert.equal(bucket.objects.size, 0, name);
+    assert.equal(registration.rows.length, 0, name);
+  }
+});
+
+test("accepts image scans, indirect stream lengths, and supported filter pipelines", async () => {
+  for (const [name, bytes, expectedStatus] of [
+    ["image-scan.pdf", imageBackedScanPdf(), "failed"],
+    ["indirect-length.pdf", indirectLengthTextPdf(), "completed"],
+    ["multi-filter.pdf", multiFilterTextPdf(), "completed"],
+  ] as const) {
+    const bucket = new FakeR2();
+    const registration = new FakeD1();
+    const source = await new EvidenceFileStore({ bucket, registration }).putValidatedFile({
+      bundleId: "bundle-1",
+      name,
+      type: "application/pdf",
+      bytes,
+    });
+
+    assert.equal(source.extractionStatus, expectedStatus, name);
+    assert.equal(registration.rows.length, 1, name);
+    assert.equal(bucket.objects.size, expectedStatus === "failed" ? 1 : 2, name);
+  }
 });
 
 test("decodes escaped Flate filter names and arrays before persistence", async () => {

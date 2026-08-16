@@ -154,3 +154,34 @@ passed
 ```
 
 Concern: the security preflight deliberately rejects indirect `/Length` values and multi-stage filter pipelines instead of accepting streams it cannot validate with the bounded supported subset. This is fail-closed behavior, but PDFs using those otherwise-valid encodings must be normalized before upload. The pre-existing standalone `tsc --noEmit` configuration limitation documented in Fix Round 1 is unchanged.
+
+## Fix Round 4
+
+Status: all three Important findings from `task-8-rereview-3.md` are addressed without narrowing the `.pdf` upload contract.
+
+- The bounded parser now validates direct Flate/LZW predictor parameters and rejects unsupported filter names before persistence. It also rejects non-integer indirect-object headers that PDF.js tolerates, so an invalid predictor, `/MadeUp` content filter, and `4.0 0 obj` corrupt stream all return 415 with zero R2 objects and zero metadata rows.
+- Indirect stream lengths are resolved through the bounded object walk, and the supported ASCIIHex-to-Flate pipeline is decoded in order before the Flate integrity check. Other standard PDF.js filters remain accepted rather than narrowing the public contract. Exact typed-array views are copied before platform decompression so wrapper decoder capacity cannot become trailing zlib input.
+- Production decoded-stream limits are now resource-oriented rather than extracted-text-sized: 64 MiB per stream and 128 MiB aggregate. A real 900×900 RGB image-backed scan (2,430,000 decoded image bytes) passes preflight and retains the intended stored-with-OCR-required behavior, while the existing per-stream/aggregate overflow, deadline, cancellation, and zero-write guarantees remain covered.
+- The upload handler passes `request.signal` into the real file-store preflight. A pre-aborted multipart request returns 415 before either object or metadata persistence.
+- Added shared binary PDF fixtures for the three malformed cases and the valid image scan, indirect `/Length`, and `[/ASCIIHexDecode /FlateDecode]` cases. Storage and HTTP regressions assert real persistence outcomes rather than parser implementation details.
+
+Verification:
+
+```text
+npx tsx --test tests/evidence-storage.test.ts tests/evidence-routes.test.ts
+52 passed, 0 failed
+
+npx tsx --test tests/evidence-analyzer.test.ts tests/evidence-auth.test.ts tests/evidence-domain.test.ts tests/evidence-jobs.test.ts tests/evidence-review.test.ts tests/evidence-routes.test.ts tests/evidence-service.test.ts tests/evidence-storage.test.ts
+161 passed, 0 failed
+
+npm test
+47 domain + 16 route/component + production build + 3 rendered HTML tests passed
+
+npm run lint
+passed
+
+git diff --check
+passed
+```
+
+No new concerns. The pre-existing standalone `tsc --noEmit` configuration limitation documented in Fix Round 1 is unchanged; the production build, full project tests, complete evidence matrix, lint, and diff checks pass.

@@ -26,6 +26,11 @@ import {
   runEvidenceAdminRoute,
   type EvidenceRouteRuntime,
 } from "../lib/server/evidence-routes.ts";
+import {
+  downstreamToleratedObjectHeaderPdf,
+  invalidPredictorPdf,
+  unsupportedFilterPdf,
+} from "./helpers/evidence-pdf-fixtures.ts";
 
 const admin: EvidenceAdmin = {
   userId: "admin-1",
@@ -415,6 +420,42 @@ test("PDF preflight rejects corrupt content and preserves valid scan/text behavi
   assert.equal(text.status, 201);
   assert.equal(rows[1]?.extractionStatus, "completed");
   assert.equal(objects.size, 3);
+});
+
+test("recovered PDF stream errors and request aborts return 415 with zero writes", async () => {
+  for (const [name, bytes, aborted] of [
+    ["invalid-predictor.pdf", invalidPredictorPdf(), false],
+    ["unsupported-filter.pdf", unsupportedFilterPdf(), false],
+    ["tolerated-object-header.pdf", downstreamToleratedObjectHeaderPdf(), false],
+    ["aborted.pdf", onePagePdf("BT /F1 12 Tf 72 720 Td (Press forward) Tj ET"), true],
+  ] as const) {
+    const objects = new Map<string, unknown>();
+    const rows: StoredEvidenceFile[] = [];
+    const store = new EvidenceFileStore({
+      bucket: {
+        async put(key, value) { objects.set(key, value); },
+        async get(key) { return objects.get(key) ?? null; },
+        async delete(key) { objects.delete(key); },
+      },
+      registration: {
+        async findExisting() { return null; },
+        async register(value) { rows.push(value); return value; },
+      },
+    });
+    const form = new FormData();
+    form.set("file", new File([bytes], name, { type: "application/pdf" }));
+    const controller = new AbortController();
+    if (aborted) controller.abort();
+    const response = await handleEvidenceFileUpload(
+      new Request("http://localhost", { method: "POST", body: form, signal: controller.signal }),
+      context({ bundleId: bundle.id }),
+      runtime({ fileStore: store }),
+    );
+
+    assert.equal(response.status, 415, name);
+    assert.equal(objects.size, 0, name);
+    assert.equal(rows.length, 0, name);
+  }
 });
 
 test("upload preserves typed registration conflicts/not-found after cleanup without leaking raw messages", async () => {

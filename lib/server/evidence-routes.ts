@@ -413,7 +413,7 @@ export async function handleEvidenceFileUpload(
         name: candidate.name,
         type: candidate.type,
         bytes: new Uint8Array(await candidate.arrayBuffer()),
-      });
+      }, { abortSignal: request.signal });
       return adminJson({ source: safeSource(source) }, { status: 201 });
     } catch (error) {
       if (error instanceof EvidenceValidationError)
