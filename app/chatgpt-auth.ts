@@ -20,6 +20,12 @@ const CALLBACK_PATH = "/callback";
 
 export async function getChatGPTUser(): Promise<ChatGPTUser | null> {
   const requestHeaders = await headers();
+  return getChatGPTUserFromHeaders(requestHeaders);
+}
+
+export function getChatGPTUserFromHeaders(
+  requestHeaders: Pick<Headers, "get">,
+): ChatGPTUser | null {
   const userId = requestHeaders.get(USER_ID_HEADER);
   const email = requestHeaders.get(USER_EMAIL_HEADER);
   if (!userId || !email) return null;
