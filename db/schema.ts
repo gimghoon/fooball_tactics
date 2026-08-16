@@ -1,4 +1,5 @@
-import { index, integer, sqliteTable, text, uniqueIndex } from "drizzle-orm/sqlite-core";
+import { sql } from "drizzle-orm";
+import { check, foreignKey, index, integer, sqliteTable, text, uniqueIndex } from "drizzle-orm/sqlite-core";
 
 export const campaigns = sqliteTable("campaigns", {
   id: text("id").primaryKey(), title: text("title").notNull(), formation: text("formation").notNull(),
@@ -71,6 +72,11 @@ export const evidenceSources = sqliteTable("evidence_sources", {
   updatedAt: integer("updated_at", { mode: "timestamp_ms" }).notNull(),
 }, (table) => [
   uniqueIndex("idx_evidence_sources_bundle_content_hash").on(table.bundleId, table.contentHash),
+  uniqueIndex("idx_evidence_sources_id_bundle").on(table.id, table.bundleId),
+  check(
+    "ck_evidence_sources_media_type_and_size",
+    sql`${table.mediaType} IN ('application/pdf', 'text/plain', 'text/markdown') AND ${table.byteSize} BETWEEN 0 AND 20971520`,
+  ),
 ]);
 
 export const evidenceVideoClips = sqliteTable("evidence_video_clips", {
@@ -82,19 +88,38 @@ export const evidenceVideoClips = sqliteTable("evidence_video_clips", {
   observation: text("observation").notNull(),
   createdAt: integer("created_at", { mode: "timestamp_ms" }).notNull(),
   updatedAt: integer("updated_at", { mode: "timestamp_ms" }).notNull(),
-});
+}, (table) => [
+  uniqueIndex("idx_evidence_video_clips_id_bundle").on(table.id, table.bundleId),
+  check(
+    "ck_evidence_video_clips_https_timecodes",
+    sql`${table.url} LIKE 'https://%' AND ${table.startMs} >= 0 AND ${table.endMs} > ${table.startMs}`,
+  ),
+]);
 
 export const evidenceChunks = sqliteTable("evidence_chunks", {
   id: text("id").primaryKey(),
   bundleId: text("bundle_id").notNull().references(() => evidenceBundles.id, { onDelete: "cascade" }),
-  sourceId: text("source_id").references(() => evidenceSources.id, { onDelete: "cascade" }),
-  videoClipId: text("video_clip_id").references(() => evidenceVideoClips.id, { onDelete: "cascade" }),
+  sourceId: text("source_id"),
+  videoClipId: text("video_clip_id"),
   ordinal: integer("ordinal").notNull(),
   locationLabel: text("location_label").notNull(),
   content: text("content").notNull(),
   contentHash: text("content_hash").notNull(),
   createdAt: integer("created_at", { mode: "timestamp_ms" }).notNull(),
-});
+}, (table) => [
+  uniqueIndex("idx_evidence_chunks_id_bundle").on(table.id, table.bundleId),
+  check("ck_evidence_chunks_exactly_one_provenance", sql`(${table.sourceId} IS NULL) != (${table.videoClipId} IS NULL)`),
+  foreignKey({
+    name: "fk_evidence_chunks_source_bundle",
+    columns: [table.sourceId, table.bundleId],
+    foreignColumns: [evidenceSources.id, evidenceSources.bundleId],
+  }).onDelete("cascade"),
+  foreignKey({
+    name: "fk_evidence_chunks_video_clip_bundle",
+    columns: [table.videoClipId, table.bundleId],
+    foreignColumns: [evidenceVideoClips.id, evidenceVideoClips.bundleId],
+  }).onDelete("cascade"),
+]);
 
 export const evidenceAnalysisJobs = sqliteTable("evidence_analysis_jobs", {
   id: text("id").primaryKey(),
@@ -112,12 +137,16 @@ export const evidenceAnalysisJobs = sqliteTable("evidence_analysis_jobs", {
   completedAt: integer("completed_at", { mode: "timestamp_ms" }),
   createdAt: integer("created_at", { mode: "timestamp_ms" }).notNull(),
   updatedAt: integer("updated_at", { mode: "timestamp_ms" }).notNull(),
-}, (table) => [uniqueIndex("idx_evidence_analysis_jobs_input_version").on(table.inputVersion)]);
+}, (table) => [
+  uniqueIndex("idx_evidence_analysis_jobs_input_version").on(table.inputVersion),
+  uniqueIndex("idx_evidence_analysis_jobs_id_bundle").on(table.id, table.bundleId),
+  check("ck_evidence_analysis_jobs_status", sql`${table.status} IN ('queued', 'running', 'review_ready', 'completed', 'failed')`),
+]);
 
 export const tacticCards = sqliteTable("tactic_cards", {
   id: text("id").primaryKey(),
   bundleId: text("bundle_id").notNull().references(() => evidenceBundles.id, { onDelete: "cascade" }),
-  jobId: text("job_id").notNull().references(() => evidenceAnalysisJobs.id, { onDelete: "cascade" }),
+  jobId: text("job_id").notNull(),
   bundleVersion: text("bundle_version").notNull(),
   status: text("status", { enum: ["analysis_draft", "owner_reviewed", "coach_reviewed", "held", "rejected"] }).notNull().default("analysis_draft"),
   draftContentJson: text("draft_content_json").notNull(),
@@ -125,14 +154,36 @@ export const tacticCards = sqliteTable("tactic_cards", {
   isStale: integer("is_stale", { mode: "boolean" }).notNull().default(false),
   createdAt: integer("created_at", { mode: "timestamp_ms" }).notNull(),
   updatedAt: integer("updated_at", { mode: "timestamp_ms" }).notNull(),
-}, (table) => [index("idx_tactic_cards_bundle_status").on(table.bundleId, table.status)]);
+}, (table) => [
+  index("idx_tactic_cards_bundle_status").on(table.bundleId, table.status),
+  uniqueIndex("idx_tactic_cards_id_bundle").on(table.id, table.bundleId),
+  check("ck_tactic_cards_status", sql`${table.status} IN ('analysis_draft', 'owner_reviewed', 'coach_reviewed', 'held', 'rejected')`),
+  foreignKey({
+    name: "fk_tactic_cards_job_bundle",
+    columns: [table.jobId, table.bundleId],
+    foreignColumns: [evidenceAnalysisJobs.id, evidenceAnalysisJobs.bundleId],
+  }).onDelete("cascade"),
+]);
 
 export const tacticCardCitations = sqliteTable("tactic_card_citations", {
   id: text("id").primaryKey(),
-  cardId: text("card_id").notNull().references(() => tacticCards.id, { onDelete: "cascade" }),
-  chunkId: text("chunk_id").notNull().references(() => evidenceChunks.id, { onDelete: "cascade" }),
+  bundleId: text("bundle_id").notNull(),
+  cardId: text("card_id").notNull(),
+  chunkId: text("chunk_id").notNull(),
   createdAt: integer("created_at", { mode: "timestamp_ms" }).notNull(),
-}, (table) => [uniqueIndex("idx_tactic_card_citations_card_chunk").on(table.cardId, table.chunkId)]);
+}, (table) => [
+  uniqueIndex("idx_tactic_card_citations_card_chunk").on(table.cardId, table.chunkId),
+  foreignKey({
+    name: "fk_tactic_card_citations_card_bundle",
+    columns: [table.cardId, table.bundleId],
+    foreignColumns: [tacticCards.id, tacticCards.bundleId],
+  }).onDelete("cascade"),
+  foreignKey({
+    name: "fk_tactic_card_citations_chunk_bundle",
+    columns: [table.chunkId, table.bundleId],
+    foreignColumns: [evidenceChunks.id, evidenceChunks.bundleId],
+  }).onDelete("cascade"),
+]);
 
 export const tacticCardReviews = sqliteTable("tactic_card_reviews", {
   id: text("id").primaryKey(),
@@ -143,7 +194,9 @@ export const tacticCardReviews = sqliteTable("tactic_card_reviews", {
   citationSnapshotJson: text("citation_snapshot_json").notNull(),
   bundleVersion: text("bundle_version").notNull(),
   createdAt: integer("created_at", { mode: "timestamp_ms" }).notNull(),
-});
+}, (table) => [
+  check("ck_tactic_card_reviews_status", sql`${table.status} IN ('analysis_draft', 'owner_reviewed', 'coach_reviewed', 'held', 'rejected')`),
+]);
 
 export const evidenceAuditEvents = sqliteTable("evidence_audit_events", {
   id: text("id").primaryKey(),

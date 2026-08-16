@@ -163,7 +163,7 @@ export function assertCardReviewTransition(
     throw new EvidenceValidationError("낮은 확신도 또는 미해결 충돌이 있어 승인할 수 없습니다.");
   }
   const actions = [...card.preferred, ...card.alternatives, ...card.risky];
-  if (actions.some((item) => !item.reason.trim() || item.citationIds.length === 0 || item.citationIds.some((id) => !knownCitationIds.has(id)))) {
+  if (actions.length === 0 || actions.some((item) => !item.reason.trim() || item.citationIds.length === 0 || item.citationIds.some((id) => !knownCitationIds.has(id)))) {
     throw new EvidenceValidationError("모든 행동과 이유에는 유효한 근거가 필요합니다.");
   }
 }

@@ -1,7 +1,7 @@
 {
   "version": "6",
   "dialect": "sqlite",
-  "id": "132f5bc5-8249-4a07-8a08-adfd976390ac",
+  "id": "0237578b-8f51-4a0c-a368-8189170ae856",
   "prevId": "d26a79f3-5461-4409-8c4d-15e1d9be27c4",
   "tables": {
     "attempts": {
@@ -305,6 +305,14 @@
             "input_version"
           ],
           "isUnique": true
+        },
+        "idx_evidence_analysis_jobs_id_bundle": {
+          "name": "idx_evidence_analysis_jobs_id_bundle",
+          "columns": [
+            "id",
+            "bundle_id"
+          ],
+          "isUnique": true
         }
       },
       "foreignKeys": {
@@ -324,7 +332,12 @@
       },
       "compositePrimaryKeys": {},
       "uniqueConstraints": {},
-      "checkConstraints": {}
+      "checkConstraints": {
+        "ck_evidence_analysis_jobs_status": {
+          "name": "ck_evidence_analysis_jobs_status",
+          "value": "\"evidence_analysis_jobs\".\"status\" IN ('queued', 'running', 'review_ready', 'completed', 'failed')"
+        }
+      }
     },
     "evidence_audit_events": {
       "name": "evidence_audit_events",
@@ -542,7 +555,16 @@
           "autoincrement": false
         }
       },
-      "indexes": {},
+      "indexes": {
+        "idx_evidence_chunks_id_bundle": {
+          "name": "idx_evidence_chunks_id_bundle",
+          "columns": [
+            "id",
+            "bundle_id"
+          ],
+          "isUnique": true
+        }
+      },
       "foreignKeys": {
         "evidence_chunks_bundle_id_evidence_bundles_id_fk": {
           "name": "evidence_chunks_bundle_id_evidence_bundles_id_fk",
@@ -557,28 +579,32 @@
           "onDelete": "cascade",
           "onUpdate": "no action"
         },
-        "evidence_chunks_source_id_evidence_sources_id_fk": {
-          "name": "evidence_chunks_source_id_evidence_sources_id_fk",
+        "fk_evidence_chunks_source_bundle": {
+          "name": "fk_evidence_chunks_source_bundle",
           "tableFrom": "evidence_chunks",
           "tableTo": "evidence_sources",
           "columnsFrom": [
-            "source_id"
+            "source_id",
+            "bundle_id"
           ],
           "columnsTo": [
-            "id"
+            "id",
+            "bundle_id"
           ],
           "onDelete": "cascade",
           "onUpdate": "no action"
         },
-        "evidence_chunks_video_clip_id_evidence_video_clips_id_fk": {
-          "name": "evidence_chunks_video_clip_id_evidence_video_clips_id_fk",
+        "fk_evidence_chunks_video_clip_bundle": {
+          "name": "fk_evidence_chunks_video_clip_bundle",
           "tableFrom": "evidence_chunks",
           "tableTo": "evidence_video_clips",
           "columnsFrom": [
-            "video_clip_id"
+            "video_clip_id",
+            "bundle_id"
           ],
           "columnsTo": [
-            "id"
+            "id",
+            "bundle_id"
           ],
           "onDelete": "cascade",
           "onUpdate": "no action"
@@ -586,7 +612,12 @@
       },
       "compositePrimaryKeys": {},
       "uniqueConstraints": {},
-      "checkConstraints": {}
+      "checkConstraints": {
+        "ck_evidence_chunks_exactly_one_provenance": {
+          "name": "ck_evidence_chunks_exactly_one_provenance",
+          "value": "(\"evidence_chunks\".\"source_id\" IS NULL) != (\"evidence_chunks\".\"video_clip_id\" IS NULL)"
+        }
+      }
     },
     "evidence_sources": {
       "name": "evidence_sources",
@@ -685,6 +716,14 @@
             "content_hash"
           ],
           "isUnique": true
+        },
+        "idx_evidence_sources_id_bundle": {
+          "name": "idx_evidence_sources_id_bundle",
+          "columns": [
+            "id",
+            "bundle_id"
+          ],
+          "isUnique": true
         }
       },
       "foreignKeys": {
@@ -704,7 +743,12 @@
       },
       "compositePrimaryKeys": {},
       "uniqueConstraints": {},
-      "checkConstraints": {}
+      "checkConstraints": {
+        "ck_evidence_sources_media_type_and_size": {
+          "name": "ck_evidence_sources_media_type_and_size",
+          "value": "\"evidence_sources\".\"media_type\" IN ('application/pdf', 'text/plain', 'text/markdown') AND \"evidence_sources\".\"byte_size\" BETWEEN 0 AND 20971520"
+        }
+      }
     },
     "evidence_video_clips": {
       "name": "evidence_video_clips",
@@ -766,7 +810,16 @@
           "autoincrement": false
         }
       },
-      "indexes": {},
+      "indexes": {
+        "idx_evidence_video_clips_id_bundle": {
+          "name": "idx_evidence_video_clips_id_bundle",
+          "columns": [
+            "id",
+            "bundle_id"
+          ],
+          "isUnique": true
+        }
+      },
       "foreignKeys": {
         "evidence_video_clips_bundle_id_evidence_bundles_id_fk": {
           "name": "evidence_video_clips_bundle_id_evidence_bundles_id_fk",
@@ -784,7 +837,12 @@
       },
       "compositePrimaryKeys": {},
       "uniqueConstraints": {},
-      "checkConstraints": {}
+      "checkConstraints": {
+        "ck_evidence_video_clips_https_timecodes": {
+          "name": "ck_evidence_video_clips_https_timecodes",
+          "value": "\"evidence_video_clips\".\"url\" LIKE 'https://%' AND \"evidence_video_clips\".\"start_ms\" >= 0 AND \"evidence_video_clips\".\"end_ms\" > \"evidence_video_clips\".\"start_ms\""
+        }
+      }
     },
     "mastery": {
       "name": "mastery",
@@ -1245,6 +1303,13 @@
           "notNull": true,
           "autoincrement": false
         },
+        "bundle_id": {
+          "name": "bundle_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
         "card_id": {
           "name": "card_id",
           "type": "text",
@@ -1278,28 +1343,32 @@
         }
       },
       "foreignKeys": {
-        "tactic_card_citations_card_id_tactic_cards_id_fk": {
-          "name": "tactic_card_citations_card_id_tactic_cards_id_fk",
+        "fk_tactic_card_citations_card_bundle": {
+          "name": "fk_tactic_card_citations_card_bundle",
           "tableFrom": "tactic_card_citations",
           "tableTo": "tactic_cards",
           "columnsFrom": [
-            "card_id"
+            "card_id",
+            "bundle_id"
           ],
           "columnsTo": [
-            "id"
+            "id",
+            "bundle_id"
           ],
           "onDelete": "cascade",
           "onUpdate": "no action"
         },
-        "tactic_card_citations_chunk_id_evidence_chunks_id_fk": {
-          "name": "tactic_card_citations_chunk_id_evidence_chunks_id_fk",
+        "fk_tactic_card_citations_chunk_bundle": {
+          "name": "fk_tactic_card_citations_chunk_bundle",
           "tableFrom": "tactic_card_citations",
           "tableTo": "evidence_chunks",
           "columnsFrom": [
-            "chunk_id"
+            "chunk_id",
+            "bundle_id"
           ],
           "columnsTo": [
-            "id"
+            "id",
+            "bundle_id"
           ],
           "onDelete": "cascade",
           "onUpdate": "no action"
@@ -1387,7 +1456,12 @@
       },
       "compositePrimaryKeys": {},
       "uniqueConstraints": {},
-      "checkConstraints": {}
+      "checkConstraints": {
+        "ck_tactic_card_reviews_status": {
+          "name": "ck_tactic_card_reviews_status",
+          "value": "\"tactic_card_reviews\".\"status\" IN ('analysis_draft', 'owner_reviewed', 'coach_reviewed', 'held', 'rejected')"
+        }
+      }
     },
     "tactic_cards": {
       "name": "tactic_cards",
@@ -1473,6 +1547,14 @@
             "status"
           ],
           "isUnique": false
+        },
+        "idx_tactic_cards_id_bundle": {
+          "name": "idx_tactic_cards_id_bundle",
+          "columns": [
+            "id",
+            "bundle_id"
+          ],
+          "isUnique": true
         }
       },
       "foreignKeys": {
@@ -1489,15 +1571,17 @@
           "onDelete": "cascade",
           "onUpdate": "no action"
         },
-        "tactic_cards_job_id_evidence_analysis_jobs_id_fk": {
-          "name": "tactic_cards_job_id_evidence_analysis_jobs_id_fk",
+        "fk_tactic_cards_job_bundle": {
+          "name": "fk_tactic_cards_job_bundle",
           "tableFrom": "tactic_cards",
           "tableTo": "evidence_analysis_jobs",
           "columnsFrom": [
-            "job_id"
+            "job_id",
+            "bundle_id"
           ],
           "columnsTo": [
-            "id"
+            "id",
+            "bundle_id"
           ],
           "onDelete": "cascade",
           "onUpdate": "no action"
@@ -1505,7 +1589,12 @@
       },
       "compositePrimaryKeys": {},
       "uniqueConstraints": {},
-      "checkConstraints": {}
+      "checkConstraints": {
+        "ck_tactic_cards_status": {
+          "name": "ck_tactic_cards_status",
+          "value": "\"tactic_cards\".\"status\" IN ('analysis_draft', 'owner_reviewed', 'coach_reviewed', 'held', 'rejected')"
+        }
+      }
     }
   },
   "views": {},
