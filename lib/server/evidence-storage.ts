@@ -1,8 +1,10 @@
 import { EvidenceValidationError } from "../domain/evidence.ts";
 import {
+  assertPdfIsNotPasswordProtected,
   extractEvidenceText,
   type EvidenceFileKind,
   type ExtractedPage,
+  PdfPasswordProtectedError,
 } from "./evidence-text-extractor.ts";
 
 const MAX_EVIDENCE_FILE_BYTES = 20 * 1024 * 1024;
@@ -19,7 +21,10 @@ const EXECUTABLE_SIGNATURES = [
   [0x7f, 0x45, 0x4c, 0x46],
   [0xfe, 0xed, 0xfa, 0xce],
   [0xcf, 0xfa, 0xed, 0xfe],
+  [0x50, 0x45, 0x00, 0x00],
 ];
+const PDF_EOF_MARKER = new TextEncoder().encode("%%EOF");
+const DELETE_RECONCILIATION_ATTEMPTS = 2;
 
 export type EvidenceMediaType = "application/pdf" | "text/plain" | "text/markdown";
 
@@ -76,6 +81,50 @@ function containsBytes(bytes: Uint8Array, value: string): boolean {
   return bytes.some((_, index) => needle.every((byte, offset) => bytes[index + offset] === byte));
 }
 
+function indexOfBytes(bytes: Uint8Array, needle: Uint8Array, from: number): number {
+  for (let index = from; index <= bytes.length - needle.length; index += 1) {
+    if (needle.every((byte, offset) => bytes[index + offset] === byte)) return index;
+  }
+  return -1;
+}
+
+function hasDecodedPdfName(bytes: Uint8Array, expected: string): boolean {
+  for (let index = 0; index < bytes.length; index += 1) {
+    if (bytes[index] !== 0x2f) continue; // '/'
+    let name = "";
+    for (let cursor = index + 1; cursor < bytes.length; cursor += 1) {
+      const byte = bytes[cursor];
+      if (byte === 0x23 && cursor + 2 < bytes.length) { // '#'
+        const hex = String.fromCharCode(bytes[cursor + 1], bytes[cursor + 2]);
+        if (/^[0-9a-f]{2}$/i.test(hex)) {
+          name += String.fromCharCode(Number.parseInt(hex, 16));
+          cursor += 2;
+          continue;
+        }
+      }
+      if (byte <= 0x20 || "()<>[]{}/%".includes(String.fromCharCode(byte))) break;
+      name += String.fromCharCode(byte);
+    }
+    if (name === expected) return true;
+  }
+  return false;
+}
+
+function hasUnsafePdfTrailer(bytes: Uint8Array): boolean {
+  let eof = -1;
+  for (let index = indexOfBytes(bytes, PDF_EOF_MARKER, 0); index !== -1; index = indexOfBytes(bytes, PDF_EOF_MARKER, index + 1)) {
+    eof = index;
+  }
+  if (eof === -1) return false;
+  const trailingBytes = bytes.subarray(eof + PDF_EOF_MARKER.length);
+  // PDF may have trailing whitespace. Only inspect the bytes after its final
+  // EOF marker, so signatures in legitimate compressed object streams do not
+  // turn a PDF into a false-positive archive/executable polyglot.
+  return [...ZIP_SIGNATURES, ...EXECUTABLE_SIGNATURES].some((signature) =>
+    indexOfBytes(trailingBytes, new Uint8Array(signature), 0) !== -1,
+  );
+}
+
 function extensionFor(name: string): string {
   const extension = name.trim().toLowerCase().match(/\.([a-z0-9]+)$/)?.[1];
   return extension ?? "";
@@ -91,12 +140,20 @@ function isUnsafeTextSignature(bytes: Uint8Array): boolean {
     || bytes.includes(0);
 }
 
-function resolveKindAndMediaType(input: EvidenceFileInput): Pick<ValidatedEvidenceFile, "kind" | "mediaType"> {
+async function resolveKindAndMediaType(input: EvidenceFileInput): Promise<Pick<ValidatedEvidenceFile, "kind" | "mediaType">> {
   const extension = extensionFor(input.name);
   if (extension === "pdf") {
     if (input.type !== "application/pdf" || !startsWith(input.bytes, [0x25, 0x50, 0x44, 0x46, 0x2d])) invalidFormat();
-    if (ZIP_SIGNATURES.some((signature) => startsWith(input.bytes, signature)) || EXECUTABLE_SIGNATURES.some((signature) => startsWith(input.bytes, signature))) invalidFormat();
-    if (containsBytes(input.bytes, "/Encrypt")) throw new EvidenceValidationError("암호화된 PDF는 업로드할 수 없습니다.");
+    if (hasUnsafePdfTrailer(input.bytes)) invalidFormat();
+    try {
+      await assertPdfIsNotPasswordProtected(input.bytes);
+    } catch (error) {
+      if (error instanceof PdfPasswordProtectedError) throw new EvidenceValidationError(error.message);
+      throw error;
+    }
+    if (containsBytes(input.bytes, "/Encrypt") || hasDecodedPdfName(input.bytes, "Encrypt")) {
+      throw new EvidenceValidationError("암호화된 PDF는 업로드할 수 없습니다.");
+    }
     return { kind: "pdf", mediaType: "application/pdf" };
   }
 
@@ -116,7 +173,7 @@ export async function validateEvidenceFile(input: EvidenceFileInput): Promise<Va
   if (input.bytes.byteLength > MAX_EVIDENCE_FILE_BYTES) {
     throw new EvidenceValidationError("파일은 20MB 이하여야 합니다.");
   }
-  const file = resolveKindAndMediaType(input);
+  const file = await resolveKindAndMediaType(input);
   if (file.kind === "text") {
     try {
       new TextDecoder("utf-8", { fatal: true }).decode(input.bytes);
@@ -199,10 +256,14 @@ export class EvidenceFileStore {
   }
 
   async deleteFilePair(originalKey: string, extractedKey: string | null): Promise<void> {
-    await Promise.all([
-      this.dependencies.bucket.delete(originalKey),
-      ...(extractedKey === null ? [] : [this.dependencies.bucket.delete(extractedKey)]),
-    ]);
+    const keys = [originalKey, ...(extractedKey === null ? [] : [extractedKey])];
+    let errors: unknown[] = [];
+    for (let attempt = 0; attempt < DELETE_RECONCILIATION_ATTEMPTS; attempt += 1) {
+      const results = await Promise.allSettled(keys.map((key) => this.dependencies.bucket.delete(key)));
+      errors = results.flatMap((result) => result.status === "rejected" ? [result.reason] : []);
+      if (errors.length === 0) return;
+    }
+    throw new AggregateError(errors, "근거 파일 쌍을 모두 삭제하지 못했습니다.");
   }
 
   private async findByBundleAndHash(bundleId: string, contentHash: string): Promise<StoredEvidenceFile | null> {

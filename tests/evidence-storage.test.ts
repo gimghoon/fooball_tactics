@@ -31,6 +31,21 @@ function encryptedPdf() {
   };
 }
 
+function escapedEncryptedPdf() {
+  return {
+    name: "notes.pdf",
+    type: "application/pdf",
+    bytes: new TextEncoder().encode("%PDF-1.7\ntrailer\n<< /Encr#79pt 1 0 R >>"),
+  };
+}
+
+function appendBytes(bytes: Uint8Array, suffix: number[]): Uint8Array {
+  const result = new Uint8Array(bytes.length + suffix.length);
+  result.set(bytes);
+  result.set(suffix, bytes.length);
+  return result;
+}
+
 function textPdf(text: string): Uint8Array {
   const stream = `BT /F1 12 Tf 72 720 Td (${text}) Tj ET`;
   const objects = [
@@ -68,6 +83,14 @@ test("rejects MIME, extension, signature, archive, executable, and encrypted PDF
   await assert.rejects(() => validateEvidenceFile({ name: "notes.txt", type: "text/plain", bytes: new Uint8Array([0x4d, 0x5a]) }), /형식/);
   await assert.rejects(() => validateEvidenceFile({ name: "notes.txt", type: "text/plain", bytes: new Uint8Array([0x61, 0]) }), /형식/);
   await assert.rejects(() => validateEvidenceFile(encryptedPdf()), /암호화/);
+  await assert.rejects(() => validateEvidenceFile(escapedEncryptedPdf()), /암호화/);
+  for (const suffix of [[0x50, 0x4b, 0x03, 0x04], [0x7f, 0x45, 0x4c, 0x46], [0x4d, 0x5a], [0x50, 0x45, 0, 0]]) {
+    await assert.rejects(() => validateEvidenceFile({
+      name: "polyglot.pdf",
+      type: "application/pdf",
+      bytes: appendBytes(textPdf("safe"), suffix),
+    }), /형식/);
+  }
 });
 
 test("extracts strict UTF-8 text into non-empty paragraph locators", async () => {
@@ -83,6 +106,19 @@ test("extracts text-only PDF pages without a worker", async () => {
   assert.deepEqual(await extractEvidenceText("pdf", textPdf("Press forward")), [
     { locator: "page:1", text: "Press forward" },
   ]);
+});
+
+test("enforces page, output, and deadline bounds before accumulating evidence text", async () => {
+  await assert.rejects(() => extractEvidenceText("pdf", textPdf("one page"), { maxPages: 0 }), /페이지/);
+  await assert.rejects(() => extractEvidenceText("text", new TextEncoder().encode("too long"), { maxOutputBytes: 10 }), /추출 텍스트/);
+  let clock = 0;
+  await assert.rejects(() => extractEvidenceText("text", new TextEncoder().encode("a"), {
+    maxExtractionMs: 0,
+    now: () => clock++,
+  }), /시간/);
+  await assert.rejects(() => extractEvidenceText("text", new TextEncoder().encode("a"), {
+    abortSignal: AbortSignal.abort(),
+  }), /중단/);
 });
 
 type SourceRow = {
@@ -101,6 +137,8 @@ type SourceRow = {
 class FakeR2 {
   readonly objects = new Map<string, unknown>();
   readonly putKeys: string[] = [];
+  readonly deleteAttempts = new Map<string, number>();
+  readonly deleteFailures = new Map<string, number>();
 
   async put(key: string, value: unknown): Promise<void> {
     this.putKeys.push(key);
@@ -112,6 +150,12 @@ class FakeR2 {
   }
 
   async delete(key: string): Promise<void> {
+    this.deleteAttempts.set(key, (this.deleteAttempts.get(key) ?? 0) + 1);
+    const failures = this.deleteFailures.get(key) ?? 0;
+    if (failures > 0) {
+      this.deleteFailures.set(key, failures - 1);
+      throw new Error(`injected delete failure for ${key}`);
+    }
     this.objects.delete(key);
   }
 }
@@ -139,12 +183,19 @@ class FakeD1Statement {
     const [id, bundleId, originalFileName, mediaType, byteSize, contentHash, storageKey, extractedTextKey, extractionStatus, extractionError] = this.values as [
       string, string, string, string, number, string, string, string | null, SourceRow["extractionStatus"], string | null,
     ];
-    this.database.rows.push({ id, bundleId, originalFileName, mediaType, byteSize, contentHash, storageKey, extractedTextKey, extractionStatus, extractionError });
+    const source = { id, bundleId, originalFileName, mediaType, byteSize, contentHash, storageKey, extractedTextKey, extractionStatus, extractionError };
+    if (this.database.nextUniqueConflict !== null) {
+      this.database.rows.push(this.database.nextUniqueConflict);
+      this.database.nextUniqueConflict = null;
+      throw new Error("UNIQUE constraint failed: evidence_sources.bundle_id, evidence_sources.content_hash");
+    }
+    this.database.rows.push(source);
   }
 }
 
 class FakeD1 {
   readonly rows: SourceRow[] = [];
+  nextUniqueConflict: SourceRow | null = null;
 
   prepare(sql: string): FakeD1Statement {
     return new FakeD1Statement(sql, this);
@@ -177,6 +228,50 @@ test("persists one opaque original and extracted pair, then reuses a duplicate s
   await store.deleteFilePair(first.storageKey, first.extractedTextKey);
   assert.equal(await store.getFile(first.storageKey), null);
   assert.equal(await store.getFile(first.extractedTextKey ?? "missing"), null);
+});
+
+test("reconciles both R2 keys after a one-sided pair deletion failure", async () => {
+  const bucket = new FakeR2();
+  const store = new EvidenceFileStore({ bucket, database: new FakeD1() });
+  bucket.objects.set("original", "original");
+  bucket.objects.set("extracted", "extracted");
+  bucket.deleteFailures.set("original", 1);
+
+  await assert.doesNotReject(() => store.deleteFilePair("original", "extracted"));
+  assert.equal(bucket.objects.size, 0);
+  assert.equal(bucket.deleteAttempts.get("original"), 2);
+  assert.equal(bucket.deleteAttempts.get("extracted"), 2);
+});
+
+test("cleans up loser objects and returns the D1 winner after a unique-content race", async () => {
+  const bucket = new FakeR2();
+  const database = new FakeD1();
+  const input = {
+    bundleId: "bundle-1",
+    name: "race.md",
+    type: "text/markdown",
+    bytes: new TextEncoder().encode("same content"),
+  };
+  const validated = await validateEvidenceFile(input);
+  const winner: SourceRow = {
+    id: "winner",
+    bundleId: input.bundleId,
+    originalFileName: "winner.md",
+    mediaType: "text/markdown",
+    byteSize: input.bytes.byteLength,
+    contentHash: validated.sha256,
+    storageKey: "bundles/bundle-1/winner/original",
+    extractedTextKey: "bundles/bundle-1/winner/extracted",
+    extractionStatus: "completed",
+    extractionError: null,
+  };
+  database.nextUniqueConflict = winner;
+
+  const result = await new EvidenceFileStore({ bucket, database }).putValidatedFile(input);
+
+  assert.equal(result.id, "winner");
+  assert.equal(bucket.objects.size, 0);
+  assert.equal(bucket.putKeys.length, 2);
 });
 
 test("preserves a scanned PDF and marks extraction as failed without OCR", async () => {
