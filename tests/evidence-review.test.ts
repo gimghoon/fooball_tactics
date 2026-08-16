@@ -50,13 +50,16 @@ class SQLiteD1Statement implements EvidenceD1Statement {
 }
 
 class SQLiteD1Database implements EvidenceD1Database {
-  readonly database = new DatabaseSync(":memory:");
+  readonly database: DatabaseSync;
   beforeNextBatch: (() => void | Promise<void>) | null = null;
 
-  constructor() {
+  constructor(database = new DatabaseSync(":memory:"), applyMigrations = true) {
+    this.database = database;
     this.database.exec("PRAGMA foreign_keys = ON");
-    for (const name of readdirSync("drizzle").filter((value) => /^\d{4}_.*\.sql$/.test(value)).sort()) {
-      this.database.exec(readFileSync(`drizzle/${name}`, "utf8"));
+    if (applyMigrations) {
+      for (const name of readdirSync("drizzle").filter((value) => /^\d{4}_.*\.sql$/.test(value)).sort()) {
+        this.database.exec(readFileSync(`drizzle/${name}`, "utf8"));
+      }
     }
   }
 
@@ -271,7 +274,7 @@ function insertReviewVersion(
     status: "analysis_draft" | "owner_reviewed" | "coach_reviewed" | "held" | "rejected";
     kind: "llm_draft" | "owner_edit" | "coach_edit" | "status_change";
     content?: TacticCardContent;
-    actorUserId?: string;
+    actorUserId?: string | null;
     createdAt?: number;
     producerJobId?: string | null;
     producerModel?: string | null;
@@ -286,7 +289,7 @@ function insertReviewVersion(
       (id,card_id,actor_user_id,status,version_kind,producer_job_id,producer_model,
        content_json,citation_snapshot_json,bundle_version,created_at)
       VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
-    input.id, "card-1", input.actorUserId ?? "admin-2", input.status, input.kind,
+    input.id, "card-1", input.actorUserId === undefined ? "admin-2" : input.actorUserId, input.status, input.kind,
     input.producerJobId ?? null, input.producerModel ?? null, JSON.stringify(content), citationSnapshot(database, ids),
     "bundle-v1", input.createdAt ?? 2_000,
   );
@@ -311,7 +314,7 @@ function insertScenarioForReview(database: SQLiteD1Database, scenarioId: string,
   );
 }
 
-test("migration 0009 backfills the current review fence without claiming legacy rows are LLM originals", () => {
+test("migration 0009 is D1-transaction safe and legacy approval needs a fresh authoritative review", async () => {
   const database = new DatabaseSync(":memory:");
   database.exec("PRAGMA foreign_keys = ON");
   const migrations = readdirSync("drizzle").filter((value) => /^\d{4}_.*\.sql$/.test(value)).sort();
@@ -326,11 +329,18 @@ test("migration 0009 backfills the current review fence without claiming legacy 
       (id,bundle_id,input_version,status,analyzer_model,prompt_version,schema_version,stage,is_stale,created_at,updated_at)
       VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
   ).run("legacy-job", "legacy-bundle", "legacy-version", "review_ready", "legacy-model", "p1", "s1", "done", 0, 1, 1);
+  const legacyContent = card({
+    preferred: [{ action: "pass", reason: "반대편을 연다", citationIds: ["legacy-chunk"] }],
+    risky: [],
+  });
   database.prepare(
     `INSERT INTO tactic_cards
       (id,bundle_id,job_id,bundle_version,status,draft_content_json,current_content_json,is_stale,created_at,updated_at)
       VALUES (?,?,?,?,?,?,?,?,?,?)`,
-  ).run("legacy-card", "legacy-bundle", "legacy-job", "legacy-version", "owner_reviewed", "{}", "{}", 0, 1, 20);
+  ).run(
+    "legacy-card", "legacy-bundle", "legacy-job", "legacy-version", "owner_reviewed",
+    JSON.stringify(legacyContent), JSON.stringify(legacyContent), 0, 1, 20,
+  );
   for (const [id, status, createdAt] of [
     ["legacy-held", "held", 10],
     ["legacy-owner", "owner_reviewed", 20],
@@ -340,8 +350,11 @@ test("migration 0009 backfills the current review fence without claiming legacy 
         (id,card_id,actor_user_id,status,content_json,citation_snapshot_json,bundle_version,created_at)
         VALUES (?,?,?,?,?,?,?,?)`,
     ).run(
-      id, "legacy-card", "legacy-admin", status, "{}",
-      id === "legacy-owner" ? '[{"chunkId":"legacy-chunk"}]' : "[]", "legacy-version", createdAt,
+      id, "legacy-card", "legacy-admin", status, JSON.stringify(legacyContent),
+      id === "legacy-owner"
+        ? '[{"chunkId":"legacy-chunk","sourceId":"legacy-source","videoClipId":null,"locationLabel":"p.1","content":"legacy","contentHash":"chunk-hash"}]'
+        : "[]",
+      "legacy-version", createdAt,
     );
   }
   database.prepare(
@@ -355,6 +368,9 @@ test("migration 0009 backfills the current review fence without claiming legacy 
       VALUES (?,?,?,?,?,?,?,?,?,?)`,
   ).run("legacy-chunk", "legacy-bundle", "legacy-version", "legacy-source", null, 0, "p.1", "legacy", "chunk-hash", 1);
   database.prepare(
+    "INSERT INTO tactic_card_citations (id,bundle_id,card_id,chunk_id,created_at) VALUES (?,?,?,?,?)",
+  ).run("legacy-citation", "legacy-bundle", "legacy-card", "legacy-chunk", 1);
+  database.prepare(
     `INSERT INTO scenarios
       (id,campaign_id,role,principle,prompt,hint,explanation,pitch_json,answer_json,content_json,review_status,order_index)
       VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
@@ -363,17 +379,39 @@ test("migration 0009 backfills the current review fence without claiming legacy 
     "INSERT INTO scenario_tactic_card_reviews (scenario_id,card_id,card_review_id,created_at) VALUES (?,?,?,?)",
   ).run("legacy-scenario", "legacy-card", "legacy-owner", 20);
 
-  database.exec(readFileSync(`drizzle/${migrations[migrationIndex]}`, "utf8"));
+  database.exec("BEGIN IMMEDIATE");
+  try {
+    for (const statement of readFileSync(`drizzle/${migrations[migrationIndex]}`, "utf8")
+      .split("--> statement-breakpoint").map((value) => value.trim()).filter(Boolean)) {
+      database.exec(statement);
+    }
+    database.exec("COMMIT");
+  } catch (error) {
+    database.exec("ROLLBACK");
+    throw error;
+  }
 
   assert.deepEqual(database.prepare(
-    "SELECT id,version_kind AS versionKind,producer_job_id AS producerJobId,producer_model AS producerModel FROM tactic_card_reviews ORDER BY created_at",
+    `SELECT id,actor_user_id AS actorUserId,status,content_json AS contentJson,
+      citation_snapshot_json AS citationSnapshotJson,bundle_version AS bundleVersion,created_at AS createdAt,
+      version_kind AS versionKind,producer_job_id AS producerJobId,producer_model AS producerModel
+      FROM tactic_card_reviews ORDER BY created_at`,
   ).all().map((row) => ({ ...row })), [
-    { id: "legacy-held", versionKind: "status_change", producerJobId: null, producerModel: null },
-    { id: "legacy-owner", versionKind: "status_change", producerJobId: null, producerModel: null },
+    {
+      id: "legacy-held", actorUserId: "legacy-admin", status: "held", contentJson: JSON.stringify(legacyContent),
+      citationSnapshotJson: "[]", bundleVersion: "legacy-version", createdAt: 10,
+      versionKind: "status_change", producerJobId: null, producerModel: null,
+    },
+    {
+      id: "legacy-owner", actorUserId: "legacy-admin", status: "owner_reviewed", contentJson: JSON.stringify(legacyContent),
+      citationSnapshotJson: '[{"chunkId":"legacy-chunk","sourceId":"legacy-source","videoClipId":null,"locationLabel":"p.1","content":"legacy","contentHash":"chunk-hash"}]',
+      bundleVersion: "legacy-version", createdAt: 20,
+      versionKind: "status_change", producerJobId: null, producerModel: null,
+    },
   ]);
   assert.equal(database.prepare(
     "SELECT current_review_id AS currentReviewId FROM tactic_cards WHERE id='legacy-card'",
-  ).get()?.currentReviewId, "legacy-owner");
+  ).get()?.currentReviewId, null);
   assert.equal(database.prepare(
     "SELECT count(*) AS count FROM tactic_card_reviews WHERE version_kind='llm_draft'",
   ).get()?.count, 0);
@@ -383,7 +421,48 @@ test("migration 0009 backfills the current review fence without claiming legacy 
   assert.equal(database.prepare(
     "SELECT source_id AS sourceId FROM scenario_evidence_sources WHERE scenario_id='legacy-scenario'",
   ).get()?.sourceId, "legacy-source");
+  assert.deepEqual(database.prepare(
+    "SELECT scenario_id AS scenarioId,card_id AS cardId,card_review_id AS cardReviewId,created_at AS createdAt FROM scenario_tactic_card_reviews",
+  ).all().map((row) => ({ ...row })), [{
+    scenarioId: "legacy-scenario", cardId: "legacy-card", cardReviewId: "legacy-owner", createdAt: 20,
+  }]);
   assert.deepEqual(database.prepare("PRAGMA foreign_key_check").all(), []);
+
+  const d1 = new SQLiteD1Database(database, false);
+  let generatedId = 0;
+  let now = 20;
+  const service = new EvidenceService({
+    repository: new D1EvidenceServiceRepository(d1),
+    settings: { analyzerModel: "legacy-model", promptVersion: "p1", schemaVersion: "s1" },
+    now: () => ++now,
+    newId: () => `legacy-generated-${++generatedId}`,
+  });
+  await assert.rejects(
+    () => service.createScenarioDraft("legacy-card", { ...draftInput, expectedUpdatedAt: 20 }, admin),
+    /승인 스냅샷/,
+  );
+
+  const reviewed = await service.reviewCard("legacy-card", {
+    status: "owner_reviewed",
+    content: legacyContent,
+    expectedUpdatedAt: 20,
+  }, admin);
+  assert.notEqual(reviewed.currentReviewId, null);
+  assert.deepEqual(database.prepare(
+    `SELECT actor_user_id AS actorUserId,producer_job_id AS producerJobId,producer_model AS producerModel,
+      created_at AS createdAt FROM tactic_card_reviews
+      WHERE card_id='legacy-card' AND version_kind='llm_draft'`,
+  ).all().map((row) => ({ ...row })), [{
+    actorUserId: null, producerJobId: "legacy-job", producerModel: "legacy-model", createdAt: 1,
+  }]);
+  const created = await service.createScenarioDraft("legacy-card", {
+    ...draftInput,
+    expectedUpdatedAt: reviewed.updatedAt,
+  }, admin);
+  assert.equal(created.reviewStatus, "draft");
+  assert.equal(database.prepare(
+    "SELECT count(*) AS count FROM tactic_card_reviews WHERE card_id='legacy-card' AND version_kind='llm_draft'",
+  ).get()?.count, 1);
 });
 
 test("owner edits retain the untouched LLM draft and exact immutable review snapshots", async () => {
@@ -405,7 +484,7 @@ test("owner edits retain the untouched LLM draft and exact immutable review snap
   const versions = database.all<{
     status: string;
     versionKind: string;
-    actorUserId: string;
+    actorUserId: string | null;
     producerJobId: string | null;
     producerModel: string | null;
     contentJson: string;
@@ -431,7 +510,7 @@ test("owner edits retain the untouched LLM draft and exact immutable review snap
   assert.deepEqual(versions.map(({ actorUserId, producerJobId, producerModel, bundleVersion, createdAt }) => ({
     actorUserId, producerJobId, producerModel, bundleVersion, createdAt,
   })), [
-    { actorUserId: "job-1", producerJobId: "job-1", producerModel: "model-1", bundleVersion: "bundle-v1", createdAt: 1 },
+    { actorUserId: null, producerJobId: "job-1", producerModel: "model-1", bundleVersion: "bundle-v1", createdAt: 1 },
     { actorUserId: "admin-1", producerJobId: null, producerModel: null, bundleVersion: "bundle-v1", createdAt: 1001 },
   ]);
   const cardFence = database.first<{ currentReviewId: string }>(
@@ -508,7 +587,7 @@ test("a concurrent original insertion cannot create a duplicate LLM version", as
       id: "winning-original",
       status: "analysis_draft",
       kind: "llm_draft",
-      actorUserId: "job-1",
+      actorUserId: null,
       producerJobId: "job-1",
       producerModel: "model-1",
       createdAt: 1,
@@ -528,7 +607,7 @@ test("a concurrent original insertion cannot create a duplicate LLM version", as
     id: "duplicate-original",
     status: "analysis_draft",
     kind: "llm_draft",
-    actorUserId: "job-1",
+    actorUserId: null,
     producerJobId: "job-1",
     producerModel: "model-1",
     createdAt: 1,
@@ -553,6 +632,25 @@ test("an analysis-draft status command is distinct from the original LLM version
   ]);
 });
 
+test("review provenance requires a machine-only LLM identity and a human actor for later versions", () => {
+  const { database } = createContext();
+  seedCard(database);
+  assert.throws(() => insertReviewVersion(database, {
+    id: "bad-machine-actor",
+    status: "analysis_draft",
+    kind: "llm_draft",
+    actorUserId: "job-1",
+    producerJobId: "job-1",
+    producerModel: "model-1",
+  }), /CHECK/);
+  assert.throws(() => insertReviewVersion(database, {
+    id: "missing-human-actor",
+    status: "held",
+    kind: "status_change",
+    actorUserId: null,
+  }), /CHECK/);
+});
+
 test("coach approval appends a coach-edit identity after the owner edit", async () => {
   const { database, service } = createContext();
   seedCard(database);
@@ -568,10 +666,10 @@ test("coach approval appends a coach-edit identity after the owner edit", async 
     expectedUpdatedAt: owner.updatedAt,
   }, { ...admin, userId: "coach-1" });
 
-  assert.deepEqual(database.all<{ kind: string; actor: string }>(
+  assert.deepEqual(database.all<{ kind: string; actor: string | null }>(
     "SELECT version_kind AS kind,actor_user_id AS actor FROM tactic_card_reviews WHERE card_id='card-1' ORDER BY rowid",
   ).map((row) => ({ ...row })), [
-    { kind: "llm_draft", actor: "job-1" },
+    { kind: "llm_draft", actor: null },
     { kind: "owner_edit", actor: "admin-1" },
     { kind: "coach_edit", actor: "coach-1" },
   ]);

@@ -224,7 +224,7 @@ export const tacticCardCitations = sqliteTable("tactic_card_citations", {
 export const tacticCardReviews = sqliteTable("tactic_card_reviews", {
   id: text("id").primaryKey(),
   cardId: text("card_id").notNull().references(() => tacticCards.id, { onDelete: "cascade" }),
-  actorUserId: text("actor_user_id").notNull(),
+  actorUserId: text("actor_user_id"),
   status: text("status", { enum: ["analysis_draft", "owner_reviewed", "coach_reviewed", "held", "rejected"] }).notNull(),
   versionKind: text("version_kind", { enum: ["llm_draft", "owner_edit", "coach_edit", "status_change"] }).notNull().default("status_change"),
   producerJobId: text("producer_job_id"),
@@ -236,6 +236,17 @@ export const tacticCardReviews = sqliteTable("tactic_card_reviews", {
 }, (table) => [
   check("ck_tactic_card_reviews_status", sql`${table.status} IN ('analysis_draft', 'owner_reviewed', 'coach_reviewed', 'held', 'rejected')`),
   check("ck_tactic_card_reviews_version_kind", sql`${table.versionKind} IN ('llm_draft', 'owner_edit', 'coach_edit', 'status_change')`),
+  check("ck_tactic_card_reviews_attribution", sql`(
+    ${table.versionKind} = 'llm_draft'
+    AND ${table.actorUserId} IS NULL
+    AND ${table.producerJobId} IS NOT NULL
+    AND ${table.producerModel} IS NOT NULL
+  ) OR (
+    ${table.versionKind} <> 'llm_draft'
+    AND ${table.actorUserId} IS NOT NULL
+    AND ${table.producerJobId} IS NULL
+    AND ${table.producerModel} IS NULL
+  )`),
   uniqueIndex("idx_tactic_card_reviews_one_llm_draft").on(table.cardId).where(sql`${table.versionKind} = 'llm_draft'`),
   uniqueIndex("idx_tactic_card_reviews_id_card").on(table.id, table.cardId),
 ]);

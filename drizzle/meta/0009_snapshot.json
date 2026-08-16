@@ -1738,7 +1738,7 @@
           "name": "actor_user_id",
           "type": "text",
           "primaryKey": false,
-          "notNull": true,
+          "notNull": false,
           "autoincrement": false
         },
         "status": {
@@ -1842,6 +1842,10 @@
         "ck_tactic_card_reviews_version_kind": {
           "name": "ck_tactic_card_reviews_version_kind",
           "value": "\"tactic_card_reviews\".\"version_kind\" IN ('llm_draft', 'owner_edit', 'coach_edit', 'status_change')"
+        },
+        "ck_tactic_card_reviews_attribution": {
+          "name": "ck_tactic_card_reviews_attribution",
+          "value": "(\n    \"tactic_card_reviews\".\"version_kind\" = 'llm_draft'\n    AND \"tactic_card_reviews\".\"actor_user_id\" IS NULL\n    AND \"tactic_card_reviews\".\"producer_job_id\" IS NOT NULL\n    AND \"tactic_card_reviews\".\"producer_model\" IS NOT NULL\n  ) OR (\n    \"tactic_card_reviews\".\"version_kind\" <> 'llm_draft'\n    AND \"tactic_card_reviews\".\"actor_user_id\" IS NOT NULL\n    AND \"tactic_card_reviews\".\"producer_job_id\" IS NULL\n    AND \"tactic_card_reviews\".\"producer_model\" IS NULL\n  )"
         }
       }
     },

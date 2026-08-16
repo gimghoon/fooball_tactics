@@ -48,7 +48,7 @@ export type EvidenceCitationSnapshot = {
 export type EvidenceCardReviewRecord = {
   id: string;
   cardId: string;
-  actorUserId: string;
+  actorUserId: string | null;
   status: CardReviewStatus;
   versionKind: EvidenceCardReviewVersionKind;
   producerJobId: string | null;
@@ -499,7 +499,7 @@ export class EvidenceService {
     const originalReview: EvidenceCardReviewRecord = {
       id: this.id(),
       cardId: card.id,
-      actorUserId: card.jobId,
+      actorUserId: null,
       status: "analysis_draft",
       versionKind: "llm_draft",
       producerJobId: card.jobId,
