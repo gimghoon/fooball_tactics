@@ -421,7 +421,7 @@ test("migration upgrades the exact old queued default and runs validation first"
   await drainScheduled(scheduled);
 });
 
-test("migration preserves every legacy job-owned card without duplication or destructive rewind", async () => {
+test("migration preserves durable decisions and quarantines invalid draft-only legacy output before rewind", async () => {
   const database = new DatabaseSync(":memory:");
   database.exec("PRAGMA foreign_keys = ON");
   const migrations = readdirSync("drizzle").filter((value) => /^\d{4}_.*\.sql$/.test(value)).sort();
@@ -435,7 +435,8 @@ test("migration preserves every legacy job-owned card without duplication or des
         (id,bundle_id,input_version,status,analyzer_model,prompt_version,schema_version,stage,is_stale,created_at,updated_at)
         VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
     ).run(
-      `${suffix}-job`, `${suffix}-bundle`, `${suffix}-input`, "running", "model-1", "prompt-1", "schema-1",
+      `${suffix}-job`, `${suffix}-bundle`, `${suffix}-input`, suffix === "incomplete" ? "review_ready" : "running",
+      "model-1", "prompt-1", "schema-1",
       "cards_generated", 0, 1, 1,
     );
     database.prepare(
@@ -443,10 +444,31 @@ test("migration preserves every legacy job-owned card without duplication or des
         (id,bundle_id,job_id,bundle_version,status,draft_content_json,current_content_json,is_stale,created_at,updated_at)
         VALUES (?,?,?,?,?,?,?,?,?,?)`,
     ).run(
-      `${suffix}-card`, `${suffix}-bundle`, `${suffix}-job`, `${suffix}-input`, "analysis_draft",
+      `${suffix}-card`, `${suffix}-bundle`, `${suffix}-job`, `${suffix}-input`,
+      suffix === "complete" ? "owner_reviewed" : "analysis_draft",
       suffix === "complete" ? '{"citationIds":["complete-chunk"]}' : "{}",
       suffix === "complete" ? '{"citationIds":["complete-chunk"]}' : "{}", 0, 1, 1,
     );
+  }
+  database.prepare(
+    `INSERT INTO tactic_cards
+      (id,bundle_id,job_id,bundle_version,status,draft_content_json,current_content_json,is_stale,created_at,updated_at)
+      VALUES (?,?,?,?,?,?,?,?,?,?)`,
+  ).run("mixed-draft", "complete-bundle", "complete-job", "complete-input", "analysis_draft", "{}", "{}", 0, 1, 1);
+  for (const status of ["held", "rejected"] as const) {
+    database.prepare(
+      "INSERT INTO evidence_bundles (id,title,purpose,version,content_version,created_at,updated_at) VALUES (?,?,?,?,?,?,?)",
+    ).run(`${status}-bundle`, status, "Resume", 1, `${status}-input`, 1, 1);
+    database.prepare(
+      `INSERT INTO evidence_analysis_jobs
+        (id,bundle_id,input_version,status,analyzer_model,prompt_version,schema_version,stage,is_stale,created_at,updated_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+    ).run(`${status}-job`, `${status}-bundle`, `${status}-input`, "running", "model-1", "prompt-1", "schema-1", "cards_generated", 0, 1, 1);
+    database.prepare(
+      `INSERT INTO tactic_cards
+        (id,bundle_id,job_id,bundle_version,status,draft_content_json,current_content_json,is_stale,created_at,updated_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?)`,
+    ).run(`${status}-card`, `${status}-bundle`, `${status}-job`, `${status}-input`, status, "{}", "{}", 0, 1, 1);
   }
   database.prepare(
     `INSERT INTO evidence_sources
@@ -499,7 +521,10 @@ test("migration preserves every legacy job-owned card without duplication or des
   assert.deepEqual({ ...database.prepare(
     "SELECT status,stage FROM evidence_analysis_jobs WHERE id='complete-job'",
   ).get() }, { status: "review_ready", stage: "done" });
-  assert.equal(database.prepare("SELECT count(*) AS count FROM tactic_cards WHERE job_id='complete-job'").get()?.count, 1);
+  assert.equal(database.prepare("SELECT count(*) AS count FROM tactic_cards WHERE job_id='complete-job'").get()?.count, 2);
+  assert.deepEqual({ ...database.prepare(
+    "SELECT status,is_stale AS isStale FROM tactic_cards WHERE id='mixed-draft'",
+  ).get() }, { status: "held", isStale: 1 });
   assert.equal(database.prepare("SELECT count(*) AS count FROM tactic_card_citations WHERE card_id='complete-card'").get()?.count, 1);
   assert.equal(database.prepare(
     `SELECT count(*) AS count FROM tactic_card_citations AS citation
@@ -531,16 +556,48 @@ test("migration preserves every legacy job-owned card without duplication or des
   ).get(snapshotIds[1]!)?.input_version, "historical-input");
   assert.equal(database.prepare("SELECT count(*) AS count FROM tactic_cards WHERE job_id='incomplete-job'").get()?.count, 1);
   assert.deepEqual({ ...database.prepare(
+    "SELECT status,is_stale AS isStale FROM tactic_cards WHERE id='incomplete-card'",
+  ).get() }, { status: "held", isStale: 1 });
+  assert.deepEqual({ ...database.prepare(
     "SELECT status,stage FROM evidence_analysis_jobs WHERE id='incomplete-job'",
-  ).get() }, { status: "review_ready", stage: "done" });
+  ).get() }, { status: "queued", stage: "extract_evidence" });
+  for (const status of ["held", "rejected"] as const) {
+    assert.deepEqual({ ...database.prepare(
+      "SELECT status,stage FROM evidence_analysis_jobs WHERE id=?",
+    ).get(`${status}-job`) }, { status: "review_ready", stage: "done" });
+    assert.deepEqual({ ...database.prepare(
+      "SELECT status,is_stale AS isStale FROM tactic_cards WHERE id=?",
+    ).get(`${status}-card`) }, { status, isStale: 0 });
+  }
 
   const d1 = new SQLiteD1Database(database, false);
   const context = createContext({ database: d1 });
   await context.jobs.runAnalysisStep("complete-job");
+  d1.run(
+    `INSERT INTO evidence_sources
+      (id,bundle_id,original_file_name,media_type,byte_size,content_hash,storage_key,extraction_status,created_at,updated_at)
+      VALUES (?,?,?,?,?,?,?,?,?,?)`,
+    "incomplete-source", "incomplete-bundle", "notes.md", "text/markdown", 1, "hash", "key", "completed", 1, 1,
+  );
+  d1.run(
+    `INSERT INTO evidence_chunks
+      (id,bundle_id,input_version,source_id,video_clip_id,ordinal,location_label,content,content_hash,created_at)
+      VALUES (?,?,?,?,?,?,?,?,?,?)`,
+    "incomplete-chunk", "incomplete-bundle", "incomplete-input", "incomplete-source", null, 0, "p1", "evidence", "hash", 1,
+  );
   await context.jobs.runAnalysisStep("incomplete-job");
-  assert.equal(d1.first<{ count: number }>("SELECT count(*) AS count FROM tactic_cards WHERE job_id='complete-job'").count, 1);
-  assert.equal(d1.first<{ count: number }>("SELECT count(*) AS count FROM tactic_cards WHERE job_id='incomplete-job'").count, 1);
-  assert.deepEqual(context.analyzer.calls, []);
+  await drainScheduled(context.scheduled);
+  assert.equal(d1.first<{ count: number }>("SELECT count(*) AS count FROM tactic_cards WHERE job_id='complete-job'").count, 2);
+  assert.equal(d1.first<{ count: number }>(
+    "SELECT count(*) AS count FROM tactic_cards WHERE job_id='complete-job' AND status='owner_reviewed' AND is_stale=0",
+  ).count, 1);
+  assert.equal(d1.first<{ count: number }>(
+    "SELECT count(*) AS count FROM tactic_cards WHERE job_id='incomplete-job' AND status='analysis_draft' AND is_stale=0",
+  ).count, 1);
+  assert.equal(d1.first<{ count: number }>(
+    "SELECT count(*) AS count FROM tactic_cards WHERE job_id='incomplete-job' AND status='held' AND is_stale=1",
+  ).count, 1);
+  assert.deepEqual(context.analyzer.calls, ["extract", "cards"]);
 });
 
 test("same input version deduplicates analysis jobs", async () => {
