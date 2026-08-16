@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useState } from "react";
 import Link from "next/link";
 import type { AttemptInput, CoachExplanation, HighlightRef, Point, PublicScenarioProjection, ScenarioTimeline } from "@/lib/domain/content";
-import { attemptDeliveryDisposition, mergePendingEvents } from "@/lib/domain/offline-queue";
+import { attemptDeliveryDisposition, attemptDeliveryFeedback, mergePendingEvents } from "@/lib/domain/offline-queue";
 import {
   beginInitialPlayback,
   completePlayback,
@@ -96,7 +96,12 @@ export function CampaignPlayer({ campaign, scenarios }: { campaign: { id: string
       if (!auth || !pending.length) return;
       for (const event of pending) {
         const response = await fetch("/api/attempts", { method: "POST", headers: { "content-type": "application/json", authorization: `Bearer ${auth.recoveryToken}`, "x-participant-id": auth.participantId }, body: JSON.stringify(event) }).catch(() => null);
-        if (attemptDeliveryDisposition(response?.status ?? null) !== "retry") {
+        const disposition = attemptDeliveryDisposition(response?.status ?? null);
+        if (disposition === "rejected" && response) {
+          const delivery = attemptDeliveryFeedback(disposition, await responseError(response));
+          setFeedback({ correct: false, grade: null, hint: delivery.message, explanation: null });
+        }
+        if (disposition !== "retry") {
           localStorage.setItem("tactiq-pending-attempts", JSON.stringify(readPendingAttempts().filter((item) => item.eventId !== event.eventId)));
         }
       }
@@ -116,13 +121,15 @@ export function CampaignPlayer({ campaign, scenarios }: { campaign: { id: string
       const response = await fetch("/api/attempts", { method: "POST", headers: { "content-type": "application/json", authorization: `Bearer ${auth.recoveryToken}`, "x-participant-id": auth.participantId }, body: JSON.stringify(event) }).catch(() => null);
       const disposition = attemptDeliveryDisposition(response?.status ?? null);
       if (disposition === "retry") {
-        storePendingAttempt(event);
         const message = response ? await responseError(response) : "네트워크에 연결할 수 없어요.";
-        setFeedback({ correct: false, grade: null, hint: `${message} 답안은 기기에 임시 저장했어요.`, explanation: null });
+        const delivery = attemptDeliveryFeedback(disposition, message);
+        if (delivery.queue) storePendingAttempt(event);
+        setFeedback({ correct: false, grade: null, hint: delivery.message, explanation: null });
         return;
       }
       if (disposition === "rejected" && response) {
-        setFeedback({ correct: false, grade: null, hint: await responseError(response), explanation: null });
+        const delivery = attemptDeliveryFeedback(disposition, await responseError(response));
+        setFeedback({ correct: false, grade: null, hint: delivery.message, explanation: null });
         return;
       }
       if (!response) return;

@@ -11,7 +11,7 @@ import {
 } from "react";
 import { normalizeClientPoint } from "@/lib/domain/geometry";
 import type { ActionType, HighlightRef, Point, PublicScenarioProjection } from "@/lib/domain/content";
-import { frameAt } from "@/lib/domain/timeline";
+import { pitchFrameAt } from "@/lib/domain/timeline";
 import { classifyPlayerTap, defenseTypeLabel, playerAriaLabel } from "@/lib/domain/tactical-pitch";
 
 const ACTION_LABELS: Record<ActionType, string> = {
@@ -102,13 +102,16 @@ export function TacticalPitch({
 
   const displayedMs = reducedMotion ? content.setupTimeline.durationMs : setupMs;
   const frame = useMemo(
-    () => frameAt(content.setupTimeline, displayedMs),
-    [content.setupTimeline, displayedMs],
+    () => pitchFrameAt(content.pitch, content.setupTimeline, displayedMs),
+    [content.pitch, content.setupTimeline, displayedMs],
   );
-  const setupStart = useMemo(() => frameAt(content.setupTimeline, 0), [content.setupTimeline]);
+  const setupStart = useMemo(
+    () => pitchFrameAt(content.pitch, content.setupTimeline, 0),
+    [content.pitch, content.setupTimeline],
+  );
   const setupEnd = useMemo(
-    () => frameAt(content.setupTimeline, content.setupTimeline.durationMs),
-    [content.setupTimeline],
+    () => pitchFrameAt(content.pitch, content.setupTimeline, content.setupTimeline.durationMs),
+    [content.pitch, content.setupTimeline],
   );
   const highlighted = useMemo(
     () => new Set(highlights.map((highlight) => `${highlight.kind}:${highlight.id}`)),
@@ -122,12 +125,15 @@ export function TacticalPitch({
   const ball = frame.ball;
   const destinationControls = selectedAction === "dribble"
     || selectedAction === "move"
-    || (selectedAction === "pass" && content.passInputMode === "destination");
-  const setupMotions = content.pitch.players.flatMap((player) => {
+    || (selectedAction === "pass" && content.passInputMode !== "player");
+  const playerSetupMotions = content.pitch.players.flatMap((player) => {
     const from = setupStart.players[player.id] ?? player;
     const to = setupEnd.players[player.id] ?? player;
     return from.x === to.x && from.y === to.y ? [] : [{ id: player.id, from, to }];
   });
+  const setupMotions = setupStart.ball.x === setupEnd.ball.x && setupStart.ball.y === setupEnd.ball.y
+    ? playerSetupMotions
+    : [...playerSetupMotions, { id: "ball", from: setupStart.ball, to: setupEnd.ball }];
 
   function submitDestination(event: PointerEvent<SVGSVGElement>) {
     if (!selectedAction || disabled || setupLocked) return;
@@ -216,7 +222,7 @@ export function TacticalPitch({
         <circle cx="50" cy="50" r="12" className="pitch-line" />
         {reducedMotion && content.setupTimeline.durationMs > 0 ? setupMotions.map(({ id, from, to }) => (
           <g key={`setup-motion-${id}`}>
-            <line x1={from.x} y1={from.y} x2={to.x} y2={to.y} className="setup-motion-arrow" markerEnd="url(#setup-arrow)" />
+            <line data-setup-motion={id} x1={from.x} y1={from.y} x2={to.x} y2={to.y} className="setup-motion-arrow" markerEnd="url(#setup-arrow)" />
             <circle cx={from.x} cy={from.y} r="2" className="setup-start-endpoint" />
             <circle cx={to.x} cy={to.y} r="2" className="setup-end-endpoint" />
           </g>
@@ -250,6 +256,7 @@ export function TacticalPitch({
               onPointerDown={(event) => submitPlayer(event, player)}
             >
               <title>{playerAriaLabel(actor, player)}</title>
+              <circle cx={player.x} cy={player.y} r="8" className="player-hit-target" />
               <circle data-player-id={player.id} cx={player.x} cy={player.y} r="5" className={player.team === "us" ? "player" : "opponent"} />
             </g>
           );

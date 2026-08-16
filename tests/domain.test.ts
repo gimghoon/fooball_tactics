@@ -17,12 +17,12 @@ import {
   toPublicScenarioContent,
   type ScenarioContent,
 } from "../lib/domain/content.ts";
-import { attemptDeliveryDisposition, mergePendingEvents } from "../lib/domain/offline-queue.ts";
+import { attemptDeliveryDisposition, attemptDeliveryFeedback, mergePendingEvents } from "../lib/domain/offline-queue.ts";
 import { advanceRole, evaluateAttempt } from "../lib/domain/session.ts";
 import { createRecoveryToken, hashRecoveryToken, normalizeNickname } from "../lib/domain/identity.ts";
 import { evaluateScenarioAction } from "../lib/domain/scenario-judging.ts";
 import { classifyPlayerTap, defenseTypeLabel, playerAriaLabel } from "../lib/domain/tactical-pitch.ts";
-import { attemptAnalyticsPoint, buildStructuredAttemptFeedback } from "../lib/domain/attempt-feedback.ts";
+import { attemptAnalyticsPoint, buildStructuredAttemptFeedback, resolveLegacyAttemptChoice } from "../lib/domain/attempt-feedback.ts";
 import {
   beginInitialPlayback,
   completePlayback,
@@ -436,10 +436,22 @@ test("publishes a canonical pass input mode for structured zone and legacy answe
     pitchJson: JSON.stringify({ players: [], ball: { x: 50, y: 80 } }),
     answerJson: JSON.stringify({ kind: "circle", cx: 30, cy: 50, radius: 8 }),
   }));
+  const mixed = toPublicScenarioContent({
+    ...reviewedScenarioContent,
+    answer: {
+      ...reviewedScenarioContent.answer,
+      alternatives: [{
+        actionType: "pass",
+        target: { kind: "zone", zone: { kind: "circle", cx: 35, cy: 55, radius: 4 } },
+        reason: "검수된 차선 이유",
+      }],
+    },
+  });
 
   assert.equal(toPublicScenarioContent(reviewedScenarioContent).passInputMode, "player");
   assert.equal(zonePass.passInputMode, "destination");
   assert.equal(legacy.passInputMode, "destination");
+  assert.equal(mixed.passInputMode, "both");
 });
 
 test("withholds incompletely reviewed structured content while preserving legacy compatibility", () => {
@@ -449,6 +461,14 @@ test("withholds incompletely reviewed structured content while preserving legacy
         ...reviewedScenarioContent,
         review: { ...reviewedScenarioContent.review, [reviewFlag]: false },
       }),
+      reviewedContentJson: JSON.stringify({
+        ...reviewedScenarioContent,
+        review: { ...reviewedScenarioContent.review, [reviewFlag]: false },
+      }),
+      sourceTitle: "검수 출처",
+      sourceUrl: "https://example.com/source",
+      reviewerName: "검수자",
+      reviewedAt: new Date("2026-08-16T00:00:00.000Z"),
       pitchJson: JSON.stringify(reviewedScenarioContent.pitch),
       answerJson: JSON.stringify(reviewedScenarioContent.answer),
     });
@@ -456,11 +476,34 @@ test("withholds incompletely reviewed structured content while preserving legacy
   }
   const legacy = serializePublicScenarioContent({
     contentJson: "",
+    reviewedContentJson: null,
+    sourceTitle: null,
+    sourceUrl: null,
+    reviewerName: null,
+    reviewedAt: null,
     pitchJson: JSON.stringify({ players: [], ball: { x: 50, y: 80 } }),
     answerJson: JSON.stringify({ kind: "circle", cx: 30, cy: 50, radius: 8 }),
   });
 
   assert.equal(JSON.parse(legacy ?? "{}").defenseType, null);
+});
+
+test("withholds structured content when review provenance is missing or belongs to an older content snapshot", () => {
+  const contentJson = JSON.stringify(reviewedScenarioContent);
+  const source = {
+    contentJson,
+    reviewedContentJson: contentJson,
+    sourceTitle: "검수 출처",
+    sourceUrl: "https://example.com/source",
+    reviewerName: "검수자",
+    reviewedAt: new Date("2026-08-16T00:00:00.000Z"),
+    pitchJson: JSON.stringify(reviewedScenarioContent.pitch),
+    answerJson: JSON.stringify(reviewedScenarioContent.answer),
+  };
+
+  assert.notEqual(serializePublicScenarioContent(source), null);
+  assert.equal(serializePublicScenarioContent({ ...source, reviewedContentJson: "{}" }), null);
+  assert.equal(serializePublicScenarioContent({ ...source, reviewerName: null }), null);
 });
 
 test("accepts points inside and on the boundary of a circular answer zone", () => {
@@ -525,6 +568,11 @@ test("projects training props without pre-attempt feedback", () => {
     pitchJson: JSON.stringify(reviewedScenarioContent.pitch),
     answerJson: JSON.stringify(reviewedScenarioContent.answer),
     contentJson: JSON.stringify(reviewedScenarioContent),
+    reviewedContentJson: JSON.stringify(reviewedScenarioContent),
+    sourceTitle: "검수 출처",
+    sourceUrl: "https://example.com/source",
+    reviewerName: "검수자",
+    reviewedAt: new Date("2026-08-16T00:00:00.000Z"),
     orderIndex: 1,
   });
 
@@ -613,6 +661,27 @@ test("reconstructs retries from the exact persisted path instead of rounded coor
   });
   assert.equal(evaluateScenarioAction(boundaryContent, reconstructed).correct, false);
   assert.equal(evaluateScenarioAction(boundaryContent, { ...reconstructed, destination: { x: 70, y: 72 } }).correct, true);
+});
+
+test("reconstructs legacy destination-pass retries from their canonical persisted path", () => {
+  const legacy = adaptLegacyPassScenario({
+    pitchJson: JSON.stringify({ players: [], ball: { x: 50, y: 80 } }),
+    answerJson: JSON.stringify({ kind: "circle", cx: 30, cy: 50, radius: 8 }),
+  });
+  const choice = resolveLegacyAttemptChoice(
+    legacy,
+    { eventId: "event", scenarioId: "legacy", actionType: "pass", destination: { x: 99, y: 99 } },
+    {
+      actionType: "pass",
+      targetPlayerId: null,
+      pathJson: JSON.stringify([{ x: 50, y: 80 }, { x: 30.0045, y: 50 }]),
+      touchX: 3000,
+      touchY: 5000,
+    },
+  );
+
+  assert.deepEqual(choice.point, { x: 30.0045, y: 50 });
+  assert.deepEqual(choice.path, [{ x: 50, y: 80 }, { x: 30.0045, y: 50 }]);
 });
 
 test("requires a pass target to share the actor's team", () => {
@@ -708,6 +777,17 @@ test("queues only transport failures and retryable server responses", () => {
   ] as const;
 
   for (const [status, expected] of cases) assert.equal(attemptDeliveryDisposition(status), expected);
+});
+
+test("delivery feedback never claims permanent HTTP errors were stored", () => {
+  assert.deepEqual(attemptDeliveryFeedback("retry", "서버 오류"), {
+    queue: true,
+    message: "서버 오류 답안은 기기에 임시 저장했어요.",
+  });
+  assert.deepEqual(attemptDeliveryFeedback("rejected", "요청 오류"), {
+    queue: false,
+    message: "요청 오류",
+  });
 });
 
 test("first miss returns only the authored observe clue and safe setup data", () => {

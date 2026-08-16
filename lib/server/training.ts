@@ -4,6 +4,7 @@ import { attempts, mastery, participants, reflections, rooms, scenarios } from "
 import { isPointInZone, type CircleZone } from "@/lib/domain/geometry";
 import {
   adaptLegacyPassScenario,
+  hasCurrentScenarioReviewAudit,
   parseScenarioContent,
   reconstructAttemptInput,
   type AttemptInput,
@@ -20,6 +21,7 @@ import { evaluateScenarioAction, type ActionEvaluation } from "@/lib/domain/scen
 import {
   attemptAnalyticsPoint,
   buildStructuredAttemptFeedback,
+  resolveLegacyAttemptChoice,
 } from "@/lib/domain/attempt-feedback";
 import { RoomError, authenticateParticipant } from "./rooms";
 
@@ -71,20 +73,22 @@ export async function recordAttempt(request: Request, input: ParsedAttemptInput)
     const legacy = adaptLegacyPassScenario(scenario);
     if (legacy.answer.preferred.target.kind !== "zone") throw new RoomError("기존 문제 답안을 확인할 수 없어요.", 409);
     zone = legacy.answer.preferred.target.zone;
-    if (isLegacyAttemptInput(input)) {
-      recordedPoint = { x: input.x, y: input.y };
-    } else {
+    if (!existing && !isLegacyAttemptInput(input)) {
       if (input.actionType !== "pass" || input.destination === undefined) {
         throw new RoomError("기존 문제는 패스 도착 지점으로 제출해주세요.", 400);
       }
-      actionType = input.actionType;
-      targetPlayerId = input.targetPlayerId ?? null;
-      recordedPoint = input.destination;
     }
-    if (existing) recordedPoint = { x: existing.touchX / 100, y: existing.touchY / 100 };
+    const legacyChoice = resolveLegacyAttemptChoice(legacy, input, existing);
+    actionType = "pass";
+    targetPlayerId = null;
+    recordedPoint = legacyChoice.point;
+    selectedPath = legacyChoice.path;
     correct = existing?.correct ?? isPointInZone(recordedPoint, zone);
   } else {
     if (isLegacyAttemptInput(input)) throw new RoomError("행동 유형을 포함해 답안을 제출해주세요.", 400);
+    if (!hasCurrentScenarioReviewAudit(scenario)) {
+      throw new RoomError("현재 콘텐츠의 검수 기록이 없어 답안을 제출할 수 없어요.", 409);
+    }
     content = parseScenarioContent(scenario.contentJson);
     if (!content.review.sourceReviewed || !content.review.timelineReviewed || !content.review.explanationsReviewed) {
       throw new RoomError("검수가 완료되지 않은 문제에는 답안을 제출할 수 없어요.", 409);

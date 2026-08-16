@@ -2,7 +2,7 @@
 
 import { useEffect, useMemo, useRef, useSyncExternalStore } from "react";
 import type { HighlightRef, PitchState, Point, ScenarioTimeline } from "@/lib/domain/content";
-import { frameAt, snapToKeyframe } from "@/lib/domain/timeline";
+import { pitchFrameAt, snapToKeyframe } from "@/lib/domain/timeline";
 
 type ScenarioPlaybackProps = {
   pitch: PitchState;
@@ -94,7 +94,7 @@ export function ScenarioPlayback({
 
   const endpointOnly = reducedMotion !== false;
   const displayedMs = endpointOnly ? snapToKeyframe(timeline, currentMs) : currentMs;
-  const frame = useMemo(() => frameAt(timeline, displayedMs), [displayedMs, timeline]);
+  const frame = useMemo(() => pitchFrameAt(pitch, timeline, displayedMs), [displayedMs, pitch, timeline]);
   const highlighted = useMemo(
     () => new Set(highlights.map((highlight) => `${highlight.kind}:${highlight.id}`)),
     [highlights],

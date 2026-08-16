@@ -35,7 +35,9 @@ The server must configure `CONTENT_REVIEWER_NAME` together with
 the normalized source title and URL, and the server timestamp in one database
 update. It never accepts reviewer identity from the request body. Moving a
 scenario back to `draft` or `pending` clears those audit fields so an earlier
-approval cannot be mistaken for the current content.
+approval cannot be mistaken for the current content. The same update stores the
+exact reviewed content snapshot; any later content edit invalidates publication
+and attempt submission until the scenario is reviewed again.
 
 Publication requires all three flags (`sourceReviewed`, `timelineReviewed`, and
 `explanationsReviewed`) plus valid structured content containing all four

@@ -5,6 +5,7 @@ import { createRoot, type Root } from "react-dom/client";
 import { Window } from "happy-dom";
 
 import { CoachExplanationPanel } from "../app/train/[campaignId]/CoachExplanationPanel.tsx";
+import { ScenarioPlayback } from "../app/train/[campaignId]/ScenarioPlayback.tsx";
 import { TacticalPitch, type TacticalChoice } from "../app/train/[campaignId]/TacticalPitch.tsx";
 import type { CoachExplanation, HighlightRef, PublicScenarioContent } from "../lib/domain/content.ts";
 
@@ -86,7 +87,7 @@ function content(overrides: Partial<PublicScenarioContent> = {}): PublicScenario
       durationMs: 500,
       decisionAtMs: 500,
       keyframes: [
-        { atMs: 0, players: { defender: { x: 50, y: 40 } }, ball: { x: 50, y: 70 } },
+        { atMs: 0, players: {}, ball: { x: 50, y: 70 } },
         { atMs: 500, players: { defender: { x: 50, y: 55 } }, ball: { x: 50, y: 70 } },
       ],
     },
@@ -121,6 +122,31 @@ test("setup timeline autoplays before enabling actions", async () => {
   assert.equal(container.querySelector('circle[data-player-id="defender"]')?.getAttribute("cy"), "55");
 });
 
+test("reviewed result playback seeds sparse initial players from the pitch", async () => {
+  setupMatchMedia(false);
+  setupRaf();
+  const scenario = content();
+  const { container } = await render(
+    <ScenarioPlayback
+      pitch={scenario.pitch}
+      timeline={scenario.setupTimeline}
+      selectedPath={null}
+      recommendedPath={null}
+      highlights={[]}
+      currentMs={0}
+      playing={false}
+      generation={0}
+      onCurrentMsChange={() => {}}
+      onPlayingChange={() => {}}
+      onRestart={() => {}}
+      onPlaybackComplete={() => {}}
+      prefersReducedMotion={false}
+    />,
+  );
+
+  assert.equal(container.querySelector("circle.opponent")?.getAttribute("cy"), "40");
+});
+
 test("setup replay cancels the active frame and unmount cancels its replacement", async () => {
   setupMatchMedia(false);
   const raf = setupRaf();
@@ -141,14 +167,25 @@ test("setup replay cancels the active frame and unmount cancels its replacement"
 test("reduced motion shows reviewed setup endpoints and arrows without RAF", async () => {
   setupMatchMedia(true);
   const raf = setupRaf();
+  const reducedContent = content({
+    setupTimeline: {
+      durationMs: 500,
+      decisionAtMs: 500,
+      keyframes: [
+        { atMs: 0, players: {}, ball: { x: 50, y: 70 } },
+        { atMs: 500, players: { defender: { x: 50, y: 55 } }, ball: { x: 45, y: 65 } },
+      ],
+    },
+  });
   const { container } = await render(
-    <TacticalPitch content={content()} prefersReducedMotion onSubmit={() => {}} />,
+    <TacticalPitch content={reducedContent} prefersReducedMotion onSubmit={() => {}} />,
   );
 
   assert.equal(raf.callbacks.size, 0);
   assert.equal(button(container, "패스").disabled, false);
   assert.ok(container.querySelectorAll(".setup-motion-arrow").length > 0);
   assert.ok(container.querySelectorAll(".setup-start-endpoint").length > 0);
+  assert.ok(container.querySelector('[data-setup-motion="ball"]'));
 });
 
 test("player pass targets stop pitch propagation and work with pointer and keyboard", async () => {
@@ -160,11 +197,30 @@ test("player pass targets stop pitch propagation and work with pointer and keybo
   await act(async () => { button(container, "패스").click(); });
   const target = container.querySelector('[role="button"][aria-label="동료 선수 teammate"]');
   assert.ok(target);
+  assert.equal(target.querySelector(".player-hit-target")?.getAttribute("r"), "8");
 
   await act(async () => { target.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true, clientX: 10, clientY: 10 })); });
   assert.deepEqual(choices, [{ actionType: "pass", targetPlayerId: "teammate" }]);
   await act(async () => { target.dispatchEvent(new KeyboardEvent("keydown", { bubbles: true, key: "Enter" })); });
   assert.deepEqual(choices[1], { actionType: "pass", targetPlayerId: "teammate" });
+});
+
+test("mixed pass input keeps player targets and open-space coordinate controls available", async () => {
+  setupMatchMedia(false);
+  setupRaf();
+  const choices: TacticalChoice[] = [];
+  const mixedPass = content({
+    passInputMode: "both",
+    setupTimeline: { durationMs: 0, decisionAtMs: 0, keyframes: [{ atMs: 0, players: {}, ball: { x: 50, y: 70 } }] },
+  });
+  const { container } = await render(<TacticalPitch content={mixedPass} onSubmit={(choice) => choices.push(choice)} />);
+  await act(async () => { button(container, "패스").click(); });
+
+  const target = container.querySelector('[role="button"][aria-label="동료 선수 teammate"]');
+  assert.ok(target);
+  assert.ok(container.querySelector('input[aria-label="도착 X 좌표"]'));
+  await act(async () => { target.dispatchEvent(new KeyboardEvent("keydown", { bubbles: true, key: "Enter" })); });
+  assert.deepEqual(choices, [{ actionType: "pass", targetPlayerId: "teammate" }]);
 });
 
 test("zone pass teammate taps use the exact canonical player coordinate", async () => {

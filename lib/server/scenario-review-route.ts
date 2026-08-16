@@ -6,6 +6,7 @@ export type ScenarioReviewUpdate = {
   sourceUrl: string | null;
   reviewerName: string | null;
   reviewedAt: Date | null;
+  reviewedContentJson: string | null;
 };
 
 export type ScenarioReviewDependencies = {
@@ -15,7 +16,7 @@ export type ScenarioReviewDependencies = {
   };
   now: () => Date;
   findScenario: (id: string) => Promise<{ contentJson: string } | undefined>;
-  updateScenario: (id: string, values: ScenarioReviewUpdate) => Promise<void>;
+  updateScenario: (id: string, expectedContentJson: string, values: ScenarioReviewUpdate) => Promise<boolean>;
 };
 
 type ReviewBody = {
@@ -74,6 +75,7 @@ export async function handleReviewRequest(
       sourceUrl,
       reviewerName,
       reviewedAt: dependencies.now(),
+      reviewedContentJson: scenario.contentJson,
     };
   } else {
     values = {
@@ -82,9 +84,13 @@ export async function handleReviewRequest(
       sourceUrl: null,
       reviewerName: null,
       reviewedAt: null,
+      reviewedContentJson: null,
     };
   }
 
-  await dependencies.updateScenario(id, values);
+  const updated = await dependencies.updateScenario(id, scenario.contentJson, values);
+  if (!updated) {
+    return Response.json({ error: "시나리오 콘텐츠가 변경되어 다시 검수해야 합니다." }, { status: 409 });
+  }
   return Response.json({ id, reviewStatus: body.status });
 }

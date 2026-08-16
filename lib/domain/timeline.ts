@@ -1,4 +1,4 @@
-import type { CoachExplanation, ExplanationKind, Point, ScenarioTimeline, TimelineKeyframe } from "./content";
+import type { CoachExplanation, ExplanationKind, PitchState, Point, ScenarioTimeline, TimelineKeyframe } from "./content";
 
 export type PitchFrame = TimelineKeyframe;
 export type ExplanationStage = "상황" | "판단" | "결과";
@@ -108,4 +108,24 @@ export function frameAt(timeline: ScenarioTimeline, atMs: number): PitchFrame {
     players,
     ball: interpolatePoint(before.ball, after.ball, progress),
   };
+}
+
+/** Seeds sparse animation from the reviewed pitch instead of borrowing a future player position. */
+export function pitchFrameAt(pitch: PitchState, timeline: ScenarioTimeline, atMs: number): PitchFrame {
+  const basePlayers = Object.fromEntries(
+    pitch.players.map((player) => [player.id, { x: player.x, y: player.y }]),
+  );
+  let foundStart = false;
+  const keyframes = timeline.keyframes.map((keyframe) => {
+    if (keyframe.atMs !== 0) return keyframe;
+    foundStart = true;
+    return {
+      ...keyframe,
+      players: { ...basePlayers, ...keyframe.players },
+    };
+  });
+  if (!foundStart) {
+    keyframes.unshift({ atMs: 0, players: basePlayers, ball: { ...pitch.ball } });
+  }
+  return frameAt({ ...timeline, keyframes }, atMs);
 }

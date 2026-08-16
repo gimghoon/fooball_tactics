@@ -48,15 +48,18 @@ function request(status: string, extra: Record<string, unknown> = {}) {
   });
 }
 
-function dependencies(options: { found?: boolean } = {}) {
-  const updates: { id: string; values: Update }[] = [];
+function dependencies(options: { found?: boolean; updated?: boolean } = {}) {
+  const updates: { id: string; expectedContentJson: string; values: Update }[] = [];
   return {
     updates,
     dependencies: {
       env: { CONTENT_REVIEW_KEY: "secret", CONTENT_REVIEWER_NAME: "서버 검수자" },
       now: () => new Date("2026-08-16T01:02:03.000Z"),
       findScenario: async () => options.found === false ? undefined : { contentJson: reviewedContent },
-      updateScenario: async (id: string, values: Update) => { updates.push({ id, values }); },
+      updateScenario: async (id: string, expectedContentJson: string, values: Update) => {
+        updates.push({ id, expectedContentJson, values });
+        return options.updated !== false;
+      },
     },
   };
 }
@@ -76,12 +79,14 @@ test("reviewed transition atomically records server reviewer and required source
   assert.equal(response.status, 200);
   assert.deepEqual(harness.updates, [{
     id: "scenario-1",
+    expectedContentJson: reviewedContent,
     values: {
       reviewStatus: "reviewed",
       sourceTitle: "코치 원문",
       sourceUrl: "https://example.com/source",
       reviewerName: "서버 검수자",
       reviewedAt: new Date("2026-08-16T01:02:03.000Z"),
+      reviewedContentJson: reviewedContent,
     },
   }]);
 });
@@ -126,8 +131,21 @@ test("draft and pending transitions invalidate every review audit field", async 
       sourceUrl: null,
       reviewerName: null,
       reviewedAt: null,
+      reviewedContentJson: null,
     });
   }
+});
+
+test("reviewed transition rejects a concurrent content change instead of publishing stale validation", async () => {
+  const harness = dependencies({ updated: false });
+  const response = await handleReviewRequest(
+    request("reviewed", { sourceTitle: "출처", sourceUrl: "https://example.com/source" }),
+    { params: Promise.resolve({ id: "scenario-1" }) },
+    harness.dependencies,
+  );
+
+  assert.equal(response.status, 409);
+  assert.equal(harness.updates.length, 1);
 });
 
 test("every review status returns 404 for a nonexistent scenario", async () => {

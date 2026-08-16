@@ -1,4 +1,4 @@
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { getDb } from "@/db";
 import { scenarios } from "@/db/schema";
 import { handleReviewRequest } from "@/lib/server/scenario-review-route";
@@ -12,8 +12,14 @@ export async function POST(request: Request, context: { params: Promise<{ id: st
       .from(scenarios)
       .where(eq(scenarios.id, id))
       .get(),
-    updateScenario: async (id, values) => {
-      await getDb().update(scenarios).set(values).where(eq(scenarios.id, id)).run();
+    updateScenario: async (id, expectedContentJson, values) => {
+      const updated = await getDb()
+        .update(scenarios)
+        .set(values)
+        .where(and(eq(scenarios.id, id), eq(scenarios.contentJson, expectedContentJson)))
+        .returning({ id: scenarios.id })
+        .get();
+      return updated !== undefined;
     },
   });
 }

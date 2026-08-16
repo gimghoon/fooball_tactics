@@ -94,7 +94,7 @@ export type ScenarioContent = {
 };
 
 export type PublicScenarioContent = Pick<ScenarioContent, "defenseType" | "actorId" | "allowedActions" | "pitch"> & {
-  passInputMode: "player" | "destination";
+  passInputMode: "player" | "destination" | "both";
   setupTimeline: ScenarioTimeline;
 };
 
@@ -119,6 +119,11 @@ export type PublicTrainingScenarioSource = {
   pitchJson: string;
   answerJson: string;
   contentJson: string;
+  reviewedContentJson: string | null;
+  sourceTitle: string | null;
+  sourceUrl: string | null;
+  reviewerName: string | null;
+  reviewedAt: Date | null;
   orderIndex: number;
 };
 
@@ -133,7 +138,17 @@ type LegacyPassScenario = {
 
 type ScenarioContentSource = LegacyPassScenario & {
   contentJson: string;
+  reviewedContentJson: string | null;
+  sourceTitle: string | null;
+  sourceUrl: string | null;
+  reviewerName: string | null;
+  reviewedAt: Date | null;
 };
+
+export type ScenarioReviewAuditSource = Pick<
+  ScenarioContentSource,
+  "contentJson" | "reviewedContentJson" | "sourceTitle" | "sourceUrl" | "reviewerName" | "reviewedAt"
+>;
 
 const ACTION_TYPES: readonly ActionType[] = ["pass", "dribble", "move"];
 const DEFENSE_TYPES: readonly DefenseType[] = [
@@ -521,14 +536,20 @@ export function adaptLegacyPassScenario({ pitchJson, answerJson }: LegacyPassSce
 }
 
 export function toPublicScenarioContent(content: ScenarioContent | LegacyPassScenarioContent): PublicScenarioProjection {
-  const passAction = [content.answer.preferred, ...content.answer.alternatives]
-    .find((action) => action.actionType === "pass");
+  const passTargetKinds = new Set(
+    [content.answer.preferred, ...content.answer.alternatives]
+      .filter((action) => action.actionType === "pass")
+      .map((action) => action.target.kind),
+  );
+  const passInputMode = passTargetKinds.size > 1
+    ? "both"
+    : passTargetKinds.has("player") ? "player" : "destination";
   return {
     defenseType: content.defenseType,
     actorId: content.actorId,
     allowedActions: content.allowedActions,
     pitch: content.pitch,
-    passInputMode: passAction?.target.kind === "player" ? "player" : "destination",
+    passInputMode,
     setupTimeline: {
       durationMs: content.timeline.decisionAtMs,
       decisionAtMs: content.timeline.decisionAtMs,
@@ -541,8 +562,18 @@ export function serializePublicScenarioContent(source: ScenarioContentSource): s
   if (source.contentJson === "") {
     return JSON.stringify(toPublicScenarioContent(adaptLegacyPassScenario(source)));
   }
+  if (!hasCurrentScenarioReviewAudit(source)) return null;
   if (!isScenarioPublishable(source.contentJson)) return null;
   return JSON.stringify(toPublicScenarioContent(parseScenarioContent(source.contentJson)));
+}
+
+export function hasCurrentScenarioReviewAudit(source: ScenarioReviewAuditSource): boolean {
+  return source.contentJson !== ""
+    && source.reviewedContentJson === source.contentJson
+    && Boolean(source.sourceTitle?.trim())
+    && Boolean(source.sourceUrl?.trim())
+    && Boolean(source.reviewerName?.trim())
+    && source.reviewedAt !== null;
 }
 
 export function serializePublicTrainingScenario(source: PublicTrainingScenarioSource): PublicTrainingScenario | null {

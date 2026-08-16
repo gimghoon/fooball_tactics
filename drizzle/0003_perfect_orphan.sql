@@ -1,0 +1,1 @@
+ALTER TABLE `scenarios` ADD `reviewed_content_json` text;

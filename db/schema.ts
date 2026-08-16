@@ -14,6 +14,7 @@ export const scenarios = sqliteTable("scenarios", {
   pitchJson: text("pitch_json").notNull(), answerJson: text("answer_json").notNull(), contentJson: text("content_json").notNull().default(""),
   reviewStatus: text("review_status", { enum: ["draft", "pending", "reviewed"] }).notNull().default("pending"),
   sourceTitle: text("source_title"), sourceUrl: text("source_url"), reviewerName: text("reviewer_name"), reviewedAt: integer("reviewed_at", { mode: "timestamp_ms" }),
+  reviewedContentJson: text("reviewed_content_json"),
   orderIndex: integer("order_index").notNull(),
 }, (table) => [index("idx_scenarios_campaign_order").on(table.campaignId, table.orderIndex)]);
 
