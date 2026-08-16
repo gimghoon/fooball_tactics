@@ -284,12 +284,26 @@ class FakeD1 {
   prepare(sql: string): FakeD1Statement {
     return new FakeD1Statement(sql, this);
   }
+
+  async findExisting(bundleId: string, contentHash: string): Promise<SourceRow | null> {
+    return this.rows.find((row) => row.bundleId === bundleId && row.contentHash === contentHash) ?? null;
+  }
+
+  async register(source: SourceRow): Promise<SourceRow> {
+    if (this.nextUniqueConflict !== null) {
+      this.rows.push(this.nextUniqueConflict);
+      this.nextUniqueConflict = null;
+      throw new Error("UNIQUE constraint failed: evidence_sources.bundle_id, evidence_sources.content_hash");
+    }
+    this.rows.push(source);
+    return source;
+  }
 }
 
 test("persists one opaque original and extracted pair, then reuses a duplicate source", async () => {
   const bucket = new FakeR2();
   const database = new FakeD1();
-  const store = new EvidenceFileStore({ bucket, database });
+  const store = new EvidenceFileStore({ bucket, registration: database });
   const input = {
     bundleId: "bundle-1",
     name: "coach-secret-notes.md",
@@ -316,7 +330,7 @@ test("persists one opaque original and extracted pair, then reuses a duplicate s
 
 test("reconciles both R2 keys after a one-sided pair deletion failure", async () => {
   const bucket = new FakeR2();
-  const store = new EvidenceFileStore({ bucket, database: new FakeD1() });
+  const store = new EvidenceFileStore({ bucket, registration: new FakeD1() });
   bucket.objects.set("original", "original");
   bucket.objects.set("extracted", "extracted");
   bucket.deleteFailures.set("original", 1);
@@ -329,7 +343,7 @@ test("reconciles both R2 keys after a one-sided pair deletion failure", async ()
 
 test("restores the pair when one R2 deletion fails permanently", async () => {
   const bucket = new FakeR2();
-  const store = new EvidenceFileStore({ bucket, database: new FakeD1() });
+  const store = new EvidenceFileStore({ bucket, registration: new FakeD1() });
   bucket.objects.set("original", "original");
   bucket.objects.set("extracted", "extracted");
   bucket.deleteFailures.set("original", 3);
@@ -339,9 +353,23 @@ test("restores the pair when one R2 deletion fails permanently", async () => {
   assert.equal(await store.getFile("extracted"), "extracted");
 });
 
+test("restores both R2 objects when the later authoritative mutation fails", async () => {
+  const bucket = new FakeR2();
+  const store = new EvidenceFileStore({ bucket, registration: new FakeD1() });
+  bucket.objects.set("original", "original");
+  bucket.objects.set("extracted", "extracted");
+
+  await assert.rejects(
+    () => store.deleteFilePairWithCompensation("original", "extracted", async () => { throw new Error("late D1 failure"); }),
+    /late D1 failure/,
+  );
+  assert.equal(await store.getFile("original"), "original");
+  assert.equal(await store.getFile("extracted"), "extracted");
+});
+
 test("bounds Cloudflare R2 stream snapshots before attempting pair deletion", async () => {
   const bucket = new FakeR2();
-  const store = new EvidenceFileStore({ bucket, database: new FakeD1() });
+  const store = new EvidenceFileStore({ bucket, registration: new FakeD1() });
   const chunk = new Uint8Array(1024 * 1024);
   let chunks = 0;
   bucket.objects.set("original", {
@@ -386,7 +414,7 @@ test("cleans up loser objects and returns the D1 winner after a unique-content r
   };
   database.nextUniqueConflict = winner;
 
-  const result = await new EvidenceFileStore({ bucket, database }).putValidatedFile(input);
+  const result = await new EvidenceFileStore({ bucket, registration: database }).putValidatedFile(input);
 
   assert.equal(result.id, "winner");
   assert.equal(bucket.objects.size, 0);
@@ -395,7 +423,7 @@ test("cleans up loser objects and returns the D1 winner after a unique-content r
 
 test("preserves a scanned PDF and marks extraction as failed without OCR", async () => {
   const bucket = new FakeR2();
-  const store = new EvidenceFileStore({ bucket, database: new FakeD1() });
+  const store = new EvidenceFileStore({ bucket, registration: new FakeD1() });
 
   const source = await store.putValidatedFile({
     bundleId: "bundle-1",
