@@ -73,7 +73,11 @@ export type EvidenceD1Database = {
   prepare(query: string): EvidenceD1Statement;
 };
 
-type EvidenceSourceRow = StoredEvidenceFile;
+/** Service-owned registration keeps a new source in the same version/audit mutation. */
+export type EvidenceSourceRegistrationPort = {
+  findExisting(bundleId: string, contentHash: string): Promise<StoredEvidenceFile | null>;
+  register(source: StoredEvidenceFile): Promise<StoredEvidenceFile>;
+};
 
 function isEvidenceR2Body(value: unknown): value is EvidenceR2Body {
   return typeof value === "object" && value !== null && "body" in value;
@@ -189,25 +193,16 @@ export async function validateEvidenceFile(input: EvidenceFileInput): Promise<Va
   return { ...file, sha256, bytes: input.bytes };
 }
 
-function sourceFromRow(row: EvidenceSourceRow): StoredEvidenceFile {
-  return {
-    ...row,
-    mediaType: row.mediaType as EvidenceMediaType,
-    extractedTextKey: row.extractedTextKey ?? null,
-    extractionError: row.extractionError ?? null,
-  };
-}
-
 function opaqueStorageKey(bundleId: string, sourceId: string, sha256: string): string {
   return `bundles/${bundleId}/${sourceId}/${crypto.randomUUID()}-${sha256}`;
 }
 
 export class EvidenceFileStore {
-  constructor(private readonly dependencies: { bucket: EvidenceR2Bucket; database: EvidenceD1Database }) {}
+  constructor(private readonly dependencies: { bucket: EvidenceR2Bucket; registration: EvidenceSourceRegistrationPort }) {}
 
   async putValidatedFile(input: EvidenceFileInput & { bundleId: string }): Promise<StoredEvidenceFile> {
     const file = await validateEvidenceFile(input);
-    const existing = await this.findByBundleAndHash(input.bundleId, file.sha256);
+    const existing = await this.dependencies.registration.findExisting(input.bundleId, file.sha256);
     if (existing !== null) return existing;
 
     const id = crypto.randomUUID();
@@ -244,11 +239,10 @@ export class EvidenceFileStore {
       extractionError,
     };
     try {
-      await this.insert(source);
-      return source;
+      return await this.dependencies.registration.register(source);
     } catch (error) {
       await this.deleteFilePair(storageKey, extractedTextKey);
-      const winner = await this.findByBundleAndHash(input.bundleId, file.sha256);
+      const winner = await this.dependencies.registration.findExisting(input.bundleId, file.sha256);
       if (winner !== null) return winner;
       throw error;
     }
@@ -272,6 +266,21 @@ export class EvidenceFileStore {
     ));
     const restoreErrors = restoration.flatMap((result) => result.status === "rejected" ? [result.reason] : []);
     throw new AggregateError([...errors, ...restoreErrors], "근거 파일 쌍을 모두 삭제하지 못했습니다.");
+  }
+
+  /** Restores the exact R2 pair when the following authoritative D1 mutation rejects. */
+  async deleteFilePairWithCompensation<T>(originalKey: string, extractedKey: string | null, mutation: () => Promise<T>): Promise<T> {
+    const keys = [originalKey, ...(extractedKey === null ? [] : [extractedKey])];
+    const snapshots = await Promise.all(keys.map((key) => this.snapshotFile(key)));
+    await this.deleteFilePair(originalKey, extractedKey);
+    try {
+      return await mutation();
+    } catch (error) {
+      const restored = await Promise.allSettled(snapshots.map((snapshot, index) => snapshot === null ? undefined : this.dependencies.bucket.put(keys[index]!, snapshot)));
+      const restoreErrors = restored.flatMap((result) => result.status === "rejected" ? [result.reason] : []);
+      if (restoreErrors.length) throw new AggregateError([error, ...restoreErrors], "근거 삭제를 복구하지 못했습니다.");
+      throw error;
+    }
   }
 
   private async snapshotFile(key: string): Promise<Uint8Array | string | null> {
@@ -308,27 +317,4 @@ export class EvidenceFileStore {
     return snapshot;
   }
 
-  private async findByBundleAndHash(bundleId: string, contentHash: string): Promise<StoredEvidenceFile | null> {
-    const row = await this.dependencies.database.prepare(`
-      SELECT id, bundle_id AS bundleId, original_file_name AS originalFileName,
-        media_type AS mediaType, byte_size AS byteSize, content_hash AS contentHash,
-        storage_key AS storageKey, extracted_text_key AS extractedTextKey,
-        extraction_status AS extractionStatus, extraction_error AS extractionError
-      FROM evidence_sources WHERE bundle_id = ? AND content_hash = ? LIMIT 1
-    `).bind(bundleId, contentHash).first<EvidenceSourceRow>();
-    return row === null ? null : sourceFromRow(row);
-  }
-
-  private async insert(source: StoredEvidenceFile): Promise<void> {
-    await this.dependencies.database.prepare(`
-      INSERT INTO evidence_sources (
-        id, bundle_id, original_file_name, media_type, byte_size, content_hash,
-        storage_key, extracted_text_key, extraction_status, extraction_error, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).bind(
-      source.id, source.bundleId, source.originalFileName, source.mediaType, source.byteSize,
-      source.contentHash, source.storageKey, source.extractedTextKey, source.extractionStatus,
-      source.extractionError, Date.now(), Date.now(),
-    ).run();
-  }
 }

@@ -12,6 +12,7 @@ CREATE TABLE `evidence_analysis_jobs` (
 	`error_message` text,
 	`started_at` integer,
 	`completed_at` integer,
+	`is_stale` integer DEFAULT false NOT NULL,
 	`created_at` integer NOT NULL,
 	`updated_at` integer NOT NULL,
 	FOREIGN KEY (`bundle_id`) REFERENCES `evidence_bundles`(`id`) ON UPDATE no action ON DELETE cascade,

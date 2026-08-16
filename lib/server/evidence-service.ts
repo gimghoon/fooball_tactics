@@ -1,238 +1,43 @@
-import {
-  computeEvidenceVersion,
-  parseBundleInput,
-  parseVideoClip,
-  type EvidenceBundleInput,
-  type VideoClipInput,
-} from "../domain/evidence.ts";
+import { computeEvidenceVersion, parseBundleInput, parseVideoClip, type EvidenceBundleInput, type VideoClipInput } from "../domain/evidence.ts";
 import type { EvidenceAdmin } from "./evidence-auth.ts";
 import type { EvidenceFileStore, StoredEvidenceFile } from "./evidence-storage.ts";
 
-export type EvidenceAnalysisSettings = {
-  analyzerModel: string;
-  promptVersion: string;
-  schemaVersion: string;
-};
-
-export type EvidenceBundleRecord = EvidenceBundleInput & {
-  id: string;
-  version: number;
-  contentVersion: string;
-  createdAt: number;
-  updatedAt: number;
-};
-
-export type EvidenceVideoClipRecord = VideoClipInput & {
-  id: string;
-  bundleId: string;
-  createdAt: number;
-  updatedAt: number;
-};
-
-export type EvidenceAuditEventInput = {
-  bundleId: string;
-  actorUserId: string;
-  action: string;
-  targetType: string;
-  targetId: string;
-  detailsJson: string;
-  createdAt: number;
-};
-
-export type EvidenceDeleteImpact = {
-  sourceId: string;
-  cardIds: string[];
-  scenarioDraftIds: string[];
-};
-
-/**
- * A transaction boundary intentionally kept above D1. Production adapters must
- * make this callback atomic (D1 batch/transaction); the narrow seam lets tests
- * observe rollback, staleness, and audit writes without parsing SQL.
- */
-export type EvidenceServiceTransaction = {
-  getBundle(id: string): Promise<EvidenceBundleRecord | null>;
-  listBundles(): Promise<EvidenceBundleRecord[]>;
-  listSources(bundleId: string): Promise<StoredEvidenceFile[]>;
-  findSource(sourceId: string): Promise<StoredEvidenceFile | null>;
-  listVideoClips(bundleId: string): Promise<EvidenceVideoClipRecord[]>;
-  createBundle(bundle: EvidenceBundleRecord): Promise<void>;
-  updateBundle(bundle: EvidenceBundleRecord): Promise<void>;
-  addVideoClip(clip: EvidenceVideoClipRecord): Promise<void>;
-  removeSource(sourceId: string): Promise<void>;
-  /** Marks jobs/cards from prior content versions stale and revokes approval eligibility. */
-  invalidateBundle(bundleId: string): Promise<void>;
-  recordAudit(event: EvidenceAuditEventInput): Promise<void>;
-  describeDeleteImpact(sourceId: string): Promise<EvidenceDeleteImpact>;
-};
-
-export type EvidenceServiceRepository = EvidenceServiceTransaction & {
-  transaction<T>(work: (transaction: EvidenceServiceTransaction) => Promise<T>): Promise<T>;
-};
-
-export type EvidenceBundleDetail = EvidenceBundleRecord & {
-  sources: StoredEvidenceFile[];
-  videoClips: EvidenceVideoClipRecord[];
-};
-
-export type EvidenceBundleUpdate = Partial<EvidenceBundleInput>;
-
+export type EvidenceAnalysisSettings={analyzerModel:string;promptVersion:string;schemaVersion:string};
+export type EvidenceBundleRecord=EvidenceBundleInput&{id:string;version:number;contentVersion:string;createdAt:number;updatedAt:number};
+export type EvidenceVideoClipRecord=VideoClipInput&{id:string;bundleId:string;createdAt:number;updatedAt:number};
+export type EvidenceAuditEventInput={id:string;bundleId:string;actorUserId:string;action:string;targetType:string;targetId:string;detailsJson:string;createdAt:number};
+export type EvidenceDeleteImpact={sourceId:string;cardIds:string[];scenarioDraftIds:string[]};
+export type EvidenceBundleDetail=EvidenceBundleRecord&{sources:StoredEvidenceFile[];videoClips:EvidenceVideoClipRecord[]};
+export type EvidenceBundleUpdate=Partial<EvidenceBundleInput>;
+export class EvidenceConflictError extends Error { readonly status=409; constructor(){super("근거 묶음이 다른 변경으로 갱신되었습니다. 다시 시도해 주세요.");} }
+export type EvidenceMutation={current:EvidenceBundleRecord;next:EvidenceBundleRecord;audit:EvidenceAuditEventInput;sourceToInsert?:StoredEvidenceFile;sourceToDelete?:string;clipToInsert?:EvidenceVideoClipRecord};
+export type EvidenceD1Statement={bind(...values:unknown[]):EvidenceD1Statement;first<T>():Promise<T|null>;all<T>():Promise<{results:T[]}>;run():Promise<{meta?:{changes?:number}}>};
+export type EvidenceD1Database={prepare(query:string):EvidenceD1Statement;batch(statements:EvidenceD1Statement[]):Promise<{meta?:{changes?:number}}[]>};
+export type EvidenceServiceRepository={getBundle(id:string):Promise<EvidenceBundleRecord|null>;listBundles():Promise<EvidenceBundleRecord[]>;listSources(bundleId:string):Promise<StoredEvidenceFile[]>;findSource(sourceId:string):Promise<StoredEvidenceFile|null>;listVideoClips(bundleId:string):Promise<EvidenceVideoClipRecord[]>;findSourceByHash(bundleId:string,hash:string):Promise<StoredEvidenceFile|null>;describeDeleteImpact(sourceId:string):Promise<EvidenceDeleteImpact>;createBundle(bundle:EvidenceBundleRecord,audit:EvidenceAuditEventInput):Promise<void>;applyMutation(mutation:EvidenceMutation):Promise<boolean>};
+const guard="EXISTS (SELECT 1 FROM evidence_bundles WHERE id=? AND version=? AND content_version=?)";
+/** Production D1 adapter: every dependent write shares an optimistic-CAS guard in one atomic batch. */
+export class D1EvidenceServiceRepository implements EvidenceServiceRepository {
+  constructor(private readonly db:EvidenceD1Database){}
+  async getBundle(id:string){return this.db.prepare("SELECT id,title,purpose,version,content_version AS contentVersion,created_at AS createdAt,updated_at AS updatedAt FROM evidence_bundles WHERE id=?").bind(id).first<EvidenceBundleRecord>()}
+  async listBundles(){return (await this.db.prepare("SELECT id,title,purpose,version,content_version AS contentVersion,created_at AS createdAt,updated_at AS updatedAt FROM evidence_bundles ORDER BY updated_at DESC").all<EvidenceBundleRecord>()).results}
+  async listSources(bundleId:string){return (await this.db.prepare("SELECT id,bundle_id AS bundleId,original_file_name AS originalFileName,media_type AS mediaType,byte_size AS byteSize,content_hash AS contentHash,storage_key AS storageKey,extracted_text_key AS extractedTextKey,extraction_status AS extractionStatus,extraction_error AS extractionError FROM evidence_sources WHERE bundle_id=?").bind(bundleId).all<StoredEvidenceFile>()).results}
+  async findSource(id:string){return this.db.prepare("SELECT id,bundle_id AS bundleId,original_file_name AS originalFileName,media_type AS mediaType,byte_size AS byteSize,content_hash AS contentHash,storage_key AS storageKey,extracted_text_key AS extractedTextKey,extraction_status AS extractionStatus,extraction_error AS extractionError FROM evidence_sources WHERE id=?").bind(id).first<StoredEvidenceFile>()}
+  async listVideoClips(bundleId:string){return (await this.db.prepare("SELECT id,bundle_id AS bundleId,url,start_ms AS startMs,end_ms AS endMs,observation,created_at AS createdAt,updated_at AS updatedAt FROM evidence_video_clips WHERE bundle_id=?").bind(bundleId).all<EvidenceVideoClipRecord>()).results}
+  async findSourceByHash(bundleId:string,hash:string){return this.db.prepare("SELECT id,bundle_id AS bundleId,original_file_name AS originalFileName,media_type AS mediaType,byte_size AS byteSize,content_hash AS contentHash,storage_key AS storageKey,extracted_text_key AS extractedTextKey,extraction_status AS extractionStatus,extraction_error AS extractionError FROM evidence_sources WHERE bundle_id=? AND content_hash=?").bind(bundleId,hash).first<StoredEvidenceFile>()}
+  async describeDeleteImpact(sourceId:string){const [cards,scenarios]=await Promise.all([this.db.prepare("SELECT DISTINCT c.id FROM tactic_cards c JOIN tactic_card_citations x ON x.card_id=c.id JOIN evidence_chunks h ON h.id=x.chunk_id WHERE h.source_id=?").bind(sourceId).all<{id:string}>(),this.db.prepare("SELECT id FROM scenarios WHERE review_status='draft' AND content_json LIKE '%' || ? || '%'").bind(sourceId).all<{id:string}>()]);return{sourceId,cardIds:cards.results.map(x=>x.id),scenarioDraftIds:scenarios.results.map(x=>x.id)}}
+  async createBundle(b:EvidenceBundleRecord,a:EvidenceAuditEventInput){await this.db.batch([this.db.prepare("INSERT INTO evidence_bundles (id,title,purpose,version,content_version,created_at,updated_at) VALUES (?,?,?,?,?,?,?)").bind(b.id,b.title,b.purpose,b.version,b.contentVersion,b.createdAt,b.updatedAt),this.audit(a,"EXISTS (SELECT 1 FROM evidence_bundles WHERE id=?)",[b.id])])}
+  async applyMutation(m:EvidenceMutation){const c=m.current,n=m.next,cas=[c.id,c.version,c.contentVersion];const ss=[this.db.prepare("UPDATE evidence_bundles SET title=?,purpose=?,version=?,content_version=?,updated_at=? WHERE id=? AND version=? AND content_version=?").bind(n.title,n.purpose,n.version,n.contentVersion,n.updatedAt,...cas)];if(m.sourceToInsert){const s=m.sourceToInsert;ss.push(this.db.prepare(`INSERT INTO evidence_sources (id,bundle_id,original_file_name,media_type,byte_size,content_hash,storage_key,extracted_text_key,extraction_status,extraction_error,created_at,updated_at) SELECT ?,?,?,?,?,?,?,?,?,?,?,? WHERE ${guard}`).bind(s.id,s.bundleId,s.originalFileName,s.mediaType,s.byteSize,s.contentHash,s.storageKey,s.extractedTextKey,s.extractionStatus,s.extractionError,n.updatedAt,n.updatedAt,...cas));}if(m.sourceToDelete)ss.push(this.db.prepare(`DELETE FROM evidence_sources WHERE id=? AND ${guard}`).bind(m.sourceToDelete,...cas));if(m.clipToInsert){const x=m.clipToInsert;ss.push(this.db.prepare(`INSERT INTO evidence_video_clips (id,bundle_id,url,start_ms,end_ms,observation,created_at,updated_at) SELECT ?,?,?,?,?,?,?,? WHERE ${guard}`).bind(x.id,x.bundleId,x.url,x.startMs,x.endMs,x.observation,x.createdAt,x.updatedAt,...cas));}ss.push(this.db.prepare(`UPDATE evidence_analysis_jobs SET is_stale=1,status=CASE WHEN status IN ('queued','running','review_ready') THEN 'failed' ELSE status END,error_message=CASE WHEN status IN ('queued','running','review_ready') THEN 'evidence version superseded' ELSE error_message END,updated_at=? WHERE bundle_id=? AND input_version<>? AND ${guard}`).bind(n.updatedAt,c.id,n.contentVersion,...cas),this.db.prepare(`UPDATE tactic_cards SET is_stale=1,status=CASE WHEN status IN ('analysis_draft','owner_reviewed','coach_reviewed') THEN 'held' ELSE status END,updated_at=? WHERE bundle_id=? AND bundle_version<>? AND ${guard}`).bind(n.updatedAt,c.id,n.contentVersion,...cas),this.audit(m.audit,guard,cas));return ((await this.db.batch(ss))[0]?.meta?.changes??0)===1}
+  private audit(a:EvidenceAuditEventInput,w:string,v:unknown[]){return this.db.prepare(`INSERT INTO evidence_audit_events (id,bundle_id,actor_user_id,action,target_type,target_id,details_json,created_at) SELECT ?,?,?,?,?,?,?,? WHERE ${w}`).bind(a.id,a.bundleId,a.actorUserId,a.action,a.targetType,a.targetId,a.detailsJson,a.createdAt,...v)}
+}
 export class EvidenceService {
-  constructor(private readonly dependencies: {
-    repository: EvidenceServiceRepository;
-    settings: EvidenceAnalysisSettings;
-    fileStore?: Pick<EvidenceFileStore, "deleteFilePair">;
-    now?: () => number;
-    newId?: () => string;
-  }) {}
-
-  async createBundle(input: unknown, admin: EvidenceAdmin): Promise<EvidenceBundleRecord> {
-    const parsed = parseBundleInput(input);
-    return this.dependencies.repository.transaction(async (transaction) => {
-      const now = this.now();
-      const bundle: EvidenceBundleRecord = {
-        id: this.newId(),
-        ...parsed,
-        version: 1,
-        contentVersion: await this.contentVersion([], []),
-        createdAt: now,
-        updatedAt: now,
-      };
-      await transaction.createBundle(bundle);
-      await transaction.recordAudit(this.audit(bundle.id, admin, "bundle.created", "bundle", bundle.id, { title: bundle.title, purpose: bundle.purpose }, now));
-      return bundle;
-    });
-  }
-
-  async updateBundle(id: string, update: EvidenceBundleUpdate, admin: EvidenceAdmin): Promise<EvidenceBundleRecord> {
-    return this.dependencies.repository.transaction(async (transaction) => {
-      const current = await this.requiredBundle(transaction, id);
-      const nextInput = parseBundleInput({ title: update.title ?? current.title, purpose: update.purpose ?? current.purpose });
-      const contentChanged = nextInput.purpose !== current.purpose;
-      const now = this.now();
-      const updated: EvidenceBundleRecord = {
-        ...current,
-        ...nextInput,
-        version: contentChanged ? current.version + 1 : current.version,
-        contentVersion: contentChanged
-          ? await this.versionForBundle(transaction, id)
-          : current.contentVersion,
-        updatedAt: now,
-      };
-      await transaction.updateBundle(updated);
-      if (contentChanged) await transaction.invalidateBundle(id);
-      await transaction.recordAudit(this.audit(id, admin, "bundle.updated", "bundle", id, {
-        contentChanged,
-        title: updated.title,
-        purpose: updated.purpose,
-      }, now));
-      return updated;
-    });
-  }
-
-  async addVideoClip(bundleId: string, input: unknown, admin: EvidenceAdmin): Promise<EvidenceBundleRecord> {
-    const parsed = parseVideoClip(input);
-    return this.dependencies.repository.transaction(async (transaction) => {
-      const bundle = await this.requiredBundle(transaction, bundleId);
-      const now = this.now();
-      const clip: EvidenceVideoClipRecord = { id: this.newId(), bundleId, ...parsed, createdAt: now, updatedAt: now };
-      const sources = await transaction.listSources(bundleId);
-      const clips = await transaction.listVideoClips(bundleId);
-      const updated: EvidenceBundleRecord = {
-        ...bundle,
-        version: bundle.version + 1,
-        contentVersion: await this.contentVersion(sources, [...clips, clip]),
-        updatedAt: now,
-      };
-      await transaction.addVideoClip(clip);
-      await transaction.updateBundle(updated);
-      await transaction.invalidateBundle(bundleId);
-      await transaction.recordAudit(this.audit(bundleId, admin, "video_clip.added", "video_clip", clip.id, {
-        url: clip.url, startMs: clip.startMs, endMs: clip.endMs, observation: clip.observation,
-      }, now));
-      return updated;
-    });
-  }
-
-  async describeDeleteImpact(sourceId: string): Promise<EvidenceDeleteImpact> {
-    return this.dependencies.repository.describeDeleteImpact(sourceId);
-  }
-
-  async removeSource(sourceId: string, admin: EvidenceAdmin): Promise<EvidenceBundleRecord> {
-    const impact = await this.describeDeleteImpact(sourceId);
-    this.assertUnlinked(impact);
-    const source = await this.dependencies.repository.findSource(sourceId);
-    if (source === null) throw new Error("근거 파일을 찾을 수 없습니다.");
-    if (!this.dependencies.fileStore) throw new Error("근거 파일 저장소가 구성되지 않았습니다.");
-
-    // `deleteFilePair` compensates either key on failure. Do not mutate D1 until
-    // it resolves, otherwise callers could receive a successful D1 deletion
-    // while recoverable R2 deletion failed.
-    await this.dependencies.fileStore.deleteFilePair(source.storageKey, source.extractedTextKey);
-
-    return this.dependencies.repository.transaction(async (transaction) => {
-      const currentSource = await transaction.findSource(sourceId);
-      if (currentSource === null) throw new Error("근거 파일을 찾을 수 없습니다.");
-      this.assertUnlinked(await transaction.describeDeleteImpact(sourceId));
-      const bundle = await this.requiredBundle(transaction, currentSource.bundleId);
-      const now = this.now();
-      await transaction.removeSource(sourceId);
-      const updated: EvidenceBundleRecord = {
-        ...bundle,
-        version: bundle.version + 1,
-        contentVersion: await this.versionForBundle(transaction, bundle.id),
-        updatedAt: now,
-      };
-      await transaction.updateBundle(updated);
-      await transaction.invalidateBundle(bundle.id);
-      await transaction.recordAudit(this.audit(bundle.id, admin, "source.removed", "source", sourceId, {
-        originalFileName: currentSource.originalFileName,
-      }, now));
-      return updated;
-    });
-  }
-
-  async getBundleForAdmin(id: string, admin: EvidenceAdmin): Promise<EvidenceBundleDetail | null> {
-    void admin;
-    const bundle = await this.dependencies.repository.getBundle(id);
-    if (bundle === null) return null;
-    const [sources, videoClips] = await Promise.all([
-      this.dependencies.repository.listSources(id),
-      this.dependencies.repository.listVideoClips(id),
-    ]);
-    return { ...bundle, sources, videoClips };
-  }
-
-  async listBundlesForAdmin(admin: EvidenceAdmin): Promise<EvidenceBundleRecord[]> {
-    void admin;
-    return this.dependencies.repository.listBundles();
-  }
-
-  private async versionForBundle(transaction: EvidenceServiceTransaction, bundleId: string): Promise<string> {
-    const [sources, clips] = await Promise.all([transaction.listSources(bundleId), transaction.listVideoClips(bundleId)]);
-    return this.contentVersion(sources, clips);
-  }
-
-  private contentVersion(sources: Pick<StoredEvidenceFile, "contentHash">[], clips: VideoClipInput[]): Promise<string> {
-    return computeEvidenceVersion({ sourceHashes: sources.map((source) => source.contentHash), clips, ...this.dependencies.settings });
-  }
-
-  private async requiredBundle(transaction: EvidenceServiceTransaction, id: string): Promise<EvidenceBundleRecord> {
-    const bundle = await transaction.getBundle(id);
-    if (bundle === null) throw new Error("근거 묶음을 찾을 수 없습니다.");
-    return bundle;
-  }
-
-  private assertUnlinked(impact: EvidenceDeleteImpact): void {
-    if (impact.cardIds.length > 0 || impact.scenarioDraftIds.length > 0) {
-      throw new Error("연결된 카드 또는 시나리오 초안이 있어 근거를 삭제할 수 없습니다.");
-    }
-  }
-
-  private audit(bundleId: string, admin: EvidenceAdmin, action: string, targetType: string, targetId: string, details: object, createdAt: number): EvidenceAuditEventInput {
-    return { bundleId, actorUserId: admin.userId, action, targetType, targetId, detailsJson: JSON.stringify(details), createdAt };
-  }
-
-  private now(): number { return this.dependencies.now?.() ?? Date.now(); }
-  private newId(): string { return this.dependencies.newId?.() ?? crypto.randomUUID(); }
+  constructor(private readonly d:{repository:EvidenceServiceRepository;settings:EvidenceAnalysisSettings;fileStore?:Pick<EvidenceFileStore,"deleteFilePairWithCompensation">;now?:()=>number;newId?:()=>string}){}
+  async createBundle(input:unknown,admin:EvidenceAdmin){const x=parseBundleInput(input),now=this.now(),b:EvidenceBundleRecord={id:this.id(),...x,version:1,contentVersion:await this.hash(x.purpose,[],[]),createdAt:now,updatedAt:now};await this.d.repository.createBundle(b,this.audit(b,admin,"bundle.created","bundle",b.id,x,now));return b}
+  async updateBundle(id:string,u:EvidenceBundleUpdate,a:EvidenceAdmin){const c=await this.need(id),x=parseBundleInput({title:u.title??c.title,purpose:u.purpose??c.purpose}),changed=x.purpose!==c.purpose,n={...c,...x,version:changed?c.version+1:c.version,contentVersion:changed?await this.hash(x.purpose,await this.d.repository.listSources(id),await this.d.repository.listVideoClips(id)):c.contentVersion,updatedAt:this.now()};await this.commit({current:c,next:n,audit:this.audit(n,a,"bundle.updated","bundle",id,{contentChanged:changed},n.updatedAt)});return n}
+  async addVideoClip(id:string,input:unknown,a:EvidenceAdmin){const c=await this.need(id),now=this.now(),x:EvidenceVideoClipRecord={id:this.id(),bundleId:id,...parseVideoClip(input),createdAt:now,updatedAt:now},n={...c,version:c.version+1,contentVersion:await this.hash(c.purpose,await this.d.repository.listSources(id),[...await this.d.repository.listVideoClips(id),x]),updatedAt:now};await this.commit({current:c,next:n,clipToInsert:x,audit:this.audit(n,a,"video_clip.added","video_clip",x.id,x,now)});return n}
+  sourceRegistration(a:EvidenceAdmin){return{findExisting:(b:string,h:string)=>this.d.repository.findSourceByHash(b,h),register:(s:StoredEvidenceFile)=>this.addSource(s,a)}}
+  async addSource(s:StoredEvidenceFile,a:EvidenceAdmin){const c=await this.need(s.bundleId),now=this.now(),n={...c,version:c.version+1,contentVersion:await this.hash(c.purpose,[...await this.d.repository.listSources(c.id),s],await this.d.repository.listVideoClips(c.id)),updatedAt:now};await this.commit({current:c,next:n,sourceToInsert:s,audit:this.audit(n,a,"source.added","source",s.id,{contentHash:s.contentHash},now)});return s}
+  async describeDeleteImpact(id:string){return this.d.repository.describeDeleteImpact(id)}
+  async removeSource(id:string,a:EvidenceAdmin){const s=await this.d.repository.findSource(id);if(!s)throw new Error("근거 파일을 찾을 수 없습니다.");this.links(await this.describeDeleteImpact(id));if(!this.d.fileStore)throw new Error("근거 파일 저장소가 구성되지 않았습니다.");return this.d.fileStore.deleteFilePairWithCompensation(s.storageKey,s.extractedTextKey,async()=>{this.links(await this.describeDeleteImpact(id));const c=await this.need(s.bundleId),now=this.now(),n={...c,version:c.version+1,contentVersion:await this.hash(c.purpose,(await this.d.repository.listSources(c.id)).filter(x=>x.id!==id),await this.d.repository.listVideoClips(c.id)),updatedAt:now};await this.commit({current:c,next:n,sourceToDelete:id,audit:this.audit(n,a,"source.removed","source",id,{},now)});return n})}
+  async getBundleForAdmin(id:string,a:EvidenceAdmin):Promise<EvidenceBundleDetail|null>{void a;const b=await this.d.repository.getBundle(id);return b?{...b,sources:await this.d.repository.listSources(id),videoClips:await this.d.repository.listVideoClips(id)}:null} async listBundlesForAdmin(a:EvidenceAdmin){void a;return this.d.repository.listBundles()}
+  private async commit(m:EvidenceMutation){if(!await this.d.repository.applyMutation(m))throw new EvidenceConflictError()} private async need(id:string){const b=await this.d.repository.getBundle(id);if(!b)throw new Error("근거 묶음을 찾을 수 없습니다.");return b} private hash(p:string,s:Pick<StoredEvidenceFile,"contentHash">[],c:VideoClipInput[]){return computeEvidenceVersion({purpose:p,sourceHashes:s.map(x=>x.contentHash),clips:c,...this.d.settings})} private links(x:EvidenceDeleteImpact){if(x.cardIds.length||x.scenarioDraftIds.length)throw new Error("연결된 카드 또는 시나리오 초안이 있어 근거를 삭제할 수 없습니다.")} private audit(b:EvidenceBundleRecord,a:EvidenceAdmin,ac:string,t:string,id:string,o:object,at:number):EvidenceAuditEventInput{return{id:this.id(),bundleId:b.id,actorUserId:a.userId,action:ac,targetType:t,targetId:id,detailsJson:JSON.stringify(o),createdAt:at}}private now(){return this.d.now?.()??Date.now()}private id(){return this.d.newId?.()??crypto.randomUUID()}
 }

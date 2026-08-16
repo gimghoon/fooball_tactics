@@ -97,6 +97,7 @@ test("evidence versions are stable across source and clip ordering", async () =>
       { url: "https://x.test/a", startMs: 0, endMs: 50, observation: "첫 번째" },
     ],
     analyzerModel: "model-1",
+    purpose: "전방 압박 분석",
     promptVersion: "prompt-1",
     schemaVersion: "schema-1",
   });
@@ -107,12 +108,26 @@ test("evidence versions are stable across source and clip ordering", async () =>
       { url: "https://x.test/b", startMs: 100, endMs: 200, observation: "두 번째" },
     ],
     analyzerModel: "model-1",
+    purpose: "전방 압박 분석",
     promptVersion: "prompt-1",
     schemaVersion: "schema-1",
   });
 
   assert.match(first, /^[a-f0-9]{64}$/);
   assert.equal(first, second);
+
+  const changedPurpose = await computeEvidenceVersion({
+    sourceHashes: ["source-a", "source-b"],
+    clips: [
+      { url: "https://x.test/a", startMs: 0, endMs: 50, observation: "첫 번째" },
+      { url: "https://x.test/b", startMs: 100, endMs: 200, observation: "두 번째" },
+    ],
+    analyzerModel: "model-1",
+    purpose: "후방 빌드업 분석",
+    promptVersion: "prompt-1",
+    schemaVersion: "schema-1",
+  });
+  assert.notEqual(first, changedPurpose);
 });
 
 test("the generated migration rejects unsupported and oversized evidence inputs", () => {

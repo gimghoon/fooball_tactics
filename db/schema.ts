@@ -135,6 +135,7 @@ export const evidenceAnalysisJobs = sqliteTable("evidence_analysis_jobs", {
   errorMessage: text("error_message"),
   startedAt: integer("started_at", { mode: "timestamp_ms" }),
   completedAt: integer("completed_at", { mode: "timestamp_ms" }),
+  isStale: integer("is_stale", { mode: "boolean" }).notNull().default(false),
   createdAt: integer("created_at", { mode: "timestamp_ms" }).notNull(),
   updatedAt: integer("updated_at", { mode: "timestamp_ms" }).notNull(),
 }, (table) => [

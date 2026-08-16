@@ -34,6 +34,7 @@ export type VideoClipInput = {
 export type EvidenceVersionInput = {
   sourceHashes: string[];
   clips: VideoClipInput[];
+  purpose: string;
   analyzerModel: string;
   promptVersion: string;
   schemaVersion: string;
@@ -178,6 +179,7 @@ export async function computeEvidenceVersion(input: EvidenceVersionInput): Promi
   const canonical = JSON.stringify({
     analyzerModel: nonEmptyString(input.analyzerModel, "analyzerModel"),
     clips,
+    purpose: nonEmptyString(input.purpose, "purpose"),
     promptVersion: nonEmptyString(input.promptVersion, "promptVersion"),
     schemaVersion: nonEmptyString(input.schemaVersion, "schemaVersion"),
     sourceHashes: input.sourceHashes.map((hash, index) => nonEmptyString(hash, `sourceHashes[${index}]`)).sort(),
