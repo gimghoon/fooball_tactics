@@ -160,14 +160,20 @@ export function parseAnalyzerCards(
     ], field);
     if (!DEFENSE_TYPES.has(candidate.defenseType as TacticCardContent["defenseType"])) fail(`${field}.defenseType 수비 유형이 올바르지 않습니다.`);
     if (!CONFIDENCES.has(candidate.confidence as TacticCardContent["confidence"])) fail(`${field}.confidence 확신도가 올바르지 않습니다.`);
+    const preferred = parseActions(candidate.preferred, `${field}.preferred`, allowed);
+    const alternatives = parseActions(candidate.alternatives, `${field}.alternatives`, allowed);
+    const risky = parseActions(candidate.risky, `${field}.risky`, allowed);
+    if (preferred.length + alternatives.length + risky.length === 0) {
+      fail(`${field}에는 하나 이상의 행동이 필요합니다.`);
+    }
     return {
       situation: nonEmptyString(candidate.situation, `${field}.situation`),
       conditions: stringArray(candidate.conditions, `${field}.conditions`),
       defenseType: candidate.defenseType as TacticCardContent["defenseType"],
       cues: stringArray(candidate.cues, `${field}.cues`),
-      preferred: parseActions(candidate.preferred, `${field}.preferred`, allowed),
-      alternatives: parseActions(candidate.alternatives, `${field}.alternatives`, allowed),
-      risky: parseActions(candidate.risky, `${field}.risky`, allowed),
+      preferred,
+      alternatives,
+      risky,
       confidence: candidate.confidence as TacticCardContent["confidence"],
       uncertainties: stringArray(candidate.uncertainties, `${field}.uncertainties`),
       conflicts: stringArray(candidate.conflicts, `${field}.conflicts`),
@@ -175,9 +181,7 @@ export function parseAnalyzerCards(
       animationSuitable: booleanValue(candidate.animationSuitable, `${field}.animationSuitable`),
     };
   });
-  if (!cards.some((card) => card.preferred.length + card.alternatives.length + card.risky.length > 0)) {
-    fail("카드 결과에는 하나 이상의 행동이 필요합니다.");
-  }
+  if (cards.length === 0) fail("카드 결과에는 하나 이상의 행동이 필요합니다.");
   return cards;
 }
 

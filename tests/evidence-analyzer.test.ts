@@ -10,6 +10,11 @@ import {
 import { createConfiguredEvidenceAnalyzer } from "../lib/server/openai-evidence-analyzer.ts";
 
 const chunks: EvidenceChunkInput[] = [{ id: "chunk-1", locationLabel: "page:1", content: "수비수는 중앙을 막는다." }];
+const defaultConfig = {
+  EVIDENCE_LLM_ENDPOINT: "https://llm.example.test/v1/responses",
+  EVIDENCE_LLM_API_KEY: "key",
+  EVIDENCE_LLM_MODEL: "model",
+};
 const card = (citationIds = ["chunk-1"]) => ({
   situation: "중앙으로 공을 운반한다.",
   conditions: ["전방 압박이 없다."],
@@ -57,6 +62,9 @@ test("rejects unknown fields, enums, empty action reasons, and empty citations",
   assert.throws(() => parseAnalyzerCards(JSON.stringify([{ ...card(), preferred: [{ action: "pass", reason: "", citationIds: ["chunk-1"] }] }]), chunks), /필요/);
   assert.throws(() => parseAnalyzerCards(JSON.stringify([card([])]), chunks), /근거/);
   assert.throws(() => parseAnalyzerCards(JSON.stringify([{ ...card(), preferred: [], alternatives: [], risky: [] }]), chunks), /행동/);
+  const actionless = { ...card(), preferred: [], alternatives: [], risky: [] };
+  assert.throws(() => parseAnalyzerCards(JSON.stringify([card(), actionless]), chunks), /행동/);
+  assert.throws(() => parseAnalyzerCards(JSON.stringify([]), chunks), /행동/);
 });
 
 test("configured adapter sends a strict Responses structured-output request and returns only domain cards", async () => {
@@ -310,6 +318,14 @@ test("latches the first abort cause even when fetch rejection is delayed", async
   const callerFirstResult = callerFirst.generateCards(cardInput, callerFirstSignal.signal);
   callerFirstSignal.abort();
   await assert.rejects(() => callerFirstResult, (error: unknown) => error instanceof EvidenceAnalyzerError && !error.retryable && /취소/.test(error.message));
+
+  const callerThenTimerSignal = new AbortController();
+  const callerThenTimer = createConfiguredEvidenceAnalyzer({
+    EVIDENCE_LLM_ENDPOINT: "https://llm.example.test/v1/responses", EVIDENCE_LLM_API_KEY: "secret-key", EVIDENCE_LLM_MODEL: "model",
+  }, { fetch: delayedAbortFetch, requestTimeoutMs: 1 });
+  const callerThenTimerResult = callerThenTimer.generateCards(cardInput, callerThenTimerSignal.signal);
+  callerThenTimerSignal.abort();
+  await assert.rejects(() => callerThenTimerResult, (error: unknown) => error instanceof EvidenceAnalyzerError && !error.retryable && /취소/.test(error.message));
 });
 
 test("sanitizes response-stream failures and preserves timeout or cancellation during body reads", async () => {
@@ -341,20 +357,78 @@ test("sanitizes response-stream failures and preserves timeout or cancellation d
   const cancelledResult = cancelled.generateCards(cardInput, caller.signal);
   caller.abort();
   await assert.rejects(() => cancelledResult, (error: unknown) => error instanceof EvidenceAnalyzerError && !error.retryable && /취소/.test(error.message));
+
+  const rejectedCancel = createConfiguredEvidenceAnalyzer({
+    EVIDENCE_LLM_ENDPOINT: "https://llm.example.test/v1/responses", EVIDENCE_LLM_API_KEY: "secret-key", EVIDENCE_LLM_MODEL: "model",
+  }, { fetch: async () => new Response(new ReadableStream<Uint8Array>({
+    pull(controller) { controller.enqueue(new Uint8Array(1_000_001)); },
+    cancel() { return Promise.reject(new Error("secret-key provider raw cancel body")); },
+  })) });
+  await assert.rejects(() => rejectedCancel.generateCards(cardInput, AbortSignal.timeout(1_000)), (error: unknown) => {
+    assert.ok(error instanceof EvidenceAnalyzerError);
+    assert.equal(error.message.includes("secret-key"), false);
+    assert.equal(error.message.includes("raw cancel body"), false);
+    return true;
+  });
 });
 
-test("removes the caller abort listener after a completed request", async () => {
-  let added = 0;
-  let removed = 0;
-  const signal = {
-    aborted: false,
-    addEventListener: () => { added += 1; },
-    removeEventListener: () => { removed += 1; },
-  } as unknown as AbortSignal;
-  const analyzer = createConfiguredEvidenceAnalyzer({
-    EVIDENCE_LLM_ENDPOINT: "https://llm.example.test/v1/responses", EVIDENCE_LLM_API_KEY: "key", EVIDENCE_LLM_MODEL: "model",
-  }, { fetch: async () => completedResponse(JSON.stringify({ cards: [card()] })) });
-  await analyzer.generateCards(cardInput, signal);
-  assert.equal(added, 1);
-  assert.equal(removed, 1);
+test("removes the identical caller abort listener on success, error, and abort", async (t) => {
+  const observableSignal = () => {
+    let aborted = false;
+    let added: EventListenerOrEventListenerObject | undefined;
+    let removed: EventListenerOrEventListenerObject | undefined;
+    const signal = {
+      get aborted() { return aborted; },
+      addEventListener: (type: string, listener: EventListenerOrEventListenerObject) => {
+        assert.equal(type, "abort");
+        added = listener;
+      },
+      removeEventListener: (type: string, listener: EventListenerOrEventListenerObject) => {
+        assert.equal(type, "abort");
+        removed = listener;
+      },
+    } as unknown as AbortSignal;
+    return {
+      signal,
+      abort: () => {
+        aborted = true;
+        if (typeof added === "function") added(new Event("abort"));
+        else added?.handleEvent(new Event("abort"));
+      },
+      assertRemoved: () => assert.strictEqual(removed, added),
+    };
+  };
+  await t.test("success", async () => {
+    const probe = observableSignal();
+    const analyzer = createConfiguredEvidenceAnalyzer({ ...defaultConfig }, { fetch: async () => completedResponse(JSON.stringify({ cards: [card()] })) });
+    await analyzer.generateCards(cardInput, probe.signal);
+    probe.assertRemoved();
+  });
+  await t.test("error", async () => {
+    const probe = observableSignal();
+    const analyzer = createConfiguredEvidenceAnalyzer({ ...defaultConfig }, { fetch: async () => { throw new Error("network"); } });
+    await assert.rejects(() => analyzer.generateCards(cardInput, probe.signal), EvidenceAnalyzerError);
+    probe.assertRemoved();
+  });
+  await t.test("abort", async () => {
+    const probe = observableSignal();
+    const analyzer = createConfiguredEvidenceAnalyzer({ ...defaultConfig }, { fetch: async (_input, init) => new Promise<Response>((_resolve, reject) => {
+      init?.signal?.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
+    }) });
+    const result = analyzer.generateCards(cardInput, probe.signal);
+    probe.abort();
+    await assert.rejects(() => result, EvidenceAnalyzerError);
+    probe.assertRemoved();
+  });
+});
+
+test("adapter malformed JSON preserves a safe retryable JSON error", async () => {
+  const analyzer = createConfiguredEvidenceAnalyzer({ ...defaultConfig }, { fetch: async () => new Response("not-json secret-key provider raw body") });
+  await assert.rejects(() => analyzer.generateCards(cardInput, AbortSignal.timeout(1_000)), (error: unknown) => {
+    assert.ok(error instanceof EvidenceAnalyzerError);
+    assert.equal(error.retryable, true);
+    assert.match(error.message, /JSON/);
+    assert.equal(error.message.includes("secret-key"), false);
+    return true;
+  });
 });
