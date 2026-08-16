@@ -294,7 +294,14 @@ test("explanation tabs use stable relationships and roving arrow-key focus", asy
   const tabs = [...container.querySelectorAll<HTMLElement>('[role="tab"]')];
   assert.equal(tabs[0].id, "explanation-tab-situation");
   assert.equal(tabs[0].getAttribute("aria-controls"), "explanation-panel-situation");
-  assert.equal(container.querySelector('[role="tabpanel"]')?.getAttribute("aria-labelledby"), tabs[0].id);
+  const panels = [...container.querySelectorAll<HTMLElement>('[role="tabpanel"]')];
+  assert.equal(panels.length, 3);
+  for (const tab of tabs) {
+    const panel = container.querySelector<HTMLElement>(`#${tab.getAttribute("aria-controls")}`);
+    assert.ok(panel);
+    assert.equal(panel.getAttribute("aria-labelledby"), tab.id);
+  }
+  assert.deepEqual(panels.map((panel) => panel.hidden), [false, true, true]);
   assert.deepEqual(tabs.map((tab) => tab.tabIndex), [0, -1, -1]);
 
   tabs[0].focus();

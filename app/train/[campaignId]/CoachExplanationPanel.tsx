@@ -25,10 +25,6 @@ export function CoachExplanationPanel({ explanations, onSeek, onHighlightsChange
   const [activeStage, setActiveStage] = useState<Stage["id"]>("situation");
   const [activeExplanation, setActiveExplanation] = useState(() => initialExplanationIndex(explanations));
   const tabRefs = useRef<Array<HTMLButtonElement | null>>([]);
-  const stage = STAGES.find(({ id }) => id === activeStage) ?? STAGES[0];
-  const stageExplanations = explanations
-    .map((explanation, index) => ({ explanation, index }))
-    .filter(({ explanation }) => explanationStage(explanation.kind) === stage.label);
 
   function select(explanation: CoachExplanation, index: number) {
     setActiveExplanation(index);
@@ -76,23 +72,29 @@ export function CoachExplanationPanel({ explanations, onSeek, onHighlightsChange
           </button>
         ))}
       </div>
-      <div
-        id={`explanation-panel-${stage.id}`}
-        role="tabpanel"
-        aria-labelledby={`explanation-tab-${stage.id}`}
-        className="explanation-blocks"
-      >
-        {stageExplanations.map(({ explanation, index }) => (
-          <button
-            key={`${explanation.kind}-${explanation.fromMs}-${index}`}
-            type="button"
-            aria-pressed={activeExplanation === index}
-            onClick={() => select(explanation, index)}
-          >
-            {explanation.text}
-          </button>
-        ))}
-      </div>
+      {STAGES.map((item) => (
+        <div
+          key={item.id}
+          id={`explanation-panel-${item.id}`}
+          role="tabpanel"
+          aria-labelledby={`explanation-tab-${item.id}`}
+          className="explanation-blocks"
+          hidden={activeStage !== item.id}
+        >
+          {explanations.map((explanation, index) => (
+            explanationStage(explanation.kind) === item.label ? (
+              <button
+                key={`${explanation.kind}-${explanation.fromMs}-${index}`}
+                type="button"
+                aria-pressed={activeExplanation === index}
+                onClick={() => select(explanation, index)}
+              >
+                {explanation.text}
+              </button>
+            ) : null
+          ))}
+        </div>
+      ))}
     </section>
   );
 }
