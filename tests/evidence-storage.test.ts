@@ -46,6 +46,58 @@ function appendBytes(bytes: Uint8Array, suffix: number[]): Uint8Array {
   return result;
 }
 
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
+
+function interruptiblePdfLoader(phase: "load" | "page" | "text") {
+  const started = deferred<void>();
+  const pending = deferred<never>();
+  let destroyCalls = 0;
+  const page = {
+    getTextContent() {
+      if (phase === "text") {
+        started.resolve();
+        return pending.promise;
+      }
+      return Promise.resolve({ items: [{ str: "ready" }] });
+    },
+  };
+  const document = {
+    numPages: 1,
+    getPage() {
+      if (phase === "page") {
+        started.resolve();
+        return pending.promise;
+      }
+      return Promise.resolve(page);
+    },
+  };
+  const task = {
+    get promise() {
+      if (phase === "load") {
+        started.resolve();
+        return pending.promise;
+      }
+      return Promise.resolve(document);
+    },
+    async destroy() {
+      destroyCalls += 1;
+    },
+  };
+  return {
+    loader: { getDocument: () => task },
+    started: started.promise,
+    destroyCalls: () => destroyCalls,
+  };
+}
+
 function textPdf(text: string): Uint8Array {
   const stream = `BT /F1 12 Tf 72 720 Td (${text}) Tj ET`;
   const objects = [
@@ -91,6 +143,11 @@ test("rejects MIME, extension, signature, archive, executable, and encrypted PDF
       bytes: appendBytes(textPdf("safe"), suffix),
     }), /형식/);
   }
+  await assert.rejects(() => validateEvidenceFile({
+    name: "later-eof-polyglot.pdf",
+    type: "application/pdf",
+    bytes: appendBytes(textPdf("safe"), [0x50, 0x4b, 0x03, 0x04, 0x25, 0x25, 0x45, 0x4f, 0x46]),
+  }), /형식/);
 });
 
 test("extracts strict UTF-8 text into non-empty paragraph locators", async () => {
@@ -119,6 +176,33 @@ test("enforces page, output, and deadline bounds before accumulating evidence te
   await assert.rejects(() => extractEvidenceText("text", new TextEncoder().encode("a"), {
     abortSignal: AbortSignal.abort(),
   }), /중단/);
+});
+
+test("interrupts pending PDF.js load, page, and text promises and destroys each task", async () => {
+  for (const phase of ["load", "page", "text"] as const) {
+    const controller = new AbortController();
+    const fake = interruptiblePdfLoader(phase);
+    const extraction = extractEvidenceText("pdf", new Uint8Array(), {
+      abortSignal: controller.signal,
+      pdfLoader: fake.loader,
+    });
+    await fake.started;
+    controller.abort();
+    await assert.rejects(extraction, /중단/);
+    assert.equal(fake.destroyCalls(), 1);
+  }
+});
+
+test("times out a pending PDF.js load and destroys its task before it resolves", async () => {
+  const fake = interruptiblePdfLoader("load");
+  const extraction = extractEvidenceText("pdf", new Uint8Array(), {
+    maxExtractionMs: 0,
+    now: () => 0,
+    pdfLoader: fake.loader,
+  });
+  await fake.started;
+  await assert.rejects(extraction, /시간/);
+  assert.equal(fake.destroyCalls(), 1);
 });
 
 type SourceRow = {
@@ -241,6 +325,41 @@ test("reconciles both R2 keys after a one-sided pair deletion failure", async ()
   assert.equal(bucket.objects.size, 0);
   assert.equal(bucket.deleteAttempts.get("original"), 2);
   assert.equal(bucket.deleteAttempts.get("extracted"), 2);
+});
+
+test("restores the pair when one R2 deletion fails permanently", async () => {
+  const bucket = new FakeR2();
+  const store = new EvidenceFileStore({ bucket, database: new FakeD1() });
+  bucket.objects.set("original", "original");
+  bucket.objects.set("extracted", "extracted");
+  bucket.deleteFailures.set("original", 3);
+
+  await assert.rejects(() => store.deleteFilePair("original", "extracted"), /모두/);
+  assert.equal(await store.getFile("original"), "original");
+  assert.equal(await store.getFile("extracted"), "extracted");
+});
+
+test("bounds Cloudflare R2 stream snapshots before attempting pair deletion", async () => {
+  const bucket = new FakeR2();
+  const store = new EvidenceFileStore({ bucket, database: new FakeD1() });
+  const chunk = new Uint8Array(1024 * 1024);
+  let chunks = 0;
+  bucket.objects.set("original", {
+    body: new ReadableStream<Uint8Array>({
+      pull(controller) {
+        if (chunks >= 21) controller.close();
+        else {
+          chunks += 1;
+          controller.enqueue(chunk);
+        }
+      },
+    }),
+  });
+  bucket.objects.set("extracted", "extracted");
+
+  await assert.rejects(() => store.deleteFilePair("original", "extracted"), /복구용 파일 크기/);
+  assert.equal(bucket.deleteAttempts.size, 0);
+  assert.equal(await store.getFile("extracted"), "extracted");
 });
 
 test("cleans up loser objects and returns the D1 winner after a unique-content race", async () => {

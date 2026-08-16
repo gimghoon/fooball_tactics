@@ -60,6 +60,9 @@ export type EvidenceR2Bucket = {
   delete(key: string): Promise<unknown>;
 };
 
+export type EvidenceR2Body = { body: ReadableStream<Uint8Array> | null };
+export type EvidenceR2Value = Uint8Array | string | EvidenceR2Body;
+
 export type EvidenceD1Statement = {
   bind(...values: unknown[]): EvidenceD1Statement;
   first<T>(): Promise<T | null>;
@@ -71,6 +74,10 @@ export type EvidenceD1Database = {
 };
 
 type EvidenceSourceRow = StoredEvidenceFile;
+
+function isEvidenceR2Body(value: unknown): value is EvidenceR2Body {
+  return typeof value === "object" && value !== null && "body" in value;
+}
 
 function startsWith(bytes: Uint8Array, signature: number[]): boolean {
   return signature.every((byte, index) => bytes[index] === byte);
@@ -111,18 +118,14 @@ function hasDecodedPdfName(bytes: Uint8Array, expected: string): boolean {
 }
 
 function hasUnsafePdfTrailer(bytes: Uint8Array): boolean {
-  let eof = -1;
-  for (let index = indexOfBytes(bytes, PDF_EOF_MARKER, 0); index !== -1; index = indexOfBytes(bytes, PDF_EOF_MARKER, index + 1)) {
-    eof = index;
-  }
+  const eof = indexOfBytes(bytes, PDF_EOF_MARKER, 0);
   if (eof === -1) return false;
   const trailingBytes = bytes.subarray(eof + PDF_EOF_MARKER.length);
-  // PDF may have trailing whitespace. Only inspect the bytes after its final
-  // EOF marker, so signatures in legitimate compressed object streams do not
-  // turn a PDF into a false-positive archive/executable polyglot.
-  return [...ZIP_SIGNATURES, ...EXECUTABLE_SIGNATURES].some((signature) =>
-    indexOfBytes(trailingBytes, new Uint8Array(signature), 0) !== -1,
-  );
+  // MVP evidence uploads reject incremental PDFs: after the first PDF EOF,
+  // only whitespace is allowed. This treats any archive/executable payload
+  // (including one that embeds a later %%EOF marker) as a polyglot, without
+  // scanning regular compressed object streams before the PDF boundary.
+  return trailingBytes.some((byte) => ![0x09, 0x0a, 0x0c, 0x0d, 0x20].includes(byte));
 }
 
 function extensionFor(name: string): string {
@@ -257,13 +260,52 @@ export class EvidenceFileStore {
 
   async deleteFilePair(originalKey: string, extractedKey: string | null): Promise<void> {
     const keys = [originalKey, ...(extractedKey === null ? [] : [extractedKey])];
+    const snapshots = await Promise.all(keys.map((key) => this.snapshotFile(key)));
     let errors: unknown[] = [];
     for (let attempt = 0; attempt < DELETE_RECONCILIATION_ATTEMPTS; attempt += 1) {
       const results = await Promise.allSettled(keys.map((key) => this.dependencies.bucket.delete(key)));
       errors = results.flatMap((result) => result.status === "rejected" ? [result.reason] : []);
       if (errors.length === 0) return;
     }
-    throw new AggregateError(errors, "근거 파일 쌍을 모두 삭제하지 못했습니다.");
+    const restoration = await Promise.allSettled(snapshots.map((snapshot, index) =>
+      snapshot === null ? undefined : this.dependencies.bucket.put(keys[index]!, snapshot),
+    ));
+    const restoreErrors = restoration.flatMap((result) => result.status === "rejected" ? [result.reason] : []);
+    throw new AggregateError([...errors, ...restoreErrors], "근거 파일 쌍을 모두 삭제하지 못했습니다.");
+  }
+
+  private async snapshotFile(key: string): Promise<Uint8Array | string | null> {
+    const object = await this.dependencies.bucket.get(key);
+    if (object === null || typeof object === "string") return object;
+    if (object instanceof Uint8Array) return object.slice();
+    if (!isEvidenceR2Body(object) || object.body === null) {
+      throw new EvidenceValidationError("삭제 복구용 파일 본문을 읽을 수 없습니다.");
+    }
+
+    const reader = object.body.getReader();
+    const chunks: Uint8Array[] = [];
+    let byteLength = 0;
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        byteLength += value.byteLength;
+        if (byteLength > MAX_EVIDENCE_FILE_BYTES) {
+          await reader.cancel("Evidence file snapshot exceeds the deletion recovery limit.");
+          throw new EvidenceValidationError("삭제 복구용 파일 크기 제한을 초과했습니다.");
+        }
+        chunks.push(value);
+      }
+    } finally {
+      reader.releaseLock();
+    }
+    const snapshot = new Uint8Array(byteLength);
+    let offset = 0;
+    for (const chunk of chunks) {
+      snapshot.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    return snapshot;
   }
 
   private async findByBundleAndHash(bundleId: string, contentHash: string): Promise<StoredEvidenceFile | null> {
