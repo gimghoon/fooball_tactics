@@ -3,7 +3,7 @@ import { readFileSync, readdirSync } from "node:fs";
 import { DatabaseSync, type SQLInputValue } from "node:sqlite";
 import test from "node:test";
 
-import type { TacticCardContent } from "../lib/domain/evidence.ts";
+import { computeEvidenceVersion, type TacticCardContent } from "../lib/domain/evidence.ts";
 import {
   EvidenceAnalyzerError,
   type EvidenceAnalyzer,
@@ -57,12 +57,15 @@ class SQLiteD1Statement implements EvidenceD1Statement {
 }
 
 class SQLiteD1Database implements EvidenceD1Database {
-  readonly database = new DatabaseSync(":memory:");
+  readonly database: DatabaseSync;
 
-  constructor() {
+  constructor(database = new DatabaseSync(":memory:"), applyMigrations = true) {
+    this.database = database;
     this.database.exec("PRAGMA foreign_keys = ON");
-    for (const name of readdirSync("drizzle").filter((value) => /^\d{4}_.*\.sql$/.test(value)).sort()) {
-      this.database.exec(readFileSync(`drizzle/${name}`, "utf8"));
+    if (applyMigrations) {
+      for (const name of readdirSync("drizzle").filter((value) => /^\d{4}_.*\.sql$/.test(value)).sort()) {
+        this.database.exec(readFileSync(`drizzle/${name}`, "utf8"));
+      }
     }
   }
 
@@ -100,6 +103,29 @@ class SQLiteD1Database implements EvidenceD1Database {
   }
 }
 
+class AcquisitionFailingDatabase extends SQLiteD1Database {
+  override prepare(query: string): EvidenceD1Statement {
+    const statement = super.prepare(query);
+    if (!query.includes("SET lease_owner=?,lease_token=?,lease_expires_at=?")) return statement;
+    let bound: EvidenceD1Statement = statement;
+    return {
+      bind(...values: unknown[]): EvidenceD1Statement {
+        bound = statement.bind(...values);
+        return this;
+      },
+      first<T>(): Promise<T | null> {
+        return bound.first<T>();
+      },
+      all<T>(): Promise<{ results: T[] }> {
+        return bound.all<T>();
+      },
+      async run(): Promise<{ meta: { changes: number } }> {
+        throw new Error("simulated acquisition failure");
+      },
+    };
+  }
+}
+
 class MemoryFiles {
   readonly objects = new Map<string, unknown>();
 
@@ -119,10 +145,12 @@ type AnalyzerBehavior = {
 };
 
 class RecordingAnalyzer implements EvidenceAnalyzer {
-  readonly modelId = settings.analyzerModel;
   readonly calls: string[] = [];
 
-  constructor(private readonly behavior: AnalyzerBehavior = {}) {}
+  constructor(
+    private readonly behavior: AnalyzerBehavior = {},
+    readonly modelId = settings.analyzerModel,
+  ) {}
 
   async analyzeExtraction(
     input: { chunks: EvidenceChunkInput[]; promptVersion: string },
@@ -181,6 +209,35 @@ function deferred<T>() {
   return { promise, resolve };
 }
 
+const CHUNK_BYTES = 256 * 1024;
+const CHECKPOINT_BYTES = 700 * 1024;
+
+function utf8Bytes(value: string): number {
+  return new TextEncoder().encode(value).byteLength;
+}
+
+function extractedWithSerializedBytes(citationId: string, targetBytes: number): ExtractedEvidence[] {
+  const result: ExtractedEvidence[] = [{
+    citationIds: [citationId], situation: "x", conditions: [], cues: [],
+    actions: [{ action: "pass", reason: "이유", citationIds: [citationId] }], outcomes: [], exceptions: [],
+  }];
+  const missing = targetBytes - utf8Bytes(JSON.stringify(result));
+  assert.ok(missing >= 0);
+  result[0]!.situation += "x".repeat(missing);
+  assert.equal(utf8Bytes(JSON.stringify(result)), targetBytes);
+  return result;
+}
+
+function cardWithSerializedBytes(citationId: string, targetBytes: number): TacticCardContent {
+  const result = card(citationId);
+  result.uncertainties = ["x"];
+  const missing = targetBytes - utf8Bytes(JSON.stringify([result]));
+  assert.ok(missing >= 0);
+  result.uncertainties[0] += "x".repeat(missing);
+  assert.equal(utf8Bytes(JSON.stringify([result])), targetBytes);
+  return result;
+}
+
 function seedBundle(database: SQLiteD1Database, id = "bundle-1", contentVersion = "input-1"): void {
   database.run(
     "INSERT INTO evidence_bundles (id,title,purpose,version,content_version,created_at,updated_at) VALUES (?,?,?,?,?,?,?)",
@@ -236,6 +293,9 @@ function seedJob(database: SQLiteD1Database, input: {
   attemptCount?: number;
   extractedEvidenceJson?: string | null;
   generatedCardsJson?: string | null;
+  analyzerModel?: string;
+  promptVersion?: string;
+  schemaVersion?: string;
 } = {}): void {
   database.run(
     `INSERT INTO evidence_analysis_jobs
@@ -243,7 +303,8 @@ function seedJob(database: SQLiteD1Database, input: {
        error_message,attempt_count,extracted_evidence_json,generated_cards_json,is_stale,created_at,updated_at)
       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
     input.id ?? "job-1", input.bundleId ?? "bundle-1", input.inputVersion ?? "input-1", input.status ?? "queued",
-    settings.analyzerModel, settings.promptVersion, settings.schemaVersion, input.stage ?? "validate_sources",
+    input.analyzerModel ?? settings.analyzerModel, input.promptVersion ?? settings.promptVersion,
+    input.schemaVersion ?? settings.schemaVersion, input.stage ?? "validate_sources",
     input.leaseOwner ?? null, null, input.leaseExpiresAt ?? null, null, input.attemptCount ?? 0,
     input.extractedEvidenceJson ?? null, input.generatedCardsJson ?? null, 0, 1, 1,
   );
@@ -253,8 +314,11 @@ function createContext(input: {
   analyzer?: RecordingAnalyzer;
   now?: () => number;
   runnerId?: string;
+  activeSettings?: typeof settings;
+  database?: SQLiteD1Database;
+  schedule?: (promise: Promise<unknown>) => void;
 } = {}) {
-  const database = new SQLiteD1Database();
+  const database = input.database ?? new SQLiteD1Database();
   const files = new MemoryFiles();
   const analyzer = input.analyzer ?? new RecordingAnalyzer();
   const scheduled: Promise<unknown>[] = [];
@@ -264,11 +328,12 @@ function createContext(input: {
     db: database,
     files,
     analyzer,
-    settings,
+    settings: input.activeSettings ?? settings,
     runnerId: input.runnerId ?? "runner-1",
     now: input.now ?? (() => 100_000),
     newId: () => `generated-${++id}`,
     schedule(promise) {
+      if (input.schedule) return input.schedule(promise);
       stagesAtSchedule.push(database.first<{ stage: string }>("SELECT stage FROM evidence_analysis_jobs ORDER BY created_at LIMIT 1").stage);
       scheduled.push(promise);
     },
@@ -321,6 +386,163 @@ test("migration preserves legacy resume progress while adding durable checkpoint
   ).get()?.stage, "extract_evidence");
 });
 
+test("migration upgrades the exact old queued default and runs validation first", async () => {
+  const database = new DatabaseSync(":memory:");
+  database.exec("PRAGMA foreign_keys = ON");
+  const migrations = readdirSync("drizzle").filter((value) => /^\d{4}_.*\.sql$/.test(value)).sort();
+  for (const name of migrations.slice(0, -1)) database.exec(readFileSync(`drizzle/${name}`, "utf8"));
+  const inputVersion = await computeEvidenceVersion({
+    purpose: "Resume", sourceHashes: [], clips: [], ...settings,
+  });
+  database.prepare(
+    "INSERT INTO evidence_bundles (id,title,purpose,version,content_version,created_at,updated_at) VALUES (?,?,?,?,?,?,?)",
+  ).run("queued-bundle", "Legacy", "Resume", 1, inputVersion, 1, 1);
+  database.prepare(
+    `INSERT INTO evidence_analysis_jobs
+      (id,bundle_id,input_version,analyzer_model,prompt_version,schema_version,is_stale,created_at,updated_at)
+      VALUES (?,?,?,?,?,?,?,?,?)`,
+  ).run("queued-job", "queued-bundle", inputVersion, "model-1", "prompt-1", "schema-1", 0, 1, 1);
+  database.exec(readFileSync(`drizzle/${migrations.at(-1)}`, "utf8"));
+  const d1 = new SQLiteD1Database(database, false);
+  const scheduled: Promise<unknown>[] = [];
+  const scheduledStages: string[] = [];
+  const context = createContext({
+    database: d1,
+    schedule(promise) {
+      scheduledStages.push(d1.first<{ stage: string }>(
+        "SELECT stage FROM evidence_analysis_jobs WHERE id='queued-job'",
+      ).stage);
+      scheduled.push(promise);
+    },
+  });
+
+  await context.jobs.runAnalysisStep("queued-job");
+  assert.equal(scheduledStages[0], "extract_text");
+  await drainScheduled(scheduled);
+});
+
+test("migration preserves every legacy job-owned card without duplication or destructive rewind", async () => {
+  const database = new DatabaseSync(":memory:");
+  database.exec("PRAGMA foreign_keys = ON");
+  const migrations = readdirSync("drizzle").filter((value) => /^\d{4}_.*\.sql$/.test(value)).sort();
+  for (const name of migrations.slice(0, -1)) database.exec(readFileSync(`drizzle/${name}`, "utf8"));
+  for (const suffix of ["complete", "incomplete"]) {
+    database.prepare(
+      "INSERT INTO evidence_bundles (id,title,purpose,version,content_version,created_at,updated_at) VALUES (?,?,?,?,?,?,?)",
+    ).run(`${suffix}-bundle`, suffix, "Resume", 1, `${suffix}-input`, 1, 1);
+    database.prepare(
+      `INSERT INTO evidence_analysis_jobs
+        (id,bundle_id,input_version,status,analyzer_model,prompt_version,schema_version,stage,is_stale,created_at,updated_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+    ).run(
+      `${suffix}-job`, `${suffix}-bundle`, `${suffix}-input`, "running", "model-1", "prompt-1", "schema-1",
+      "cards_generated", 0, 1, 1,
+    );
+    database.prepare(
+      `INSERT INTO tactic_cards
+        (id,bundle_id,job_id,bundle_version,status,draft_content_json,current_content_json,is_stale,created_at,updated_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?)`,
+    ).run(
+      `${suffix}-card`, `${suffix}-bundle`, `${suffix}-job`, `${suffix}-input`, "analysis_draft",
+      suffix === "complete" ? '{"citationIds":["complete-chunk"]}' : "{}",
+      suffix === "complete" ? '{"citationIds":["complete-chunk"]}' : "{}", 0, 1, 1,
+    );
+  }
+  database.prepare(
+    `INSERT INTO evidence_sources
+      (id,bundle_id,original_file_name,media_type,byte_size,content_hash,storage_key,extraction_status,created_at,updated_at)
+      VALUES (?,?,?,?,?,?,?,?,?,?)`,
+  ).run("complete-source", "complete-bundle", "notes.md", "text/markdown", 1, "hash", "key", "completed", 1, 1);
+  database.prepare(
+    `INSERT INTO evidence_chunks
+      (id,bundle_id,source_id,video_clip_id,ordinal,location_label,content,content_hash,created_at)
+      VALUES (?,?,?,?,?,?,?,?,?)`,
+  ).run("complete-chunk", "complete-bundle", "complete-source", null, 0, "p1", "evidence", "chunk-hash", 1);
+  database.prepare(
+    `INSERT INTO evidence_chunks
+      (id,bundle_id,source_id,video_clip_id,ordinal,location_label,content,content_hash,created_at)
+      VALUES (?,?,?,?,?,?,?,?,?)`,
+  ).run("historical-only-chunk", "complete-bundle", "complete-source", null, 1, "p2", "old evidence", "old-hash", 1);
+  database.prepare(
+    "INSERT INTO tactic_card_citations (id,bundle_id,card_id,chunk_id,created_at) VALUES (?,?,?,?,?)",
+  ).run("complete-citation", "complete-bundle", "complete-card", "complete-chunk", 1);
+  database.prepare(
+    `INSERT INTO evidence_analysis_jobs
+      (id,bundle_id,input_version,status,analyzer_model,prompt_version,schema_version,stage,is_stale,created_at,updated_at)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+  ).run(
+    "historical-job", "complete-bundle", "historical-input", "running", "model-1", "prompt-1", "schema-1",
+    "cards_generated", 0, 1, 1,
+  );
+  database.prepare(
+    `INSERT INTO tactic_cards
+      (id,bundle_id,job_id,bundle_version,status,draft_content_json,current_content_json,is_stale,created_at,updated_at)
+      VALUES (?,?,?,?,?,?,?,?,?,?)`,
+  ).run(
+    "historical-card", "complete-bundle", "historical-job", "historical-input", "coach_reviewed",
+    '{"citationIds":["complete-chunk"]}', '{"citationIds":["complete-chunk"]}', 0, 1, 1,
+  );
+  database.prepare(
+    "INSERT INTO tactic_card_citations (id,bundle_id,card_id,chunk_id,created_at) VALUES (?,?,?,?,?)",
+  ).run("historical-citation", "complete-bundle", "historical-card", "complete-chunk", 1);
+  database.prepare(
+    `INSERT INTO tactic_card_reviews
+      (id,card_id,actor_user_id,status,content_json,citation_snapshot_json,bundle_version,created_at)
+      VALUES (?,?,?,?,?,?,?,?)`,
+  ).run(
+    "historical-review", "historical-card", "reviewer", "coach_reviewed",
+    '{"citationIds":["complete-chunk"]}',
+    '{"citationIds":["complete-chunk","historical-only-chunk"]}', "historical-input", 1,
+  );
+
+  database.exec(readFileSync(`drizzle/${migrations.at(-1)}`, "utf8"));
+  assert.deepEqual({ ...database.prepare(
+    "SELECT status,stage FROM evidence_analysis_jobs WHERE id='complete-job'",
+  ).get() }, { status: "review_ready", stage: "done" });
+  assert.equal(database.prepare("SELECT count(*) AS count FROM tactic_cards WHERE job_id='complete-job'").get()?.count, 1);
+  assert.equal(database.prepare("SELECT count(*) AS count FROM tactic_card_citations WHERE card_id='complete-card'").get()?.count, 1);
+  assert.equal(database.prepare(
+    `SELECT count(*) AS count FROM tactic_card_citations AS citation
+      JOIN tactic_cards AS card ON card.id=citation.card_id
+      JOIN evidence_chunks AS chunk ON chunk.id=citation.chunk_id
+      WHERE chunk.input_version<>card.bundle_version`,
+  ).get()?.count, 0);
+  assert.equal(database.prepare(
+    "SELECT count(DISTINCT chunk_id) AS count FROM tactic_card_citations WHERE card_id IN ('complete-card','historical-card')",
+  ).get()?.count, 2);
+  for (const row of database.prepare(
+    `SELECT card.current_content_json AS contentJson,citation.chunk_id AS chunkId
+      FROM tactic_cards AS card JOIN tactic_card_citations AS citation ON citation.card_id=card.id
+      WHERE card.id IN ('complete-card','historical-card')`,
+  ).all() as { contentJson: string; chunkId: string }[]) {
+    assert.deepEqual(JSON.parse(row.contentJson), { citationIds: [row.chunkId] });
+  }
+  const reviewRow = database.prepare(
+    `SELECT review.content_json AS contentJson,review.citation_snapshot_json AS snapshotJson,citation.chunk_id AS chunkId
+      FROM tactic_card_reviews AS review JOIN tactic_card_citations AS citation ON citation.card_id=review.card_id
+      WHERE review.id='historical-review'`,
+  ).get() as { contentJson: string; snapshotJson: string; chunkId: string };
+  assert.deepEqual(JSON.parse(reviewRow.contentJson), { citationIds: [reviewRow.chunkId] });
+  const snapshotIds = (JSON.parse(reviewRow.snapshotJson) as { citationIds: string[] }).citationIds;
+  assert.equal(snapshotIds[0], reviewRow.chunkId);
+  assert.equal(snapshotIds.length, 2);
+  assert.equal(database.prepare(
+    "SELECT input_version FROM evidence_chunks WHERE id=?",
+  ).get(snapshotIds[1]!)?.input_version, "historical-input");
+  assert.equal(database.prepare("SELECT count(*) AS count FROM tactic_cards WHERE job_id='incomplete-job'").get()?.count, 1);
+  assert.deepEqual({ ...database.prepare(
+    "SELECT status,stage FROM evidence_analysis_jobs WHERE id='incomplete-job'",
+  ).get() }, { status: "review_ready", stage: "done" });
+
+  const d1 = new SQLiteD1Database(database, false);
+  const context = createContext({ database: d1 });
+  await context.jobs.runAnalysisStep("complete-job");
+  await context.jobs.runAnalysisStep("incomplete-job");
+  assert.equal(d1.first<{ count: number }>("SELECT count(*) AS count FROM tactic_cards WHERE job_id='complete-job'").count, 1);
+  assert.equal(d1.first<{ count: number }>("SELECT count(*) AS count FROM tactic_cards WHERE job_id='incomplete-job'").count, 1);
+  assert.deepEqual(context.analyzer.calls, []);
+});
+
 test("same input version deduplicates analysis jobs", async () => {
   const context = createContext();
   seedBundle(context.database);
@@ -330,6 +552,36 @@ test("same input version deduplicates analysis jobs", async () => {
 
   assert.equal(second.id, first.id);
   assert.equal(context.database.first<{ count: number }>("SELECT count(*) AS count FROM evidence_analysis_jobs").count, 1);
+  await drainScheduled(context.scheduled);
+});
+
+test("start recomputes a settings-derived bundle version before creating a job", async () => {
+  const context = createContext();
+  const oldVersion = await computeEvidenceVersion({
+    purpose: "전방 압박 대응", sourceHashes: [], clips: [],
+    analyzerModel: "model-old", promptVersion: "prompt-old", schemaVersion: "schema-old",
+  });
+  const activeVersion = await computeEvidenceVersion({
+    purpose: "전방 압박 대응", sourceHashes: [], clips: [], ...settings,
+  });
+  seedBundle(context.database, "bundle-1", oldVersion);
+  seedJob(context.database, { id: "old-job", inputVersion: oldVersion, status: "completed", stage: "done" });
+  context.database.run(
+    `INSERT INTO tactic_cards
+      (id,bundle_id,job_id,bundle_version,status,draft_content_json,current_content_json,is_stale,created_at,updated_at)
+      VALUES (?,?,?,?,?,?,?,?,?,?)`,
+    "old-card", "bundle-1", "old-job", oldVersion, "coach_reviewed", "{}", "{}", 0, 1, 1,
+  );
+
+  const job = await context.jobs.startAnalysis("bundle-1", admin);
+
+  assert.equal(job.inputVersion, activeVersion);
+  assert.deepEqual({ ...context.database.first(
+    "SELECT content_version AS contentVersion,version FROM evidence_bundles WHERE id='bundle-1'",
+  ) }, { contentVersion: activeVersion, version: 2 });
+  assert.deepEqual({ ...context.database.first(
+    "SELECT status,is_stale AS isStale FROM tactic_cards WHERE id='old-card'",
+  ) }, { status: "held", isStale: 1 });
   await drainScheduled(context.scheduled);
 });
 
@@ -395,6 +647,29 @@ test("an unexpired lease owned by another runner blocks execution", async () => 
   assert.deepEqual(context.analyzer.calls, []);
   assert.equal(context.scheduled.length, 0);
   assert.equal((await context.jobs.getAnalysisStatus("job-1"))?.stage, "extract_evidence");
+});
+
+test("persisted model, prompt, and schema mismatches fail before lease acquisition or analyzer execution", async () => {
+  for (const mismatch of [
+    { analyzerModel: "model-old" },
+    { promptVersion: "prompt-old" },
+    { schemaVersion: "schema-old" },
+  ]) {
+    const context = createContext();
+    seedBundle(context.database);
+    seedSource(context.database, context.files, { id: "source-1" });
+    seedChunk(context.database, { id: "chunk-1", sourceId: "source-1" });
+    seedJob(context.database, { stage: "extract_evidence", ...mismatch });
+
+    await context.jobs.runAnalysisStep("job-1");
+
+    const job = await context.jobs.getAnalysisStatus("job-1");
+    assert.equal(job?.status, "failed");
+    assert.equal(job?.leaseOwner, null);
+    assert.match(job?.errorMessage ?? "", /설정|버전/);
+    assert.deepEqual(context.analyzer.calls, []);
+    assert.equal(context.database.first<{ count: number }>("SELECT count(*) AS count FROM tactic_cards").count, 0);
+  }
 });
 
 test("one runner cannot execute the same leased stage concurrently", async () => {
@@ -466,6 +741,105 @@ test("partial text extraction failure preserves successful source chunks and fai
     { sourceId: "ok", locationLabel: "paragraph:1" },
   ]);
   assert.equal((await context.jobs.getAnalysisStatus("job-1"))?.status, "review_ready");
+});
+
+test("extracted pages split deterministically at the 256 KiB UTF-8 D1 boundary", async () => {
+  for (const [length, expectedChunks] of [[CHUNK_BYTES, 1], [CHUNK_BYTES + 1, 2]] as const) {
+    const context = createContext();
+    seedBundle(context.database);
+    seedSource(context.database, context.files, { id: "source-1", text: "a".repeat(length) });
+    seedJob(context.database, { stage: "extract_text" });
+
+    await context.jobs.runAnalysisStep("job-1");
+    await drainScheduled(context.scheduled);
+
+    const chunks = context.database.all<{ ordinal: number; locationLabel: string; content: string }>(
+      "SELECT ordinal,location_label AS locationLabel,content FROM evidence_chunks ORDER BY ordinal",
+    );
+    assert.equal(chunks.length, expectedChunks);
+    assert.equal(chunks.map((chunk) => chunk.content).join(""), "a".repeat(length));
+    assert.ok(chunks.every((chunk) => utf8Bytes(chunk.content) <= CHUNK_BYTES));
+    assert.ok(chunks.every((chunk) => chunk.locationLabel === "paragraph:1"));
+    assert.deepEqual(chunks.map((chunk) => chunk.ordinal), Array.from({ length: expectedChunks }, (_, index) => index));
+  }
+});
+
+test("video observations split deterministically at the 256 KiB UTF-8 D1 boundary", async () => {
+  const context = createContext();
+  seedBundle(context.database);
+  const observation = "축".repeat(Math.ceil((CHUNK_BYTES + 1) / 3));
+  context.database.run(
+    `INSERT INTO evidence_video_clips
+      (id,bundle_id,url,start_ms,end_ms,observation,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?)`,
+    "clip-1", "bundle-1", "https://example.test/video", 0, 1_000, observation, 1, 1,
+  );
+  seedJob(context.database, { stage: "normalize_clips" });
+
+  await context.jobs.runAnalysisStep("job-1");
+  await drainScheduled(context.scheduled);
+
+  const chunks = context.database.all<{ ordinal: number; content: string }>(
+    "SELECT ordinal,content FROM evidence_chunks WHERE video_clip_id='clip-1' ORDER BY ordinal",
+  );
+  assert.equal(chunks.length, 2);
+  assert.equal(chunks.map((chunk) => chunk.content).join(""), observation);
+  assert.ok(chunks.every((chunk) => utf8Bytes(chunk.content) <= CHUNK_BYTES));
+  assert.deepEqual(chunks.map((chunk) => chunk.ordinal), [0, 1]);
+});
+
+test("extraction checkpoints enforce the exact 700 KiB row budget with bounded retry", async () => {
+  for (const [bytes, expectedStatus, expectedCalls] of [
+    [CHECKPOINT_BYTES, "review_ready", 1],
+    [CHECKPOINT_BYTES + 1, "failed", 3],
+  ] as const) {
+    const analyzer = new RecordingAnalyzer({ extract: async () => extractedWithSerializedBytes("chunk-1", bytes) });
+    const context = createContext({ analyzer });
+    seedBundle(context.database);
+    seedSource(context.database, context.files, { id: "source-1" });
+    seedChunk(context.database, { id: "chunk-1", sourceId: "source-1" });
+    seedJob(context.database, { stage: "extract_evidence" });
+
+    await context.jobs.runAnalysisStep("job-1");
+    await drainScheduled(context.scheduled);
+
+    const job = await context.jobs.getAnalysisStatus("job-1");
+    assert.equal(job?.status, expectedStatus);
+    assert.equal(analyzer.calls.filter((call) => call === "extract").length, expectedCalls);
+    if (bytes === CHECKPOINT_BYTES) assert.equal(utf8Bytes(job?.extractedEvidenceJson ?? ""), CHECKPOINT_BYTES);
+    else assert.equal(job?.extractedEvidenceJson, null);
+  }
+});
+
+test("generated checkpoints and duplicated card columns enforce the exact 700 KiB row budget", async () => {
+  const extracted = extractedWithSerializedBytes("chunk-1", 256);
+  for (const [bytes, expectedStatus, expectedCalls] of [
+    [CHECKPOINT_BYTES, "review_ready", 1],
+    [CHECKPOINT_BYTES + 1, "failed", 3],
+  ] as const) {
+    const analyzer = new RecordingAnalyzer({ cards: async () => [cardWithSerializedBytes("chunk-1", bytes)] });
+    const context = createContext({ analyzer });
+    seedBundle(context.database);
+    seedSource(context.database, context.files, { id: "source-1" });
+    seedChunk(context.database, { id: "chunk-1", sourceId: "source-1" });
+    seedJob(context.database, { stage: "generate_cards", extractedEvidenceJson: JSON.stringify(extracted) });
+
+    await context.jobs.runAnalysisStep("job-1");
+    await drainScheduled(context.scheduled);
+
+    assert.equal((await context.jobs.getAnalysisStatus("job-1"))?.status, expectedStatus);
+    assert.equal(analyzer.calls.filter((call) => call === "cards").length, expectedCalls);
+    const rows = context.database.all<{ draft: string; current: string }>(
+      "SELECT draft_content_json AS draft,current_content_json AS current FROM tactic_cards",
+    );
+    if (bytes === CHECKPOINT_BYTES) {
+      assert.equal(rows.length, 1);
+      assert.equal(utf8Bytes(rows[0]!.draft), CHECKPOINT_BYTES - 2);
+      assert.equal(rows[0]!.draft, rows[0]!.current);
+      assert.ok(utf8Bytes(rows[0]!.draft) + utf8Bytes(rows[0]!.current) < 2_000_000);
+    } else {
+      assert.equal(rows.length, 0);
+    }
+  }
 });
 
 test("chunks are scoped to one input version and failed sources cannot leak old chunks", async () => {
@@ -599,6 +973,48 @@ test("status polling is read-only and never schedules execution", async () => {
   assert.equal(status?.stage, "validate_sources");
   assert.deepEqual(after, before);
   assert.equal(context.scheduled.length, 0);
+});
+
+test("a synchronous scheduler throw leaves a durable checkpoint and observes the continuation", async () => {
+  let continuation: Promise<unknown> | null = null;
+  const inputVersion = await computeEvidenceVersion({
+    purpose: "테스트 목적", sourceHashes: [], clips: [], ...settings,
+  });
+  const context = createContext({
+    schedule(promise) {
+      continuation = promise;
+      throw new Error("simulated scheduler failure");
+    },
+  });
+  seedBundle(context.database, "bundle-1", inputVersion);
+
+  await assert.rejects(context.jobs.startAnalysis("bundle-1", admin), /simulated scheduler failure/);
+  assert.deepEqual({ ...context.database.first(
+    "SELECT status,stage FROM evidence_analysis_jobs WHERE bundle_id='bundle-1'",
+  ) }, { status: "queued", stage: "validate_sources" });
+
+  assert.notEqual(continuation, null);
+  await assert.rejects(continuation, /simulated scheduler failure/);
+  const durable = context.database.first<{ status: string; stage: string }>(
+    "SELECT status,stage FROM evidence_analysis_jobs WHERE bundle_id='bundle-1'",
+  );
+  assert.equal(durable.status, "queued");
+  assert.equal(durable.stage, "validate_sources");
+});
+
+test("scheduled lease acquisition database failures reject safely without analyzer execution", async () => {
+  const database = new AcquisitionFailingDatabase();
+  const context = createContext({ database });
+  seedBundle(database);
+
+  const job = await context.jobs.startAnalysis("bundle-1", admin);
+  assert.equal(context.scheduled.length, 1);
+  await assert.rejects(context.scheduled[0], /simulated acquisition failure/);
+
+  assert.deepEqual(context.analyzer.calls, []);
+  assert.deepEqual({ ...database.first(
+    "SELECT status,stage,lease_owner AS leaseOwner FROM evidence_analysis_jobs WHERE id=?", job.id,
+  ) }, { status: "queued", stage: "validate_sources", leaseOwner: null });
 });
 
 test("a stale bundle version cannot persist generated cards", async () => {

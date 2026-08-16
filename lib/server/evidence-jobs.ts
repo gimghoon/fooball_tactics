@@ -1,4 +1,4 @@
-import type { TacticCardContent } from "../domain/evidence.ts";
+import { computeEvidenceVersion, type TacticCardContent } from "../domain/evidence.ts";
 import {
   EvidenceAnalyzerError,
   extractedCitationIds,
@@ -17,6 +17,9 @@ import type {
 const LEASE_MS = 60_000;
 const MAX_ANALYZER_ATTEMPTS = 3;
 const MAX_R2_OBJECT_BYTES = 20 * 1024 * 1024;
+export const EVIDENCE_CHUNK_MAX_BYTES = 256 * 1024;
+export const EVIDENCE_CHECKPOINT_MAX_BYTES = 700 * 1024;
+export const EVIDENCE_CARD_MAX_BYTES = 700 * 1024;
 
 export type EvidenceAnalysisJobStage =
   | "validate_sources"
@@ -100,6 +103,7 @@ const CHECKPOINT_GUARD = `EXISTS (
   JOIN evidence_bundles AS bundle ON bundle.id=active.bundle_id
   WHERE active.id=? AND active.stage=? AND active.lease_owner=? AND active.lease_token=?
     AND active.lease_expires_at>? AND active.is_stale=0
+    AND active.analyzer_model=? AND active.prompt_version=? AND active.schema_version=?
     AND bundle.content_version=active.input_version
 )`;
 
@@ -174,6 +178,31 @@ function citationIds(card: TacticCardContent): string[] {
   return [...new Set([...card.preferred, ...card.alternatives, ...card.risky].flatMap((action) => action.citationIds))];
 }
 
+function utf8ByteLength(value: string): number {
+  return new TextEncoder().encode(value).byteLength;
+}
+
+function boundedJson(value: unknown, maximumBytes: number, message: string, retryable = true): string {
+  const json = JSON.stringify(value);
+  if (utf8ByteLength(json) > maximumBytes) throw new EvidenceAnalyzerError(message, retryable);
+  return json;
+}
+
+function splitUtf8(value: string, maximumBytes: number): string[] {
+  const encoder = new TextEncoder();
+  const decoder = new TextDecoder();
+  const pieces: string[] = [];
+  let offset = 0;
+  while (offset < value.length) {
+    const buffer = new Uint8Array(maximumBytes);
+    const { read, written } = encoder.encodeInto(value.slice(offset), buffer);
+    if (read === 0 || written === 0) throw new Error("근거 텍스트를 안전한 크기로 나눌 수 없습니다.");
+    pieces.push(decoder.decode(buffer.subarray(0, written)));
+    offset += read;
+  }
+  return pieces;
+}
+
 /** D1-authoritative, lease-based evidence analysis runner. */
 export class EvidenceAnalysisJobs {
   private readonly runnerId: string;
@@ -187,9 +216,7 @@ export class EvidenceAnalysisJobs {
 
   async startAnalysis(bundleId: string, admin: EvidenceAdmin): Promise<EvidenceAnalysisJobRecord> {
     void admin;
-    const bundle = await this.dependencies.db.prepare(
-      "SELECT id,content_version AS contentVersion FROM evidence_bundles WHERE id=?",
-    ).bind(bundleId).first<{ id: string; contentVersion: string }>();
+    const bundle = await this.refreshBundleVersion(bundleId);
     if (bundle === null) throw new Error("근거 묶음을 찾을 수 없습니다.");
 
     const now = this.now();
@@ -206,26 +233,43 @@ export class EvidenceAnalysisJobs {
     ).run();
     const job = await this.findByInputVersion(bundle.id, bundle.contentVersion);
     if (job === null) throw new Error("근거 분석 작업을 생성할 수 없습니다.");
+    if (this.configurationMismatch(job)) {
+      await this.failConfigurationMismatch(job);
+      return (await this.getAnalysisStatus(job.id)) ?? job;
+    }
     if (this.canContinue(job, now)) this.scheduleStep(job.id);
     return job;
   }
 
   async runAnalysisStep(jobId: string): Promise<EvidenceAnalysisJobRecord | null> {
+    const persisted = await this.getAnalysisStatus(jobId);
+    if (persisted === null) return null;
+    if (this.configurationMismatch(persisted)) {
+      await this.failConfigurationMismatch(persisted);
+      return this.getAnalysisStatus(jobId);
+    }
     const now = this.now();
     const leaseToken = this.id();
     const acquired = await this.dependencies.db.prepare(
       `UPDATE evidence_analysis_jobs
         SET lease_owner=?,lease_token=?,lease_expires_at=?,status='running',started_at=COALESCE(started_at,?),updated_at=?
         WHERE id=? AND is_stale=0 AND status IN ('queued','running')
+          AND analyzer_model=? AND prompt_version=? AND schema_version=?
           AND (lease_expires_at IS NULL OR lease_expires_at<=?
             OR (lease_owner=? AND lease_token=?))`,
     ).bind(
-      this.runnerId, leaseToken, now + LEASE_MS, now, now, jobId, now, this.runnerId, leaseToken,
+      this.runnerId, leaseToken, now + LEASE_MS, now, now, jobId,
+      this.dependencies.analyzer.modelId, this.dependencies.settings.promptVersion,
+      this.dependencies.settings.schemaVersion, now, this.runnerId, leaseToken,
     ).run() as { meta?: { changes?: number } };
     if (asChanges(acquired) !== 1) return this.getAnalysisStatus(jobId);
 
     const job = await this.getAnalysisStatus(jobId);
     if (job === null || job.leaseToken !== leaseToken) return job;
+    if (this.configurationMismatch(job)) {
+      await this.failConfigurationMismatch(job);
+      return this.getAnalysisStatus(jobId);
+    }
     try {
       switch (job.stage) {
         case "validate_sources":
@@ -262,6 +306,12 @@ export class EvidenceAnalysisJobs {
     if (job === null) throw new Error("근거 분석 작업을 찾을 수 없습니다.");
     if (job.status === "review_ready" || job.status === "completed") {
       throw new Error("완료된 근거 분석 작업은 재시도할 수 없습니다.");
+    }
+    if (this.configurationMismatch(job)) {
+      await this.failConfigurationMismatch(job);
+      const failed = await this.getAnalysisStatus(job.id);
+      if (failed === null) throw new Error("근거 분석 작업을 찾을 수 없습니다.");
+      return failed;
     }
     const now = this.now();
     const result = await this.dependencies.db.prepare(
@@ -323,7 +373,10 @@ export class EvidenceAnalysisJobs {
   }
 
   private guard(job: EvidenceAnalysisJobRecord, checkpointAt: number): unknown[] {
-    return [job.id, job.stage, this.runnerId, job.leaseToken, checkpointAt];
+    return [
+      job.id, job.stage, this.runnerId, job.leaseToken, checkpointAt,
+      job.analyzerModel, job.promptVersion, job.schemaVersion,
+    ];
   }
 
   private checkpointStatement(job: EvidenceAnalysisJobRecord, next: EvidenceAnalysisJobStage, now: number): EvidenceD1Statement {
@@ -331,8 +384,12 @@ export class EvidenceAnalysisJobs {
       `UPDATE evidence_analysis_jobs
         SET stage=?,attempt_count=0,error_message=NULL,lease_owner=NULL,lease_token=NULL,lease_expires_at=NULL,updated_at=?
         WHERE id=? AND stage=? AND lease_owner=? AND lease_token=? AND lease_expires_at>? AND is_stale=0
+          AND analyzer_model=? AND prompt_version=? AND schema_version=?
           AND EXISTS (SELECT 1 FROM evidence_bundles WHERE id=? AND content_version=?)`,
-    ).bind(next, now, job.id, job.stage, this.runnerId, job.leaseToken, now, job.bundleId, job.inputVersion);
+    ).bind(
+      next, now, job.id, job.stage, this.runnerId, job.leaseToken, now,
+      job.analyzerModel, job.promptVersion, job.schemaVersion, job.bundleId, job.inputVersion,
+    );
   }
 
   private async commitCheckpoint(
@@ -401,15 +458,19 @@ export class EvidenceAnalysisJobs {
         ).bind(outcome.error, now, outcome.source.id, job.bundleId, ...this.guard(job, now)));
         continue;
       }
-      for (const [ordinal, page] of outcome.pages.entries()) {
-        statements.push(this.dependencies.db.prepare(
-          `INSERT INTO evidence_chunks
-            (id,bundle_id,input_version,source_id,video_clip_id,ordinal,location_label,content,content_hash,created_at)
-            SELECT ?,?,?,?,NULL,?,?,?,?,? WHERE ${CHECKPOINT_GUARD}`,
-        ).bind(
-          this.id(), job.bundleId, job.inputVersion, outcome.source.id, ordinal, page.locator, page.text, await sha256(page.text), now,
-          ...this.guard(job, now),
-        ));
+      let ordinal = 0;
+      for (const page of outcome.pages) {
+        for (const piece of splitUtf8(page.text, EVIDENCE_CHUNK_MAX_BYTES)) {
+          statements.push(this.dependencies.db.prepare(
+            `INSERT INTO evidence_chunks
+              (id,bundle_id,input_version,source_id,video_clip_id,ordinal,location_label,content,content_hash,created_at)
+              SELECT ?,?,?,?,NULL,?,?,?,?,? WHERE ${CHECKPOINT_GUARD}`,
+          ).bind(
+            this.id(), job.bundleId, job.inputVersion, outcome.source.id, ordinal, page.locator, piece, await sha256(piece), now,
+            ...this.guard(job, now),
+          ));
+          ordinal += 1;
+        }
       }
     }
     if (await this.commitCheckpoint(job, "normalize_clips", statements, now)) this.scheduleStep(job.id);
@@ -424,14 +485,16 @@ export class EvidenceAnalysisJobs {
     const statements: EvidenceD1Statement[] = [];
     for (const clip of clips) {
       const location = `${clip.url}#t=${clip.startMs},${clip.endMs}`;
-      statements.push(this.dependencies.db.prepare(
-        `INSERT INTO evidence_chunks
-          (id,bundle_id,input_version,source_id,video_clip_id,ordinal,location_label,content,content_hash,created_at)
-          SELECT ?,?,?,NULL,?,0,?,?,? WHERE ${CHECKPOINT_GUARD}`,
-      ).bind(
-        this.id(), job.bundleId, job.inputVersion, clip.id, location, clip.observation, await sha256(clip.observation), now,
-        ...this.guard(job, now),
-      ));
+      for (const [ordinal, piece] of splitUtf8(clip.observation, EVIDENCE_CHUNK_MAX_BYTES).entries()) {
+        statements.push(this.dependencies.db.prepare(
+          `INSERT INTO evidence_chunks
+            (id,bundle_id,input_version,source_id,video_clip_id,ordinal,location_label,content,content_hash,created_at)
+            SELECT ?,?,?,NULL,?,?,?,?,?,? WHERE ${CHECKPOINT_GUARD}`,
+        ).bind(
+          this.id(), job.bundleId, job.inputVersion, clip.id, ordinal, location, piece, await sha256(piece), now,
+          ...this.guard(job, now),
+        ));
+      }
     }
     if (await this.commitCheckpoint(job, "extract_evidence", statements, now)) this.scheduleStep(job.id);
   }
@@ -443,11 +506,14 @@ export class EvidenceAnalysisJobs {
       new AbortController().signal,
     );
     const extracted = parseExtractedEvidence(result, chunks);
+    const extractedJson = boundedJson(
+      extracted, EVIDENCE_CHECKPOINT_MAX_BYTES, "추출 근거 결과가 저장 가능한 크기를 초과했습니다.",
+    );
     const now = this.now();
     const statement = this.dependencies.db.prepare(
       `UPDATE evidence_analysis_jobs SET extracted_evidence_json=?,updated_at=?
         WHERE id=? AND ${CHECKPOINT_GUARD}`,
-    ).bind(JSON.stringify(extracted), now, job.id, ...this.guard(job, now));
+    ).bind(extractedJson, now, job.id, ...this.guard(job, now));
     if (await this.commitCheckpoint(job, "generate_cards", [statement], now)) this.scheduleStep(job.id);
   }
 
@@ -462,11 +528,17 @@ export class EvidenceAnalysisJobs {
       schemaVersion: job.schemaVersion,
     }, new AbortController().signal);
     const cards = parseAnalyzerCards(result, allowedCitationIds, extractedCitationIds(extracted));
+    for (const card of cards) {
+      boundedJson(card, EVIDENCE_CARD_MAX_BYTES, "전술 카드가 저장 가능한 크기를 초과했습니다.");
+    }
+    const cardsJson = boundedJson(
+      cards, EVIDENCE_CHECKPOINT_MAX_BYTES, "전술 카드 결과가 저장 가능한 크기를 초과했습니다.",
+    );
     const now = this.now();
     const statement = this.dependencies.db.prepare(
       `UPDATE evidence_analysis_jobs SET generated_cards_json=?,updated_at=?
         WHERE id=? AND ${CHECKPOINT_GUARD}`,
-    ).bind(JSON.stringify(cards), now, job.id, ...this.guard(job, now));
+    ).bind(cardsJson, now, job.id, ...this.guard(job, now));
     if (await this.commitCheckpoint(job, "persist_cards", [statement], now)) this.scheduleStep(job.id);
   }
 
@@ -482,7 +554,9 @@ export class EvidenceAnalysisJobs {
     const statements: EvidenceD1Statement[] = [];
     for (const card of cards) {
       const cardId = this.id();
-      const contentJson = JSON.stringify(card);
+      const contentJson = boundedJson(
+        card, EVIDENCE_CARD_MAX_BYTES, "전술 카드가 저장 가능한 크기를 초과했습니다.", false,
+      );
       statements.push(this.dependencies.db.prepare(
         `INSERT INTO tactic_cards
           (id,bundle_id,job_id,bundle_version,status,draft_content_json,current_content_json,is_stale,created_at,updated_at)
@@ -508,9 +582,11 @@ export class EvidenceAnalysisJobs {
         SET status='review_ready',completed_at=?,attempt_count=0,error_message=NULL,
           lease_owner=NULL,lease_token=NULL,lease_expires_at=NULL,updated_at=?
         WHERE id=? AND stage='done' AND lease_owner=? AND lease_token=? AND lease_expires_at>? AND is_stale=0
+          AND analyzer_model=? AND prompt_version=? AND schema_version=?
           AND EXISTS (SELECT 1 FROM evidence_bundles WHERE id=? AND content_version=?)`,
     ).bind(
-      now, now, job.id, this.runnerId, job.leaseToken, now, job.bundleId, job.inputVersion,
+      now, now, job.id, this.runnerId, job.leaseToken, now,
+      job.analyzerModel, job.promptVersion, job.schemaVersion, job.bundleId, job.inputVersion,
     ).run() as { meta?: { changes?: number } };
     if (asChanges(result) !== 1) await this.markStaleIfSuperseded(job);
   }
@@ -524,10 +600,12 @@ export class EvidenceAnalysisJobs {
       `UPDATE evidence_analysis_jobs
         SET status=?,attempt_count=?,error_message=?,lease_owner=NULL,lease_token=NULL,lease_expires_at=NULL,updated_at=?
         WHERE id=? AND stage=? AND lease_owner=? AND lease_token=? AND lease_expires_at>? AND is_stale=0
+          AND analyzer_model=? AND prompt_version=? AND schema_version=?
           AND EXISTS (SELECT 1 FROM evidence_bundles WHERE id=? AND content_version=?)`,
     ).bind(
       retry ? "queued" : "failed", attemptCount, safeMessage(error), now,
-      job.id, job.stage, this.runnerId, job.leaseToken, now, job.bundleId, job.inputVersion,
+      job.id, job.stage, this.runnerId, job.leaseToken, now,
+      job.analyzerModel, job.promptVersion, job.schemaVersion, job.bundleId, job.inputVersion,
     ).run() as { meta?: { changes?: number } };
     if (asChanges(result) === 1 && retry) this.scheduleStep(job.id);
     else if (asChanges(result) !== 1) await this.markStaleIfSuperseded(job);
@@ -552,8 +630,81 @@ export class EvidenceAnalysisJobs {
       && (job.leaseExpiresAt === null || job.leaseExpiresAt <= now);
   }
 
+  private configurationMismatch(job: EvidenceAnalysisJobRecord): boolean {
+    return job.analyzerModel !== this.dependencies.analyzer.modelId
+      || job.promptVersion !== this.dependencies.settings.promptVersion
+      || job.schemaVersion !== this.dependencies.settings.schemaVersion;
+  }
+
+  private async failConfigurationMismatch(job: EvidenceAnalysisJobRecord): Promise<void> {
+    await this.dependencies.db.prepare(
+      `UPDATE evidence_analysis_jobs
+        SET status='failed',attempt_count=attempt_count+1,
+          error_message='분석 설정 버전이 현재 실행 환경과 일치하지 않습니다.',
+          lease_owner=NULL,lease_token=NULL,lease_expires_at=NULL,updated_at=?
+        WHERE id=? AND analyzer_model=? AND prompt_version=? AND schema_version=?
+          AND status IN ('queued','running')`,
+    ).bind(
+      this.now(), job.id, job.analyzerModel, job.promptVersion, job.schemaVersion,
+    ).run();
+  }
+
   private scheduleStep(jobId: string): void {
-    this.dependencies.schedule(Promise.resolve().then(() => this.runAnalysisStep(jobId)));
+    let release!: () => void;
+    let cancel!: (error: unknown) => void;
+    const registration = new Promise<void>((resolve, reject) => {
+      release = resolve;
+      cancel = reject;
+    });
+    const continuation = registration.then(() => this.runAnalysisStep(jobId));
+    try {
+      this.dependencies.schedule(continuation);
+      release();
+    } catch (error) {
+      void continuation.catch(() => undefined);
+      cancel(error);
+      throw error;
+    }
+  }
+
+  private async refreshBundleVersion(bundleId: string): Promise<{ id: string; contentVersion: string }> {
+    const bundle = await this.dependencies.db.prepare(
+      "SELECT id,purpose,content_version AS contentVersion FROM evidence_bundles WHERE id=?",
+    ).bind(bundleId).first<{ id: string; purpose: string; contentVersion: string }>();
+    if (bundle === null) throw new Error("근거 묶음을 찾을 수 없습니다.");
+    const sourceHashes = (await this.dependencies.db.prepare(
+      "SELECT content_hash AS contentHash FROM evidence_sources WHERE bundle_id=? ORDER BY content_hash",
+    ).bind(bundleId).all<{ contentHash: string }>()).results.map((source) => source.contentHash);
+    const clips = (await this.dependencies.db.prepare(
+      `SELECT url,start_ms AS startMs,end_ms AS endMs,observation
+        FROM evidence_video_clips WHERE bundle_id=? ORDER BY id`,
+    ).bind(bundleId).all<EvidenceVideoClipRow>()).results;
+    const contentVersion = await computeEvidenceVersion({
+      purpose: bundle.purpose,
+      sourceHashes,
+      clips,
+      ...this.dependencies.settings,
+    });
+    if (contentVersion === bundle.contentVersion) return { id: bundle.id, contentVersion };
+    const now = this.now();
+    const guard = "EXISTS (SELECT 1 FROM evidence_bundles WHERE id=? AND content_version=?)";
+    const results = await this.dependencies.db.batch([
+      this.dependencies.db.prepare(
+        `UPDATE evidence_analysis_jobs SET status='failed',is_stale=1,error_message='evidence version superseded',updated_at=?
+          WHERE bundle_id=? AND input_version<>? AND ${guard}`,
+      ).bind(now, bundleId, contentVersion, bundleId, bundle.contentVersion),
+      this.dependencies.db.prepare(
+        `UPDATE tactic_cards SET is_stale=1,
+          status=CASE WHEN status IN ('analysis_draft','owner_reviewed','coach_reviewed') THEN 'held' ELSE status END,
+          updated_at=?
+          WHERE bundle_id=? AND bundle_version<>? AND ${guard}`,
+      ).bind(now, bundleId, contentVersion, bundleId, bundle.contentVersion),
+      this.dependencies.db.prepare(
+        "UPDATE evidence_bundles SET content_version=?,version=version+1,updated_at=? WHERE id=? AND content_version=?",
+      ).bind(contentVersion, now, bundleId, bundle.contentVersion),
+    ]);
+    if (asChanges(results.at(-1)) !== 1) throw new Error("근거 묶음 버전이 변경되어 분석을 시작할 수 없습니다.");
+    return { id: bundle.id, contentVersion };
   }
 
   private now(): number {
