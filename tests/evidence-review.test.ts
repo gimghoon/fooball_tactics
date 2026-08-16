@@ -522,6 +522,31 @@ test("owner edits retain the untouched LLM draft and exact immutable review snap
   assert.equal(database.first<{ count: number }>("SELECT count(*) AS count FROM evidence_audit_events WHERE action='card.reviewed'").count, 1);
 });
 
+test("admin job card listing returns current cards with only current-version citation records", async () => {
+  const { database, service } = createContext();
+  seedCard(database);
+  database.run(
+    `INSERT INTO evidence_chunks
+      (id,bundle_id,input_version,source_id,video_clip_id,ordinal,location_label,content,content_hash,created_at)
+      VALUES (?,?,?,?,?,?,?,?,?,?)`,
+    "historical-chunk", "bundle-1", "old-version", "source-1", null, 3, "old p.1", "오래된 근거", "old-hash", 1,
+  );
+  database.run(
+    "INSERT INTO tactic_card_citations (id,bundle_id,card_id,chunk_id,created_at) VALUES (?,?,?,?,?)",
+    "historical-citation", "bundle-1", "card-1", "historical-chunk", 1,
+  );
+
+  const cards = await service.listCardsForJob("job-1", admin);
+
+  assert.equal(cards.length, 1);
+  assert.equal(cards[0]?.id, "card-1");
+  assert.deepEqual(cards[0]?.citations.map(({ chunkId, content }) => ({ chunkId, content })), [
+    { chunkId: "chunk-1", content: "반대편 패스" },
+    { chunkId: "chunk-2", content: "중앙 드리블 위험" },
+  ]);
+  assert.deepEqual(await service.listCardsForJob("missing-job", admin), []);
+});
+
 test("every subsequent owner edit appends a snapshot without rewriting history", async () => {
   const { database, service } = createContext();
   seedCard(database);

@@ -45,6 +45,7 @@ export type EvidenceCitationSnapshot = {
   content: string;
   contentHash: string;
 };
+export type EvidenceCardAdminDetail = EvidenceCardRecord & { citations: EvidenceCitationSnapshot[] };
 export type EvidenceCardReviewRecord = {
   id: string;
   cardId: string;
@@ -121,6 +122,7 @@ export type EvidenceServiceRepository={
   describeDeleteImpact(sourceId:string):Promise<EvidenceDeleteImpact>;
   createBundle(bundle:EvidenceBundleRecord,audit:EvidenceAuditEventInput):Promise<void>;
   applyMutation(mutation:EvidenceMutation):Promise<boolean>;
+  listCardsForJob(jobId:string):Promise<EvidenceCardRecord[]>;
   findCard(cardId:string):Promise<EvidenceCardRecord|null>;
   listCardCitations(cardId:string):Promise<(EvidenceCitationSnapshot&{inputVersion:string})[]>;
   findCardReview(reviewId:string,cardId:string):Promise<EvidenceCardReviewRecord|null>;
@@ -277,6 +279,19 @@ export class D1EvidenceServiceRepository implements EvidenceServiceRepository {
 
     const results = await this.db.batch(statements);
     return (results.at(-1)?.meta?.changes ?? 0) === 1;
+  }
+  async listCardsForJob(jobId: string): Promise<EvidenceCardRecord[]> {
+    return (await this.db.prepare(
+      `SELECT card.id,card.bundle_id AS bundleId,card.job_id AS jobId,card.bundle_version AS bundleVersion,
+        bundle.content_version AS currentBundleVersion,card.current_review_id AS currentReviewId,
+        job.analyzer_model AS producerModel,card.status,card.draft_content_json AS draftContentJson,
+        card.current_content_json AS currentContentJson,card.is_stale AS isStale,
+        card.created_at AS createdAt,card.updated_at AS updatedAt
+        FROM tactic_cards AS card
+        JOIN evidence_bundles AS bundle ON bundle.id=card.bundle_id
+        JOIN evidence_analysis_jobs AS job ON job.id=card.job_id AND job.bundle_id=card.bundle_id
+        WHERE card.job_id=? ORDER BY card.created_at,card.id`,
+    ).bind(jobId).all<EvidenceCardRecord>()).results.map((card) => ({ ...card, isStale: Boolean(card.isStale) }));
   }
   async findCard(cardId: string): Promise<EvidenceCardRecord | null> {
     const row = await this.db.prepare(
@@ -618,6 +633,23 @@ export class EvidenceService {
     const created = await this.d.repository.findScenarioDraftByReview(review.id, card.id, expectedUpdatedAt);
     if (created === null) throw new Error("시나리오 초안 저장 결과를 확인할 수 없습니다.");
     return created;
+  }
+  async listCardsForJob(jobId: string, admin: EvidenceAdmin): Promise<EvidenceCardAdminDetail[]> {
+    void admin;
+    const cards = await this.d.repository.listCardsForJob(jobId);
+    return Promise.all(cards.map(async (card) => ({
+      ...card,
+      citations: (await this.d.repository.listCardCitations(card.id))
+        .filter((citation) => citation.inputVersion === card.bundleVersion)
+        .map((citation) => ({
+          chunkId: citation.chunkId,
+          sourceId: citation.sourceId,
+          videoClipId: citation.videoClipId,
+          locationLabel: citation.locationLabel,
+          content: citation.content,
+          contentHash: citation.contentHash,
+        })),
+    })));
   }
   async getBundleForAdmin(id:string,a:EvidenceAdmin):Promise<EvidenceBundleDetail|null>{void a;const b=await this.d.repository.getBundle(id);return b?{...b,sources:await this.d.repository.listSources(id),videoClips:await this.d.repository.listVideoClips(id)}:null} async listBundlesForAdmin(a:EvidenceAdmin){void a;return this.d.repository.listBundles()}
   private assertCurrentCard(card: EvidenceCardRecord): void {
