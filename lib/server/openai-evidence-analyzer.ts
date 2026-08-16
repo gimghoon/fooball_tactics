@@ -1,6 +1,8 @@
 import {
   EvidenceAnalyzerError,
+  extractedCitationIds,
   parseAnalyzerCards,
+  parseEvidenceChunks,
   parseExtractedEvidence,
   type EvidenceAnalyzer,
   type EvidenceChunkInput,
@@ -19,6 +21,8 @@ export type EvidenceAnalyzerEnvironment = {
 
 export type OpenAiEvidenceAnalyzerDependencies = {
   fetch?: typeof globalThis.fetch;
+  /** Test seam; production calls retain the exact 30-second default. */
+  requestTimeoutMs?: number;
 };
 
 type AdapterConfig = {
@@ -26,6 +30,7 @@ type AdapterConfig = {
   apiKey: string;
   model: string;
   fetch: typeof globalThis.fetch;
+  requestTimeoutMs: number;
 };
 
 const CARD_SCHEMA = {
@@ -121,6 +126,12 @@ function validateEndpoint(value: string): string {
   return endpoint.toString();
 }
 
+function timeoutMs(value: number | undefined): number {
+  if (value === undefined) return REQUEST_TIMEOUT_MS;
+  if (!Number.isFinite(value) || value <= 0) throw new EvidenceAnalyzerError("분석 요청 시간 제한이 올바르지 않습니다.", false);
+  return value;
+}
+
 /** Creates the only server-side adapter that reads the LLM environment bindings. */
 export function createConfiguredEvidenceAnalyzer(
   env: EvidenceAnalyzerEnvironment,
@@ -133,6 +144,7 @@ export function createConfiguredEvidenceAnalyzer(
     apiKey: required(env.EVIDENCE_LLM_API_KEY, "EVIDENCE_LLM_API_KEY"),
     model: required(env.EVIDENCE_LLM_MODEL, "EVIDENCE_LLM_MODEL"),
     fetch: fetchImpl,
+    requestTimeoutMs: timeoutMs(dependencies.requestTimeoutMs),
   });
 }
 
@@ -147,21 +159,23 @@ class OpenAiEvidenceAnalyzer implements EvidenceAnalyzer {
     input: { chunks: EvidenceChunkInput[]; promptVersion: string },
     signal: AbortSignal,
   ): Promise<ExtractedEvidence[]> {
+    const chunks = parseEvidenceChunks(input.chunks);
     const text = await this.request(EXTRACTION_INSTRUCTIONS, {
-      stage: "extract_evidence", promptVersion: input.promptVersion, chunks: input.chunks,
+      stage: "extract_evidence", promptVersion: input.promptVersion, chunks,
     }, "evidence_extraction", EXTRACTION_SCHEMA, signal);
-    return parseExtractedEvidence(text, input.chunks);
+    return parseExtractedEvidence(text, chunks);
   }
 
   async generateCards(
     input: { extracted: ExtractedEvidence[]; allowedCitationIds: string[]; promptVersion: string; schemaVersion: string },
     signal: AbortSignal,
   ): Promise<TacticCardContent[]> {
+    const extracted = parseExtractedEvidence({ extracted: input.extracted }, input.allowedCitationIds);
     const text = await this.request(CARD_INSTRUCTIONS, {
       stage: "generate_cards", promptVersion: input.promptVersion, schemaVersion: input.schemaVersion,
-      allowedCitationIds: input.allowedCitationIds, extracted: input.extracted,
+      allowedCitationIds: input.allowedCitationIds, extracted,
     }, "tactic_cards", CARD_SCHEMA, signal);
-    return parseAnalyzerCards(text, input.allowedCitationIds);
+    return parseAnalyzerCards(text, input.allowedCitationIds, extractedCitationIds(extracted));
   }
 
   private async request(
@@ -171,26 +185,41 @@ class OpenAiEvidenceAnalyzer implements EvidenceAnalyzer {
     schema: object,
     signal: AbortSignal,
   ): Promise<string> {
-    const timeout = new AbortController();
-    const timer = setTimeout(() => timeout.abort(), REQUEST_TIMEOUT_MS);
-    const forwardAbort = () => timeout.abort();
-    if (signal.aborted) timeout.abort();
+    const controller = new AbortController();
+    let timedOut = false;
+    let cancelled = signal.aborted;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, this.config.requestTimeoutMs);
+    const forwardAbort = () => {
+      cancelled = true;
+      controller.abort();
+    };
+    if (cancelled) controller.abort();
     signal.addEventListener("abort", forwardAbort, { once: true });
     try {
-      const response = await this.config.fetch(this.config.endpoint, {
-        method: "POST",
-        headers: { "content-type": "application/json", authorization: `Bearer ${this.config.apiKey}` },
-        body: JSON.stringify({
-          model: this.config.model,
-          instructions,
-          input: JSON.stringify(input),
-          text: { format: { type: "json_schema", name: schemaName, schema, strict: true } },
-          store: false,
-        }),
-        signal: timeout.signal,
-        // An Authorization header must never be forwarded to a different origin.
-        redirect: "error",
-      });
+      let response: Response;
+      try {
+        response = await this.config.fetch(this.config.endpoint, {
+          method: "POST",
+          headers: { "content-type": "application/json", authorization: `Bearer ${this.config.apiKey}` },
+          body: JSON.stringify({
+            model: this.config.model,
+            instructions,
+            input: JSON.stringify(input),
+            text: { format: { type: "json_schema", name: schemaName, schema, strict: true } },
+            store: false,
+          }),
+          signal: controller.signal,
+          // An Authorization header must never be forwarded to a different origin.
+          redirect: "error",
+        });
+      } catch {
+        if (cancelled) throw new EvidenceAnalyzerError("분석 요청이 취소되었습니다.", false);
+        if (timedOut) throw new EvidenceAnalyzerError("분석 요청 시간이 초과되었습니다.", true);
+        throw new EvidenceAnalyzerError("분석 제공자와 통신할 수 없습니다.", true);
+      }
       if (!response.ok) {
         const retryable = response.status === 408 || response.status === 429 || response.status >= 500;
         const message = response.status === 400 || response.status === 401 || response.status === 403
@@ -199,10 +228,6 @@ class OpenAiEvidenceAnalyzer implements EvidenceAnalyzer {
         throw new EvidenceAnalyzerError(message, retryable);
       }
       return extractOutputText(await parseResponseJson(response));
-    } catch (error) {
-      if (error instanceof EvidenceAnalyzerError) throw error;
-      if (timeout.signal.aborted) throw new EvidenceAnalyzerError("분석 요청 시간이 초과되었습니다.", true);
-      throw new EvidenceAnalyzerError("분석 제공자와 통신할 수 없습니다.", true);
     } finally {
       clearTimeout(timer);
       signal.removeEventListener("abort", forwardAbort);
@@ -256,17 +281,34 @@ function extractOutputText(value: unknown): string {
     throw new EvidenceAnalyzerError("분석 제공자 응답이 완료되지 않았습니다.", true);
   }
   if (!Array.isArray(value.output)) throw new EvidenceAnalyzerError("분석 제공자 응답에 출력이 없습니다.", true);
+  let messageCount = 0;
+  const texts: string[] = [];
   for (const item of value.output) {
-    if (!isRecord(item)) continue;
+    if (!isRecord(item)) throw new EvidenceAnalyzerError("분석 제공자 응답 항목이 올바르지 않습니다.", true);
     if (item.status === "incomplete") throw new EvidenceAnalyzerError("분석 제공자 응답이 완료되지 않았습니다.", true);
-    if (!Array.isArray(item.content)) continue;
+    if (item.type === "reasoning") {
+      if (item.status !== undefined && item.status !== "completed") {
+        throw new EvidenceAnalyzerError("분석 제공자 응답이 완료되지 않았습니다.", true);
+      }
+      continue;
+    }
+    if (item.type !== "message" || item.status !== "completed" || !Array.isArray(item.content)) {
+      throw new EvidenceAnalyzerError("분석 제공자 응답 항목이 올바르지 않습니다.", true);
+    }
+    messageCount += 1;
     for (const content of item.content) {
-      if (!isRecord(content)) continue;
+      if (!isRecord(content)) throw new EvidenceAnalyzerError("분석 제공자 출력이 올바르지 않습니다.", true);
       if (content.type === "refusal") throw new EvidenceAnalyzerError("분석 제공자가 요청을 거부했습니다.", false);
-      if (content.type === "output_text" && typeof content.text === "string" && content.text.trim()) return content.text;
+      if (content.type !== "output_text" || typeof content.text !== "string" || !content.text.trim()) {
+        throw new EvidenceAnalyzerError("분석 제공자 출력이 올바르지 않습니다.", true);
+      }
+      texts.push(content.text);
     }
   }
-  throw new EvidenceAnalyzerError("분석 제공자 응답에 구조화된 출력이 없습니다.", true);
+  if (messageCount !== 1 || texts.length !== 1) {
+    throw new EvidenceAnalyzerError("분석 제공자 응답에 구조화된 출력이 없습니다.", true);
+  }
+  return texts[0];
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

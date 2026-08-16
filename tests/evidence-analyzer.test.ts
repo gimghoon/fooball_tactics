@@ -3,7 +3,9 @@ import test from "node:test";
 import {
   EvidenceAnalyzerError,
   parseAnalyzerCards,
+  parseExtractedEvidence,
   type EvidenceChunkInput,
+  type ExtractedEvidence,
 } from "../lib/server/evidence-analyzer.ts";
 import { createConfiguredEvidenceAnalyzer } from "../lib/server/openai-evidence-analyzer.ts";
 
@@ -22,6 +24,21 @@ const card = (citationIds = ["chunk-1"]) => ({
   scenarioSuitable: true,
   animationSuitable: true,
 });
+const extracted = (): ExtractedEvidence => ({
+  citationIds: ["chunk-1"],
+  situation: "중앙으로 공을 운반한다.",
+  conditions: ["전방 압박이 없다."],
+  cues: ["중앙 수비수가 안쪽을 닫는다."],
+  actions: [{ action: "pass", reason: "측면 공간이 열려 있다.", citationIds: ["chunk-1"] }],
+  outcomes: ["측면으로 전진한다."],
+  exceptions: [],
+});
+const cardInput = { extracted: [extracted()], allowedCitationIds: ["chunk-1"], promptVersion: "p", schemaVersion: "s" };
+
+function record(value: unknown): Record<string, unknown> {
+  assert.ok(typeof value === "object" && value !== null && !Array.isArray(value));
+  return value as Record<string, unknown>;
+}
 
 const completedResponse = (text: string) => new Response(JSON.stringify({
   status: "completed",
@@ -55,7 +72,7 @@ test("configured adapter sends a strict Responses structured-output request and 
   });
 
   const cards = await analyzer.generateCards({
-    extracted: [], allowedCitationIds: ["chunk-1"], promptVersion: "prompt-1", schemaVersion: "schema-1",
+    ...cardInput, promptVersion: "prompt-1", schemaVersion: "schema-1",
   }, AbortSignal.timeout(1_000));
 
   assert.equal(analyzer.modelId, "gpt-test");
@@ -68,6 +85,15 @@ test("configured adapter sends a strict Responses structured-output request and 
   assert.equal(body.store, false);
   assert.equal((body.text as { format: { type: string; strict: boolean } }).format.type, "json_schema");
   assert.equal((body.text as { format: { type: string; strict: boolean } }).format.strict, true);
+  const cardSchema = record(record(body.text).format).schema;
+  const cardSchemaRecord = record(cardSchema);
+  const cardItems = record(record(record(cardSchemaRecord.properties).cards).items);
+  const preferredItems = record(record(record(cardItems.properties).preferred).items);
+  assert.equal(cardSchemaRecord.additionalProperties, false);
+  assert.deepEqual(cardSchemaRecord.required, ["cards"]);
+  assert.equal(cardItems.additionalProperties, false);
+  assert.ok((cardItems.required as string[]).includes("situation"));
+  assert.equal(preferredItems.additionalProperties, false);
   assert.match(String(body.instructions), /supplied evidence/i);
 });
 
@@ -81,7 +107,7 @@ test("rejects non-HTTPS endpoints and provider refusals or incomplete responses"
   }, { fetch: async () => new Response(JSON.stringify({
     status: "incomplete", output: [{ type: "message", content: [{ type: "refusal", refusal: "no" }] }],
   })) });
-  await assert.rejects(() => analyzer.generateCards({ extracted: [], allowedCitationIds: ["chunk-1"], promptVersion: "p", schemaVersion: "s" }, AbortSignal.timeout(1_000)), /완료/);
+  await assert.rejects(() => analyzer.generateCards(cardInput, AbortSignal.timeout(1_000)), /완료/);
 });
 
 test("classifies transient provider errors without leaking raw provider bodies or API keys", async () => {
@@ -90,7 +116,7 @@ test("classifies transient provider errors without leaking raw provider bodies o
   }, { fetch: async () => new Response("provider raw body secret-key", { status: 429 }) });
 
   await assert.rejects(
-    () => analyzer.generateCards({ extracted: [], allowedCitationIds: ["chunk-1"], promptVersion: "p", schemaVersion: "s" }, AbortSignal.timeout(1_000)),
+    () => analyzer.generateCards(cardInput, AbortSignal.timeout(1_000)),
     (error: unknown) => {
       assert.ok(error instanceof EvidenceAnalyzerError);
       assert.equal(error.retryable, true);
@@ -107,28 +133,154 @@ test("classifies provider configuration errors as terminal", async () => {
   }, { fetch: async () => new Response("do not disclose", { status: 401 }) });
 
   await assert.rejects(
-    () => analyzer.generateCards({ extracted: [], allowedCitationIds: ["chunk-1"], promptVersion: "p", schemaVersion: "s" }, AbortSignal.timeout(1_000)),
+    () => analyzer.generateCards(cardInput, AbortSignal.timeout(1_000)),
     (error: unknown) => error instanceof EvidenceAnalyzerError && !error.retryable && !error.message.includes("do not disclose"),
   );
 });
 
-test("bounds oversized responses and treats timeouts as retryable", async () => {
+test("bounds oversized responses", async () => {
   const tooLarge = createConfiguredEvidenceAnalyzer({
     EVIDENCE_LLM_ENDPOINT: "https://llm.example.test/v1/responses", EVIDENCE_LLM_API_KEY: "key", EVIDENCE_LLM_MODEL: "model",
   }, { fetch: async () => new Response("x".repeat(1_000_001)) });
-  await assert.rejects(() => tooLarge.generateCards({ extracted: [], allowedCitationIds: ["chunk-1"], promptVersion: "p", schemaVersion: "s" }, AbortSignal.timeout(1_000)), /너무 큽니다/);
+  await assert.rejects(() => tooLarge.generateCards(cardInput, AbortSignal.timeout(1_000)), /너무 큽니다/);
 
+});
+
+test("extraction parser rejects unknown fields, blank values, unknown citations, and empty output", () => {
+  assert.throws(() => parseExtractedEvidence(JSON.stringify({ extracted: [{ ...extracted(), providerResponse: "raw" }] }), chunks), /알 수 없는/);
+  assert.throws(() => parseExtractedEvidence(JSON.stringify({ extracted: [{ ...extracted(), situation: " " }] }), chunks), /필요/);
+  assert.throws(() => parseExtractedEvidence(JSON.stringify({ extracted: [{ ...extracted(), citationIds: ["unknown"] }] }), chunks), /근거/);
+  assert.throws(() => parseExtractedEvidence(JSON.stringify({ extracted: [] }), chunks), /근거/);
+});
+
+test("stage one rejects empty or blank chunks and stage two requires extracted citations", async () => {
+  let calls = 0;
+  const analyzer = createConfiguredEvidenceAnalyzer({
+    EVIDENCE_LLM_ENDPOINT: "https://llm.example.test/v1/responses", EVIDENCE_LLM_API_KEY: "key", EVIDENCE_LLM_MODEL: "model",
+  }, { fetch: async () => {
+    calls += 1;
+    return completedResponse(JSON.stringify({ cards: [card()] }));
+  } });
+  await assert.rejects(() => analyzer.analyzeExtraction({ chunks: [], promptVersion: "p" }, AbortSignal.timeout(1_000)), /근거/);
+  assert.equal(calls, 0);
+  await assert.rejects(() => analyzer.analyzeExtraction({ chunks: [{ ...chunks[0], content: " " }], promptVersion: "p" }, AbortSignal.timeout(1_000)), /필요/);
+  await assert.rejects(() => analyzer.generateCards({ ...cardInput, extracted: [] }, AbortSignal.timeout(1_000)), /근거/);
+  await assert.rejects(() => analyzer.generateCards({ ...cardInput, extracted: [{ ...extracted(), citationIds: ["chunk-2"], actions: [{ action: "pass", reason: "x", citationIds: ["chunk-2"] }] }] }, AbortSignal.timeout(1_000)), /근거/);
+});
+
+test("extraction adapter sends strict schema and evidence-only instructions", async () => {
+  let request: Request | undefined;
+  const analyzer = createConfiguredEvidenceAnalyzer({
+    EVIDENCE_LLM_ENDPOINT: "https://llm.example.test/v1/responses", EVIDENCE_LLM_API_KEY: "key", EVIDENCE_LLM_MODEL: "model",
+  }, { fetch: async (input, init) => {
+    request = new Request(input, init);
+    return completedResponse(JSON.stringify({ extracted: [extracted()] }));
+  } });
+  assert.deepEqual(await analyzer.analyzeExtraction({ chunks, promptVersion: "p" }, AbortSignal.timeout(1_000)), [extracted()]);
+  const body = await request?.json() as Record<string, unknown>;
+  const format = record(record(body.text).format);
+  const extractionSchema = record(format.schema);
+  const extractionItems = record(record(record(extractionSchema.properties).extracted).items);
+  assert.equal(format.name, "evidence_extraction");
+  assert.equal(extractionSchema.additionalProperties, false);
+  assert.equal(extractionItems.additionalProperties, false);
+  assert.deepEqual(extractionItems.required, ["citationIds", "situation", "conditions", "cues", "actions", "outcomes", "exceptions"]);
+  assert.equal(record(JSON.parse(String(body.input))).stage, "extract_evidence");
+  assert.match(String(body.instructions), /only.*supplied evidence/i);
+  assert.match(String(body.instructions), /conflict/i);
+  assert.match(String(body.instructions), /differing conditions/i);
+  assert.match(String(body.instructions), /action and reason.*cite/i);
+  assert.equal(request?.redirect, "error");
+});
+
+test("rejects all invalid Responses envelopes after inspecting every output item", async (t) => {
+  const envelopes: [string, unknown][] = [
+    ["later refusal", { status: "completed", output: [
+      { type: "message", status: "completed", content: [{ type: "output_text", text: JSON.stringify({ cards: [card()] }) }] },
+      { type: "message", status: "completed", content: [{ type: "refusal", refusal: "no" }] },
+    ] }],
+    ["response failed", { status: "failed", output: [] }],
+    ["missing output", { status: "completed" }],
+    ["incomplete item", { status: "completed", output: [{ type: "reasoning", status: "incomplete", summary: [] }] }],
+    ["incomplete message", { status: "completed", output: [{ type: "message", status: "incomplete", content: [{ type: "output_text", text: "{}" }] }] }],
+    ["multiple messages", { status: "completed", output: [
+      { type: "message", status: "completed", content: [{ type: "output_text", text: "{}" }] },
+      { type: "message", status: "completed", content: [{ type: "output_text", text: "{}" }] },
+    ] }],
+    ["multiple texts", { status: "completed", output: [{ type: "message", status: "completed", content: [{ type: "output_text", text: "{}" }, { type: "output_text", text: "{}" }] }] }],
+    ["unexpected message content", { status: "completed", output: [{ type: "message", status: "completed", content: [{ type: "output_image" }] }] }],
+    ["missing text", { status: "completed", output: [{ type: "message", status: "completed", content: [] }] }],
+    ["unexpected item", { status: "completed", output: [{ type: "tool_call", status: "completed" }] }],
+  ];
+  for (const [name, envelope] of envelopes) await t.test(name, async () => {
+    const analyzer = createConfiguredEvidenceAnalyzer({
+      EVIDENCE_LLM_ENDPOINT: "https://llm.example.test/v1/responses", EVIDENCE_LLM_API_KEY: "key", EVIDENCE_LLM_MODEL: "model",
+    }, { fetch: async () => new Response(JSON.stringify(envelope)) });
+    await assert.rejects(() => analyzer.generateCards(cardInput, AbortSignal.timeout(1_000)), EvidenceAnalyzerError);
+  });
+});
+
+test("allows a documented reasoning item before one completed structured message", async () => {
+  const analyzer = createConfiguredEvidenceAnalyzer({
+    EVIDENCE_LLM_ENDPOINT: "https://llm.example.test/v1/responses", EVIDENCE_LLM_API_KEY: "key", EVIDENCE_LLM_MODEL: "model",
+  }, { fetch: async () => new Response(JSON.stringify({
+    status: "completed",
+    output: [
+      { type: "reasoning", status: "completed", summary: [] },
+      { type: "message", status: "completed", content: [{ type: "output_text", text: JSON.stringify({ cards: [card()] }) }] },
+    ],
+  })) });
+  assert.deepEqual(await analyzer.generateCards(cardInput, AbortSignal.timeout(1_000)), [card()]);
+});
+
+test("sanitizes a shared analyzer error thrown by fetch", async () => {
+  const analyzer = createConfiguredEvidenceAnalyzer({
+    EVIDENCE_LLM_ENDPOINT: "https://llm.example.test/v1/responses", EVIDENCE_LLM_API_KEY: "secret-key", EVIDENCE_LLM_MODEL: "model",
+  }, { fetch: async () => { throw new EvidenceAnalyzerError("secret-key provider raw body", false); } });
+  await assert.rejects(() => analyzer.generateCards(cardInput, AbortSignal.timeout(1_000)), (error: unknown) => {
+    assert.ok(error instanceof EvidenceAnalyzerError);
+    assert.equal(error.message.includes("secret-key"), false);
+    assert.equal(error.message.includes("provider raw body"), false);
+    return true;
+  });
+});
+
+test("classifies 408, 400, 403, 5xx, and network failures without provider leakage", async (t) => {
+  for (const [status, retryable] of [[408, true], [400, false], [403, false], [503, true]] as const) await t.test(String(status), async () => {
+    const analyzer = createConfiguredEvidenceAnalyzer({
+      EVIDENCE_LLM_ENDPOINT: "https://llm.example.test/v1/responses", EVIDENCE_LLM_API_KEY: "secret-key", EVIDENCE_LLM_MODEL: "model",
+    }, { fetch: async () => new Response("provider raw body secret-key", { status }) });
+    await assert.rejects(() => analyzer.generateCards(cardInput, AbortSignal.timeout(1_000)), (error: unknown) => {
+      assert.ok(error instanceof EvidenceAnalyzerError);
+      assert.equal(error.retryable, retryable);
+      assert.equal(error.message.includes("secret-key"), false);
+      assert.equal(error.message.includes("provider raw body"), false);
+      return true;
+    });
+  });
+  const network = createConfiguredEvidenceAnalyzer({
+    EVIDENCE_LLM_ENDPOINT: "https://llm.example.test/v1/responses", EVIDENCE_LLM_API_KEY: "secret-key", EVIDENCE_LLM_MODEL: "model",
+  }, { fetch: async () => { throw new Error("secret-key provider raw body"); } });
+  await assert.rejects(() => network.generateCards(cardInput, AbortSignal.timeout(1_000)), (error: unknown) => {
+    assert.ok(error instanceof EvidenceAnalyzerError);
+    assert.equal(error.retryable, true);
+    assert.equal(error.message.includes("secret-key"), false);
+    assert.equal(error.message.includes("provider raw body"), false);
+    return true;
+  });
+});
+
+test("distinguishes an injected adapter timeout from caller cancellation", async () => {
+  const waitingFetch = async (_input: RequestInfo | URL, init?: RequestInit) => new Promise<Response>((_resolve, reject) => {
+    if (init?.signal?.aborted) return reject(new DOMException("aborted", "AbortError"));
+    init?.signal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")), { once: true });
+  });
   const timedOut = createConfiguredEvidenceAnalyzer({
     EVIDENCE_LLM_ENDPOINT: "https://llm.example.test/v1/responses", EVIDENCE_LLM_API_KEY: "key", EVIDENCE_LLM_MODEL: "model",
-  }, { fetch: async (_input, init) => new Promise<Response>((_resolve, reject) => {
-    if (init?.signal?.aborted) {
-      reject(new DOMException("aborted", "AbortError"));
-      return;
-    }
-    init?.signal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")));
-  }) });
-  await assert.rejects(
-    () => timedOut.generateCards({ extracted: [], allowedCitationIds: ["chunk-1"], promptVersion: "p", schemaVersion: "s" }, AbortSignal.abort()),
-    (error: unknown) => error instanceof EvidenceAnalyzerError && error.retryable,
-  );
+  }, { fetch: waitingFetch, requestTimeoutMs: 1 });
+  await assert.rejects(() => timedOut.generateCards(cardInput, AbortSignal.timeout(1_000)), (error: unknown) => error instanceof EvidenceAnalyzerError && error.retryable && /시간이 초과/.test(error.message));
+  const cancelled = createConfiguredEvidenceAnalyzer({
+    EVIDENCE_LLM_ENDPOINT: "https://llm.example.test/v1/responses", EVIDENCE_LLM_API_KEY: "key", EVIDENCE_LLM_MODEL: "model",
+  }, { fetch: waitingFetch, requestTimeoutMs: 1_000 });
+  await assert.rejects(() => cancelled.generateCards(cardInput, AbortSignal.abort()), (error: unknown) => error instanceof EvidenceAnalyzerError && !error.retryable && /취소/.test(error.message));
 });

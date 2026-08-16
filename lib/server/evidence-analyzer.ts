@@ -109,6 +109,29 @@ function knownCitationIds(known: readonly EvidenceChunkInput[] | readonly string
   return new Set(known.map((item) => typeof item === "string" ? item : item.id));
 }
 
+/** Validates first-stage input before evidence is sent to the provider. */
+export function parseEvidenceChunks(chunks: readonly EvidenceChunkInput[]): EvidenceChunkInput[] {
+  if (chunks.length === 0) fail("분석할 근거 청크가 필요합니다.");
+  return chunks.map((chunk, index) => {
+    const field = `chunks[${index}]`;
+    if (!isRecord(chunk)) fail(`${field}가 필요합니다.`);
+    exactKeys(chunk, ["id", "locationLabel", "content"], field);
+    return {
+      id: nonEmptyString(chunk.id, `${field}.id`),
+      locationLabel: nonEmptyString(chunk.locationLabel, `${field}.locationLabel`),
+      content: nonEmptyString(chunk.content, `${field}.content`),
+    };
+  });
+}
+
+/** Returns only citation IDs represented by the validated first-stage evidence. */
+export function extractedCitationIds(extracted: readonly ExtractedEvidence[]): Set<string> {
+  return new Set(extracted.flatMap((item) => [
+    ...item.citationIds,
+    ...item.actions.flatMap((action) => action.citationIds),
+  ]));
+}
+
 function cardArray(value: unknown): unknown[] {
   const parsed = parseJson(value, "카드");
   if (Array.isArray(parsed)) return parsed;
@@ -122,8 +145,12 @@ function cardArray(value: unknown): unknown[] {
 export function parseAnalyzerCards(
   value: unknown,
   known: readonly EvidenceChunkInput[] | readonly string[] | Set<string>,
+  extractedCitations?: ReadonlySet<string>,
 ): TacticCardContent[] {
-  const allowed = knownCitationIds(known);
+  const callerAllowed = knownCitationIds(known);
+  const allowed = extractedCitations === undefined
+    ? callerAllowed
+    : new Set([...callerAllowed].filter((id) => extractedCitations.has(id)));
   return cardArray(value).map((candidate, index) => {
     const field = `cards[${index}]`;
     if (!isRecord(candidate)) fail(`${field}가 필요합니다.`);
@@ -162,6 +189,7 @@ export function parseExtractedEvidence(
       ? parsed.extracted
       : fail("추출 결과 배열이 필요합니다.");
   const allowed = knownCitationIds(known);
+  if (allowed.size > 0 && records.length === 0) fail("추출 결과에는 하나 이상의 근거가 필요합니다.");
   return records.map((candidate, index) => {
     const field = `extracted[${index}]`;
     if (!isRecord(candidate)) fail(`${field}가 필요합니다.`);
