@@ -600,6 +600,96 @@ test("migration preserves durable decisions and quarantines invalid draft-only l
   assert.deepEqual(context.analyzer.calls, ["extract", "cards"]);
 });
 
+test("migration rewinds done draft-only jobs and quarantines current drafts despite durable review history", async () => {
+  const database = new DatabaseSync(":memory:");
+  database.exec("PRAGMA foreign_keys = ON");
+  const migrations = readdirSync("drizzle").filter((value) => /^\d{4}_.*\.sql$/.test(value)).sort();
+  for (const name of migrations.slice(0, -1)) database.exec(readFileSync(`drizzle/${name}`, "utf8"));
+  const cases = [
+    { id: "review-ready", status: "review_ready", review: null },
+    { id: "completed", status: "completed", review: null },
+    { id: "owner-history", status: "review_ready", review: "owner_reviewed" },
+    { id: "held-history", status: "review_ready", review: "held" },
+    { id: "rejected-history", status: "review_ready", review: "rejected" },
+  ] as const;
+  for (const item of cases) {
+    database.prepare(
+      "INSERT INTO evidence_bundles (id,title,purpose,version,content_version,created_at,updated_at) VALUES (?,?,?,?,?,?,?)",
+    ).run(`${item.id}-bundle`, item.id, "Resume", 1, `${item.id}-input`, 1, 1);
+    database.prepare(
+      `INSERT INTO evidence_analysis_jobs
+        (id,bundle_id,input_version,status,analyzer_model,prompt_version,schema_version,stage,is_stale,created_at,updated_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+    ).run(
+      `${item.id}-job`, `${item.id}-bundle`, `${item.id}-input`, item.status,
+      "model-1", "prompt-1", "schema-1", "done", 0, 1, 1,
+    );
+    database.prepare(
+      `INSERT INTO tactic_cards
+        (id,bundle_id,job_id,bundle_version,status,draft_content_json,current_content_json,is_stale,created_at,updated_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?)`,
+    ).run(
+      `${item.id}-card`, `${item.id}-bundle`, `${item.id}-job`, `${item.id}-input`,
+      "analysis_draft", "{}", "{}", 0, 1, 1,
+    );
+    database.prepare(
+      `INSERT INTO evidence_sources
+        (id,bundle_id,original_file_name,media_type,byte_size,content_hash,storage_key,extraction_status,created_at,updated_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?)`,
+    ).run(`${item.id}-source`, `${item.id}-bundle`, "notes.md", "text/markdown", 1, "hash", "key", "completed", 1, 1);
+    database.prepare(
+      `INSERT INTO evidence_chunks
+        (id,bundle_id,source_id,video_clip_id,ordinal,location_label,content,content_hash,created_at)
+        VALUES (?,?,?,?,?,?,?,?,?)`,
+    ).run(`${item.id}-chunk`, `${item.id}-bundle`, `${item.id}-source`, null, 0, "p1", "evidence", "hash", 1);
+    if (item.review !== null) {
+      database.prepare(
+        `INSERT INTO tactic_card_reviews
+          (id,card_id,actor_user_id,status,content_json,citation_snapshot_json,bundle_version,created_at)
+          VALUES (?,?,?,?,?,?,?,?)`,
+      ).run(
+        `${item.id}-review`, `${item.id}-card`, "reviewer", item.review, "{}", "[]", `${item.id}-input`, 1,
+      );
+    }
+  }
+
+  database.exec(readFileSync(`drizzle/${migrations.at(-1)}`, "utf8"));
+  for (const item of cases) {
+    assert.deepEqual({ ...database.prepare(
+      "SELECT status,is_stale AS isStale FROM tactic_cards WHERE id=?",
+    ).get(`${item.id}-card`) }, { status: "held", isStale: 1 });
+    if (item.review === null) {
+      assert.deepEqual({ ...database.prepare(
+        "SELECT status,stage,completed_at AS completedAt,error_message AS errorMessage,lease_owner AS leaseOwner FROM evidence_analysis_jobs WHERE id=?",
+      ).get(`${item.id}-job`) }, {
+        status: "queued", stage: "extract_evidence", completedAt: null, errorMessage: null, leaseOwner: null,
+      });
+    } else {
+      assert.deepEqual({ ...database.prepare(
+        "SELECT status,stage FROM evidence_analysis_jobs WHERE id=?",
+      ).get(`${item.id}-job`) }, { status: "review_ready", stage: "done" });
+      assert.equal(database.prepare(
+        "SELECT status FROM tactic_card_reviews WHERE id=?",
+      ).get(`${item.id}-review`)?.status, item.review);
+    }
+  }
+
+  const d1 = new SQLiteD1Database(database, false);
+  const context = createContext({ database: d1 });
+  for (const id of ["review-ready", "completed"] as const) {
+    await context.jobs.runAnalysisStep(`${id}-job`);
+    await drainScheduled(context.scheduled);
+    assert.equal(d1.first<{ count: number }>(
+      `SELECT count(*) AS count FROM tactic_cards
+        WHERE job_id=? AND status='analysis_draft' AND is_stale=0`, `${id}-job`,
+    ).count, 1);
+    assert.equal(d1.first<{ count: number }>(
+      `SELECT count(*) AS count FROM tactic_cards
+        WHERE job_id=? AND status='held' AND is_stale=1`, `${id}-job`,
+    ).count, 1);
+  }
+});
+
 test("same input version deduplicates analysis jobs", async () => {
   const context = createContext();
   seedBundle(context.database);

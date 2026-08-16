@@ -11,10 +11,12 @@ WHERE card.`status` IN ('owner_reviewed','coach_reviewed','held','rejected')
 CREATE TABLE `__task6_jobs_with_durable_cards` (`job_id` text PRIMARY KEY NOT NULL);--> statement-breakpoint
 INSERT INTO `__task6_jobs_with_durable_cards` (`job_id`)
 SELECT DISTINCT `job_id` FROM `__task6_durable_cards`;--> statement-breakpoint
+CREATE TABLE `__task6_jobs_with_quarantined_drafts` (`job_id` text PRIMARY KEY NOT NULL);--> statement-breakpoint
+INSERT INTO `__task6_jobs_with_quarantined_drafts` (`job_id`)
+SELECT DISTINCT `job_id` FROM `tactic_cards` WHERE `status`='analysis_draft';--> statement-breakpoint
 UPDATE `tactic_cards`
 SET `status`='held',`is_stale`=1
-WHERE `status`='analysis_draft'
-	AND NOT EXISTS (SELECT 1 FROM `__task6_durable_cards` WHERE `card_id`=`tactic_cards`.`id`);--> statement-breakpoint
+WHERE `status`='analysis_draft';--> statement-breakpoint
 CREATE TABLE `__new_evidence_analysis_jobs` (
 	`id` text PRIMARY KEY NOT NULL,
 	`bundle_id` text NOT NULL,
@@ -45,10 +47,12 @@ CREATE TABLE `__new_evidence_analysis_jobs` (
 INSERT INTO `__new_evidence_analysis_jobs`("id", "bundle_id", "input_version", "status", "analyzer_model", "prompt_version", "schema_version", "stage", "lease_owner", "lease_token", "lease_expires_at", "error_message", "started_at", "completed_at", "attempt_count", "extracted_evidence_json", "generated_cards_json", "is_stale", "created_at", "updated_at") SELECT "id", "bundle_id", "input_version", CASE
 	WHEN EXISTS (SELECT 1 FROM `__task6_jobs_with_durable_cards` WHERE `job_id`=`evidence_analysis_jobs`.`id`)
 		THEN CASE WHEN "status"='completed' THEN 'completed' ELSE 'review_ready' END
+	WHEN EXISTS (SELECT 1 FROM `__task6_jobs_with_quarantined_drafts` WHERE `job_id`=`evidence_analysis_jobs`.`id`) THEN 'queued'
 	WHEN "stage" IN ('chunks_ready','extract_evidence','evidence_extracted','generate_cards','cards_generated','persist_cards','cards_persisted') THEN 'queued'
 	ELSE "status"
 END, "analyzer_model", "prompt_version", "schema_version", CASE
 	WHEN EXISTS (SELECT 1 FROM `__task6_jobs_with_durable_cards` WHERE `job_id`=`evidence_analysis_jobs`.`id`) THEN 'done'
+	WHEN EXISTS (SELECT 1 FROM `__task6_jobs_with_quarantined_drafts` WHERE `job_id`=`evidence_analysis_jobs`.`id`) THEN 'extract_evidence'
 	WHEN "stage"='queued' THEN 'validate_sources'
 	WHEN "stage"='validate_sources' THEN 'validate_sources'
 	WHEN "stage"='sources_validated' THEN 'extract_text'
@@ -66,13 +70,16 @@ END, "analyzer_model", "prompt_version", "schema_version", CASE
 	WHEN "stage"='completed' THEN 'done'
 	ELSE 'validate_sources'
 END, NULL, NULL, NULL,
-CASE WHEN "stage" IN ('chunks_ready','extract_evidence','evidence_extracted','generate_cards','cards_generated','persist_cards','cards_persisted') THEN NULL ELSE "error_message" END,
+CASE WHEN EXISTS (SELECT 1 FROM `__task6_jobs_with_quarantined_drafts` WHERE `job_id`=`evidence_analysis_jobs`.`id`)
+	OR "stage" IN ('chunks_ready','extract_evidence','evidence_extracted','generate_cards','cards_generated','persist_cards','cards_persisted') THEN NULL ELSE "error_message" END,
 "started_at",
-CASE WHEN "stage" IN ('chunks_ready','extract_evidence','evidence_extracted','generate_cards','cards_generated','persist_cards','cards_persisted') THEN NULL ELSE "completed_at" END,
+CASE WHEN EXISTS (SELECT 1 FROM `__task6_jobs_with_quarantined_drafts` WHERE `job_id`=`evidence_analysis_jobs`.`id`)
+	OR "stage" IN ('chunks_ready','extract_evidence','evidence_extracted','generate_cards','cards_generated','persist_cards','cards_persisted') THEN NULL ELSE "completed_at" END,
 0, NULL, NULL, "is_stale", "created_at", "updated_at" FROM `evidence_analysis_jobs`;--> statement-breakpoint
 DROP TABLE `evidence_analysis_jobs`;--> statement-breakpoint
 ALTER TABLE `__new_evidence_analysis_jobs` RENAME TO `evidence_analysis_jobs`;--> statement-breakpoint
 DROP TABLE `__task6_jobs_with_durable_cards`;--> statement-breakpoint
+DROP TABLE `__task6_jobs_with_quarantined_drafts`;--> statement-breakpoint
 DROP TABLE `__task6_durable_cards`;--> statement-breakpoint
 CREATE UNIQUE INDEX `idx_evidence_analysis_jobs_input_version` ON `evidence_analysis_jobs` (`bundle_id`,`input_version`);--> statement-breakpoint
 CREATE UNIQUE INDEX `idx_evidence_analysis_jobs_id_bundle` ON `evidence_analysis_jobs` (`id`,`bundle_id`);--> statement-breakpoint
