@@ -114,6 +114,7 @@ export const evidenceVideoClips = sqliteTable("evidence_video_clips", {
 export const evidenceChunks = sqliteTable("evidence_chunks", {
   id: text("id").primaryKey(),
   bundleId: text("bundle_id").notNull().references(() => evidenceBundles.id, { onDelete: "cascade" }),
+  inputVersion: text("input_version").notNull(),
   sourceId: text("source_id"),
   videoClipId: text("video_clip_id"),
   ordinal: integer("ordinal").notNull(),
@@ -123,6 +124,8 @@ export const evidenceChunks = sqliteTable("evidence_chunks", {
   createdAt: integer("created_at", { mode: "timestamp_ms" }).notNull(),
 }, (table) => [
   uniqueIndex("idx_evidence_chunks_id_bundle").on(table.id, table.bundleId),
+  uniqueIndex("idx_evidence_chunks_source_input_ordinal").on(table.bundleId, table.inputVersion, table.sourceId, table.ordinal),
+  uniqueIndex("idx_evidence_chunks_clip_input_ordinal").on(table.bundleId, table.inputVersion, table.videoClipId, table.ordinal),
   check("ck_evidence_chunks_exactly_one_provenance", sql`(${table.sourceId} IS NULL) != (${table.videoClipId} IS NULL)`),
   foreignKey({
     name: "fk_evidence_chunks_source_bundle",
@@ -144,19 +147,27 @@ export const evidenceAnalysisJobs = sqliteTable("evidence_analysis_jobs", {
   analyzerModel: text("analyzer_model").notNull(),
   promptVersion: text("prompt_version").notNull(),
   schemaVersion: text("schema_version").notNull(),
-  stage: text("stage").notNull().default("queued"),
+  stage: text("stage").notNull().default("validate_sources"),
   leaseOwner: text("lease_owner"),
+  leaseToken: text("lease_token"),
   leaseExpiresAt: integer("lease_expires_at", { mode: "timestamp_ms" }),
   errorMessage: text("error_message"),
   startedAt: integer("started_at", { mode: "timestamp_ms" }),
   completedAt: integer("completed_at", { mode: "timestamp_ms" }),
+  attemptCount: integer("attempt_count").notNull().default(0),
+  extractedEvidenceJson: text("extracted_evidence_json"),
+  generatedCardsJson: text("generated_cards_json"),
   isStale: integer("is_stale", { mode: "boolean" }).notNull().default(false),
   createdAt: integer("created_at", { mode: "timestamp_ms" }).notNull(),
   updatedAt: integer("updated_at", { mode: "timestamp_ms" }).notNull(),
 }, (table) => [
-  uniqueIndex("idx_evidence_analysis_jobs_input_version").on(table.inputVersion),
+  uniqueIndex("idx_evidence_analysis_jobs_input_version").on(table.bundleId, table.inputVersion),
   uniqueIndex("idx_evidence_analysis_jobs_id_bundle").on(table.id, table.bundleId),
   check("ck_evidence_analysis_jobs_status", sql`${table.status} IN ('queued', 'running', 'review_ready', 'completed', 'failed')`),
+  check(
+    "ck_evidence_analysis_jobs_stage",
+    sql`${table.stage} IN ('validate_sources', 'extract_text', 'normalize_clips', 'extract_evidence', 'generate_cards', 'persist_cards', 'done')`,
+  ),
 ]);
 
 export const tacticCards = sqliteTable("tactic_cards", {

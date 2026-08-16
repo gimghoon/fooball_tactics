@@ -163,7 +163,7 @@ function seedApprovedWork(database: SQLiteD1Database, bundle: EvidenceBundleReco
     `INSERT INTO evidence_analysis_jobs
       (id,bundle_id,input_version,status,analyzer_model,prompt_version,schema_version,stage,is_stale,created_at,updated_at)
       VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
-    "job-1", bundle.id, bundle.contentVersion, "queued", "model-1", "prompt-1", "schema-1", "queued", 0, 1, 1,
+    "job-1", bundle.id, bundle.contentVersion, "queued", "model-1", "prompt-1", "schema-1", "validate_sources", 0, 1, 1,
   );
   database.run(
     `INSERT INTO tactic_cards
@@ -319,7 +319,7 @@ test("a card link created after impact checks aborts D1 deletion and restores bo
       `INSERT INTO evidence_analysis_jobs
         (id,bundle_id,input_version,status,analyzer_model,prompt_version,schema_version,stage,is_stale,created_at,updated_at)
         VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
-      "race-job", bundle.id, "race-input", "completed", "model-1", "prompt-1", "schema-1", "completed", 0, 1, 1,
+      "race-job", bundle.id, "race-input", "completed", "model-1", "prompt-1", "schema-1", "done", 0, 1, 1,
     );
     context.database.run(
       `INSERT INTO tactic_cards
@@ -329,9 +329,9 @@ test("a card link created after impact checks aborts D1 deletion and restores bo
     );
     context.database.run(
       `INSERT INTO evidence_chunks
-        (id,bundle_id,source_id,video_clip_id,ordinal,location_label,content,content_hash,created_at)
-        VALUES (?,?,?,?,?,?,?,?,?)`,
-      "race-chunk", bundle.id, source.id, null, 0, "p1", "근거", "chunk-hash", 1,
+        (id,bundle_id,input_version,source_id,video_clip_id,ordinal,location_label,content,content_hash,created_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?)`,
+      "race-chunk", bundle.id, beforeDelete.contentVersion, source.id, null, 0, "p1", "근거", "chunk-hash", 1,
     );
     context.database.run(
       "INSERT INTO tactic_card_citations (id,bundle_id,card_id,chunk_id,created_at) VALUES (?,?,?,?,?)",
