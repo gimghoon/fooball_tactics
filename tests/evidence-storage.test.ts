@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { deflateSync } from "node:zlib";
 
 import {
   EvidenceFileStore,
@@ -118,6 +119,64 @@ function textPdf(text: string): Uint8Array {
   document += offsets.slice(1).map((offset) => `${offset.toString().padStart(10, "0")} 00000 n \n`).join("");
   document += `trailer\n<< /Size ${objects.length + 1} /Root 1 0 R >>\nstartxref\n${xref}\n%%EOF`;
   return new TextEncoder().encode(document);
+}
+
+function corruptFlatePdf(): Uint8Array {
+  const stream = "notflate";
+  const objects = [
+    "<< /Type /Catalog /Pages 2 0 R >>",
+    "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+    "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R >>",
+    `<< /Length ${stream.length} /Filter /FlateDecode >>\nstream\n${stream}\nendstream`,
+  ];
+  let document = "%PDF-1.4\n";
+  const offsets = [0];
+  for (const [index, object] of objects.entries()) {
+    offsets.push(document.length);
+    document += `${index + 1} 0 obj\n${object}\nendobj\n`;
+  }
+  const xref = document.length;
+  document += `xref\n0 ${objects.length + 1}\n0000000000 65535 f \n`;
+  document += offsets.slice(1).map((offset) => `${offset.toString().padStart(10, "0")} 00000 n \n`).join("");
+  document += `trailer\n<< /Size ${objects.length + 1} /Root 1 0 R >>\nstartxref\n${xref}\n%%EOF`;
+  return new TextEncoder().encode(document);
+}
+
+function validFlateTextPdf(text: string): Uint8Array {
+  const content = `BT /F1 12 Tf 72 720 Td (${text}) Tj ET`;
+  const compressed = deflateSync(new TextEncoder().encode(content));
+  const chunks: Uint8Array[] = [];
+  const offsets = [0];
+  let length = 0;
+  const push = (value: string | Uint8Array) => {
+    const bytes = typeof value === "string" ? new TextEncoder().encode(value) : value;
+    chunks.push(bytes);
+    length += bytes.byteLength;
+  };
+  push("%PDF-1.4\n");
+  for (const [id, object] of [
+    [1, "<< /Type /Catalog /Pages 2 0 R >>"],
+    [2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"],
+    [3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>"],
+  ] as const) {
+    offsets.push(length);
+    push(`${id} 0 obj\n${object}\nendobj\n`);
+  }
+  offsets.push(length);
+  push(`4 0 obj\n<< /Length ${compressed.byteLength} /Filter /FlateDecode >>\nstream\n`);
+  push(compressed);
+  push("\nendstream\nendobj\n");
+  offsets.push(length);
+  push("5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n");
+  const xref = length;
+  push(`xref\n0 6\n0000000000 65535 f \n${offsets.slice(1).map((offset) => `${offset.toString().padStart(10, "0")} 00000 n \n`).join("")}trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n${xref}\n%%EOF`);
+  const output = new Uint8Array(length);
+  let cursor = 0;
+  for (const chunk of chunks) {
+    output.set(chunk, cursor);
+    cursor += chunk.byteLength;
+  }
+  return output;
 }
 
 test("accepts the exact 20 MiB boundary and rejects one byte over", async () => {
@@ -476,4 +535,36 @@ test("rejects an unparseable PDF before persisting objects or metadata", async (
 
   assert.equal(bucket.objects.size, 0);
   assert.equal(registration.rows.length, 0);
+});
+
+test("rejects corrupt PDF page content before persisting objects or metadata", async () => {
+  const bucket = new FakeR2();
+  const registration = new FakeD1();
+  const store = new EvidenceFileStore({ bucket, registration });
+
+  await assert.rejects(() => store.putValidatedFile({
+    bundleId: "bundle-1",
+    name: "corrupt-stream.pdf",
+    type: "application/pdf",
+    bytes: corruptFlatePdf(),
+  }), /PDF 파일을 확인할 수 없습니다/);
+
+  assert.equal(bucket.objects.size, 0);
+  assert.equal(registration.rows.length, 0);
+});
+
+test("accepts a valid FlateDecode text page and reuses its completed preflight", async () => {
+  const bucket = new FakeR2();
+  const store = new EvidenceFileStore({ bucket, registration: new FakeD1() });
+
+  const source = await store.putValidatedFile({
+    bundleId: "bundle-1",
+    name: "compressed.pdf",
+    type: "application/pdf",
+    bytes: validFlateTextPdf("Press forward"),
+  });
+
+  assert.equal(source.extractionStatus, "completed");
+  assert.notEqual(source.extractedTextKey, null);
+  assert.equal(bucket.putKeys.length, 2);
 });

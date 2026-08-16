@@ -93,3 +93,32 @@ passed
 ```
 
 Fix Round 1 concern: the repository's standalone `tsc --noEmit` command remains unusable because the existing TypeScript configuration rejects the project's `.ts` import convention and lacks Cloudflare ambient types, alongside unrelated pre-existing application type errors. The required lint, production build, full project tests, and complete evidence matrix pass.
+
+## Fix Round 2
+
+Status: both Important findings from `task-8-rereview-1.md` are addressed.
+
+- PDF validation now traverses every PDF.js page and content stream before the first R2 write, with `stopAtErrors` enabled. Because PDF.js deliberately recovers some corrupt Flate streams as empty content, validation also drains every directly Flate-encoded stream through the platform `DecompressionStream` before page traversal. A corrupt `/FlateDecode` page is therefore rejected as 415 with zero objects and zero metadata instead of being mislabeled scan-only.
+- The bounded PDF.js extraction result is retained on the validated file and reused after original-object persistence, removing the former duplicate document/page parse. Existing page, UTF-8 output, interruption, and deadline limits remain enforced by the preflight extraction.
+- Structurally valid textless PDFs remain accepted and stored as `extractionStatus: failed` with the scan/OCR message. Valid uncompressed and Flate-compressed text PDFs remain accepted with completed extracted text.
+- The upload adapter now passes `EvidencePublicError` through centralized typed routing after store cleanup. Real-store registration CAS and deleted-bundle failures clean both R2 objects, return fixed redacted 409/404 responses, and do not leak the thrown message. Unknown storage/provider failures remain fixed redacted 503 responses.
+
+Fix-round regression coverage includes a structurally loadable PDF with a corrupt Flate page stream, valid scan-only and text PDFs through the real HTTP handler, a valid compressed text PDF, zero-write assertions, and real-store cleanup followed by typed 409/404 propagation.
+
+Verification:
+
+```text
+npx tsx --test tests/evidence-analyzer.test.ts tests/evidence-auth.test.ts tests/evidence-domain.test.ts tests/evidence-jobs.test.ts tests/evidence-review.test.ts tests/evidence-routes.test.ts tests/evidence-service.test.ts tests/evidence-storage.test.ts
+152 passed, 0 failed
+
+npm test
+47 domain + 16 route/component + production build + 3 rendered HTML tests passed
+
+npm run lint
+passed
+
+git diff --check
+passed
+```
+
+No new concerns. The pre-existing standalone `tsc --noEmit` configuration limitation documented in Fix Round 1 is unchanged; the required lint, production build, full project tests, and complete evidence matrix pass.

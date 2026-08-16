@@ -1,6 +1,5 @@
 import { EvidenceValidationError } from "../domain/evidence.ts";
 import {
-  assertPdfIsNotPasswordProtected,
   extractEvidenceText,
   type EvidenceFileKind,
   type ExtractedPage,
@@ -33,6 +32,8 @@ export type ValidatedEvidenceFile = {
   mediaType: EvidenceMediaType;
   sha256: string;
   bytes: Uint8Array;
+  /** PDF.js page/content preflight, reused after the original object is stored. */
+  preflightExtractedPages: ExtractedPage[] | null;
 };
 
 export type EvidenceFileInput = {
@@ -147,19 +148,57 @@ function isUnsafeTextSignature(bytes: Uint8Array): boolean {
     || bytes.includes(0);
 }
 
-async function resolveKindAndMediaType(input: EvidenceFileInput): Promise<Pick<ValidatedEvidenceFile, "kind" | "mediaType">> {
+/**
+ * PDF.js deliberately recovers some corrupt Flate streams as empty content,
+ * even with stopAtErrors enabled. Validate each directly Flate-encoded stream
+ * before page traversal so corruption cannot be confused with a valid scan.
+ */
+async function assertPdfFlateStreamsDecode(bytes: Uint8Array): Promise<void> {
+  const source = new TextDecoder("latin1").decode(bytes);
+  const streamPattern = /<<(.*?)>>\s*stream(?:\r\n|\n|\r)/gs;
+  for (const match of source.matchAll(streamPattern)) {
+    const dictionary = match[1] ?? "";
+    const directFlate = /\/Filter\s*\/(?:FlateDecode|Fl)(?=[\s/>])/i.test(dictionary);
+    const firstArrayFilter = /\/Filter\s*\[\s*\/(?:FlateDecode|Fl)(?=[\s/>])/i.test(dictionary);
+    if (!directFlate && !firstArrayFilter) continue;
+
+    const start = (match.index ?? 0) + match[0].length;
+    const indirectLength = /\/Length\s+\d+\s+\d+\s+R/i.test(dictionary);
+    const directLength = indirectLength ? null : /\/Length\s+(\d+)\b/i.exec(dictionary);
+    const endMarker = source.indexOf("endstream", start);
+    if (endMarker < start) throw new EvidenceValidationError("PDF 파일을 확인할 수 없습니다.");
+    const declaredLength = directLength === null ? null : Number(directLength[1]);
+    let end = declaredLength === null ? endMarker : start + declaredLength;
+    if (declaredLength === null) {
+      while (end > start && [0x0a, 0x0d].includes(bytes[end - 1] ?? -1)) end -= 1;
+    }
+    if (!Number.isSafeInteger(end) || end < start || end > bytes.byteLength) {
+      throw new EvidenceValidationError("PDF 파일을 확인할 수 없습니다.");
+    }
+
+    const compressed = bytes.slice(start, end);
+    try {
+      const reader = new Blob([compressed.buffer])
+        .stream()
+        .pipeThrough(new DecompressionStream("deflate"))
+        .getReader();
+      while (!(await reader.read()).done) {
+        // Drain without retaining decompressed bytes; PDF.js enforces the
+        // page/text output budgets during the following reusable preflight.
+      }
+    } catch {
+      throw new EvidenceValidationError("PDF 파일을 확인할 수 없습니다.");
+    }
+  }
+}
+
+function resolveKindAndMediaType(input: EvidenceFileInput): Pick<ValidatedEvidenceFile, "kind" | "mediaType"> {
   const extension = extensionFor(input.name);
   if (extension === "pdf") {
     if (input.type !== "application/pdf" || !startsWith(input.bytes, [0x25, 0x50, 0x44, 0x46, 0x2d])) invalidFormat();
     if (hasUnsafePdfTrailer(input.bytes)) invalidFormat();
     if (containsBytes(input.bytes, "/Encrypt") || hasDecodedPdfName(input.bytes, "Encrypt")) {
       throw new EvidenceValidationError("암호화된 PDF는 업로드할 수 없습니다.");
-    }
-    try {
-      await assertPdfIsNotPasswordProtected(input.bytes);
-    } catch (error) {
-      if (error instanceof PdfPasswordProtectedError) throw new EvidenceValidationError(error.message);
-      throw new EvidenceValidationError("PDF 파일을 확인할 수 없습니다.");
     }
     return { kind: "pdf", mediaType: "application/pdf" };
   }
@@ -180,7 +219,17 @@ export async function validateEvidenceFile(input: EvidenceFileInput): Promise<Va
   if (input.bytes.byteLength > MAX_EVIDENCE_FILE_BYTES) {
     throw new EvidenceValidationError("파일은 20MB 이하여야 합니다.");
   }
-  const file = await resolveKindAndMediaType(input);
+  const file = resolveKindAndMediaType(input);
+  let preflightExtractedPages: ExtractedPage[] | null = null;
+  if (file.kind === "pdf") {
+    try {
+      await assertPdfFlateStreamsDecode(input.bytes);
+      preflightExtractedPages = await extractEvidenceText(file.kind, input.bytes);
+    } catch (error) {
+      if (error instanceof PdfPasswordProtectedError) throw new EvidenceValidationError(error.message);
+      throw new EvidenceValidationError("PDF 파일을 확인할 수 없습니다.");
+    }
+  }
   if (file.kind === "text") {
     try {
       new TextDecoder("utf-8", { fatal: true }).decode(input.bytes);
@@ -190,7 +239,7 @@ export async function validateEvidenceFile(input: EvidenceFileInput): Promise<Va
   }
   const digest = await crypto.subtle.digest("SHA-256", input.bytes);
   const sha256 = Array.from(new Uint8Array(digest), (value) => value.toString(16).padStart(2, "0")).join("");
-  return { ...file, sha256, bytes: input.bytes };
+  return { ...file, sha256, bytes: input.bytes, preflightExtractedPages };
 }
 
 function opaqueStorageKey(bundleId: string, sourceId: string, sha256: string): string {
@@ -213,7 +262,7 @@ export class EvidenceFileStore {
 
     await this.dependencies.bucket.put(storageKey, file.bytes);
     try {
-      const extracted = await extractEvidenceText(file.kind, file.bytes);
+      const extracted = file.preflightExtractedPages ?? await extractEvidenceText(file.kind, file.bytes);
       if (file.kind === "pdf" && extracted.some((page) => page.text.trim() === "")) {
         extractionStatus = "failed";
         extractionError = "스캔 PDF는 OCR을 지원하지 않습니다.";

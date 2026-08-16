@@ -26,7 +26,7 @@ export type EvidencePdfPage = { getTextContent: () => Promise<EvidencePdfTextCon
 export type EvidencePdfDocument = { numPages: number; getPage: (page: number) => Promise<EvidencePdfPage> };
 export type EvidencePdfLoadingTask = { promise: Promise<EvidencePdfDocument>; destroy: () => Promise<void> };
 export type EvidencePdfLoader = {
-  getDocument: (input: { data: Uint8Array; useWorkerFetch: false; isEvalSupported: false }) => EvidencePdfLoadingTask;
+  getDocument: (input: { data: Uint8Array; useWorkerFetch: false; isEvalSupported: false; stopAtErrors: true }) => EvidencePdfLoadingTask;
 };
 
 export class PdfPasswordProtectedError extends Error {
@@ -159,34 +159,6 @@ async function defaultPdfLoader(): Promise<EvidencePdfLoader> {
   };
 }
 
-/** Identifies password-protected PDFs from PDF.js before any R2 persistence. */
-export async function assertPdfIsNotPasswordProtected(bytes: Uint8Array): Promise<void> {
-  const { getDocument, PasswordException } = await loadPdfJs();
-  const loadingTask = getDocument({
-    data: bytes.slice(),
-    useWorkerFetch: false,
-    isEvalSupported: false,
-  });
-  let destroyPromise: Promise<void> | undefined;
-  const destroy = () => {
-    destroyPromise ??= loadingTask.destroy().catch(() => undefined);
-    return destroyPromise;
-  };
-  const guard = createOperationGuard({});
-  try {
-    await guard.wait(loadingTask.promise, destroy);
-  } catch (error) {
-    if (error instanceof PasswordException || (error instanceof Error && error.name === "PasswordException")) {
-      throw new PdfPasswordProtectedError();
-    }
-    if (error instanceof ExtractionInterruptedError) throw error;
-    throw error;
-  } finally {
-    guard.dispose();
-    await destroy();
-  }
-}
-
 async function extractPdfPages(
   bytes: Uint8Array,
   budget: ExtractionBudget,
@@ -199,6 +171,7 @@ async function extractPdfPages(
     data: bytes.slice(),
     useWorkerFetch: false,
     isEvalSupported: false,
+    stopAtErrors: true,
   });
   let destroyPromise: Promise<void> | undefined;
   const destroy = () => {
@@ -223,6 +196,11 @@ async function extractPdfPages(
       pages.push(extractedPage);
     }
     return pages;
+  } catch (error) {
+    if (error instanceof Error && error.name === "PasswordException") {
+      throw new PdfPasswordProtectedError();
+    }
+    throw error;
   } finally {
     guard.dispose();
     await destroy();

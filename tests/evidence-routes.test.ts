@@ -130,6 +130,27 @@ function streamingRequest(bodyStream: ReadableStream<Uint8Array>, contentType: s
   } as RequestInit & { duplex: "half" });
 }
 
+function onePagePdf(stream: string, filter = ""): Uint8Array {
+  const objects = [
+    "<< /Type /Catalog /Pages 2 0 R >>",
+    "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+    "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>",
+    `<< /Length ${stream.length}${filter} >>\nstream\n${stream}\nendstream`,
+    "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+  ];
+  let document = "%PDF-1.4\n";
+  const offsets = [0];
+  for (const [index, object] of objects.entries()) {
+    offsets.push(document.length);
+    document += `${index + 1} 0 obj\n${object}\nendobj\n`;
+  }
+  const xref = document.length;
+  document += `xref\n0 ${objects.length + 1}\n0000000000 65535 f \n`;
+  document += offsets.slice(1).map((offset) => `${offset.toString().padStart(10, "0")} 00000 n \n`).join("");
+  document += `trailer\n<< /Size ${objects.length + 1} /Root 1 0 R >>\nstartxref\n${xref}\n%%EOF`;
+  return new TextEncoder().encode(document);
+}
+
 async function body(response: Response): Promise<Record<string, unknown>> {
   return await response.json() as Record<string, unknown>;
 }
@@ -349,7 +370,7 @@ test("multipart upload rejects duplicate file and unexpected form parts", async 
   assert.equal(unexpectedResponse.status, 400);
 });
 
-test("malformed PDF is 415 through the real store and leaves no object or metadata", async () => {
+test("PDF preflight rejects corrupt content and preserves valid scan/text behavior through the real route", async () => {
   const objects = new Map<string, unknown>();
   const rows: StoredEvidenceFile[] = [];
   const store = new EvidenceFileStore({
@@ -363,18 +384,62 @@ test("malformed PDF is 415 through the real store and leaves no object or metada
       async register(value) { rows.push(value); return value; },
     },
   });
-  const form = new FormData();
-  form.set("file", new File(["%PDF-1.7\n%%EOF"], "broken.pdf", { type: "application/pdf" }));
+  async function upload(bytes: Uint8Array, name: string) {
+    const form = new FormData();
+    form.set("file", new File([bytes], name, { type: "application/pdf" }));
+    return handleEvidenceFileUpload(
+      new Request("http://localhost", { method: "POST", body: form }),
+      context({ bundleId: bundle.id }),
+      runtime({ fileStore: store }),
+    );
+  }
 
-  const response = await handleEvidenceFileUpload(
-    new Request("http://localhost", { method: "POST", body: form }),
-    context({ bundleId: bundle.id }),
-    runtime({ fileStore: store }),
-  );
-
-  assert.equal(response.status, 415);
+  const corrupt = await upload(onePagePdf("notflate", " /Filter /FlateDecode"), "corrupt.pdf");
+  assert.equal(corrupt.status, 415);
   assert.equal(objects.size, 0);
   assert.equal(rows.length, 0);
+
+  const scan = await upload(onePagePdf(""), "scan.pdf");
+  assert.equal(scan.status, 201);
+  assert.equal(((await body(scan)).source as Record<string, unknown>).extractionStatus, "failed");
+  assert.equal(rows[0]?.extractionStatus, "failed");
+  assert.equal(objects.size, 1);
+
+  const text = await upload(onePagePdf("BT /F1 12 Tf 72 720 Td (Press forward) Tj ET"), "text.pdf");
+  assert.equal(text.status, 201);
+  assert.equal(rows[1]?.extractionStatus, "completed");
+  assert.equal(objects.size, 3);
+});
+
+test("upload preserves typed registration conflicts/not-found after cleanup without leaking raw messages", async () => {
+  for (const [error, status] of [
+    [new EvidenceConflictError("SECRET_CAS"), 409],
+    [new EvidenceNotFoundError("SECRET_DELETED_BUNDLE"), 404],
+  ] as const) {
+    const objects = new Map<string, unknown>();
+    const store = new EvidenceFileStore({
+      bucket: {
+        async put(key, value) { objects.set(key, value); },
+        async get(key) { return objects.get(key) ?? null; },
+        async delete(key) { objects.delete(key); },
+      },
+      registration: {
+        async findExisting() { return null; },
+        async register() { throw error; },
+      },
+    });
+    const form = new FormData();
+    form.set("file", new File(["valid"], "notes.txt", { type: "text/plain" }));
+    const response = await handleEvidenceFileUpload(
+      new Request("http://localhost", { method: "POST", body: form }),
+      context({ bundleId: bundle.id }),
+      runtime({ fileStore: store }),
+    );
+    assert.equal(response.status, status);
+    assert.equal(objects.size, 0);
+    const serialized = JSON.stringify(await body(response));
+    assert.equal(serialized.includes(error.message), false);
+  }
 });
 
 test("upload authorization completes before the counting stream reads any byte", async () => {

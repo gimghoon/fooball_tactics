@@ -418,6 +418,7 @@ export async function handleEvidenceFileUpload(
     } catch (error) {
       if (error instanceof EvidenceValidationError)
         return routeFailure(new EvidenceUnsupportedMediaTypeError());
+      if (error instanceof EvidencePublicError) return routeFailure(error);
       return jsonError("근거 파일 저장소를 사용할 수 없습니다.", 503);
     }
   } catch (error) {
