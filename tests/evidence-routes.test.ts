@@ -394,10 +394,16 @@ test("PDF preflight rejects corrupt content and preserves valid scan/text behavi
     );
   }
 
-  const corrupt = await upload(onePagePdf("notflate", " /Filter /FlateDecode"), "corrupt.pdf");
-  assert.equal(corrupt.status, 415);
-  assert.equal(objects.size, 0);
-  assert.equal(rows.length, 0);
+  for (const [filter, name] of [
+    [" /Filter /FlateDecode", "corrupt.pdf"],
+    [" /Filter /Flate#44ecode", "escaped-corrupt.pdf"],
+    [" /Filter [/F#6c]", "escaped-abbreviated-corrupt.pdf"],
+  ] as const) {
+    const corrupt = await upload(onePagePdf("notflate", filter), name);
+    assert.equal(corrupt.status, 415);
+    assert.equal(objects.size, 0);
+    assert.equal(rows.length, 0);
+  }
 
   const scan = await upload(onePagePdf(""), "scan.pdf");
   assert.equal(scan.status, 201);

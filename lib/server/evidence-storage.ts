@@ -5,6 +5,10 @@ import {
   type ExtractedPage,
   PdfPasswordProtectedError,
 } from "./evidence-text-extractor.ts";
+import {
+  validatePdfFlateStreams,
+  type EvidencePdfPreflightOptions,
+} from "./evidence-pdf-preflight.ts";
 
 const MAX_EVIDENCE_FILE_BYTES = 20 * 1024 * 1024;
 const ZIP_SIGNATURES = [
@@ -148,50 +152,6 @@ function isUnsafeTextSignature(bytes: Uint8Array): boolean {
     || bytes.includes(0);
 }
 
-/**
- * PDF.js deliberately recovers some corrupt Flate streams as empty content,
- * even with stopAtErrors enabled. Validate each directly Flate-encoded stream
- * before page traversal so corruption cannot be confused with a valid scan.
- */
-async function assertPdfFlateStreamsDecode(bytes: Uint8Array): Promise<void> {
-  const source = new TextDecoder("latin1").decode(bytes);
-  const streamPattern = /<<(.*?)>>\s*stream(?:\r\n|\n|\r)/gs;
-  for (const match of source.matchAll(streamPattern)) {
-    const dictionary = match[1] ?? "";
-    const directFlate = /\/Filter\s*\/(?:FlateDecode|Fl)(?=[\s/>])/i.test(dictionary);
-    const firstArrayFilter = /\/Filter\s*\[\s*\/(?:FlateDecode|Fl)(?=[\s/>])/i.test(dictionary);
-    if (!directFlate && !firstArrayFilter) continue;
-
-    const start = (match.index ?? 0) + match[0].length;
-    const indirectLength = /\/Length\s+\d+\s+\d+\s+R/i.test(dictionary);
-    const directLength = indirectLength ? null : /\/Length\s+(\d+)\b/i.exec(dictionary);
-    const endMarker = source.indexOf("endstream", start);
-    if (endMarker < start) throw new EvidenceValidationError("PDF 파일을 확인할 수 없습니다.");
-    const declaredLength = directLength === null ? null : Number(directLength[1]);
-    let end = declaredLength === null ? endMarker : start + declaredLength;
-    if (declaredLength === null) {
-      while (end > start && [0x0a, 0x0d].includes(bytes[end - 1] ?? -1)) end -= 1;
-    }
-    if (!Number.isSafeInteger(end) || end < start || end > bytes.byteLength) {
-      throw new EvidenceValidationError("PDF 파일을 확인할 수 없습니다.");
-    }
-
-    const compressed = bytes.slice(start, end);
-    try {
-      const reader = new Blob([compressed.buffer])
-        .stream()
-        .pipeThrough(new DecompressionStream("deflate"))
-        .getReader();
-      while (!(await reader.read()).done) {
-        // Drain without retaining decompressed bytes; PDF.js enforces the
-        // page/text output budgets during the following reusable preflight.
-      }
-    } catch {
-      throw new EvidenceValidationError("PDF 파일을 확인할 수 없습니다.");
-    }
-  }
-}
-
 function resolveKindAndMediaType(input: EvidenceFileInput): Pick<ValidatedEvidenceFile, "kind" | "mediaType"> {
   const extension = extensionFor(input.name);
   if (extension === "pdf") {
@@ -215,7 +175,10 @@ function resolveKindAndMediaType(input: EvidenceFileInput): Pick<ValidatedEviden
 }
 
 /** Validates file identity and bytes before any R2 object is written. */
-export async function validateEvidenceFile(input: EvidenceFileInput): Promise<ValidatedEvidenceFile> {
+export async function validateEvidenceFile(
+  input: EvidenceFileInput,
+  preflightOptions: EvidencePdfPreflightOptions = {},
+): Promise<ValidatedEvidenceFile> {
   if (input.bytes.byteLength > MAX_EVIDENCE_FILE_BYTES) {
     throw new EvidenceValidationError("파일은 20MB 이하여야 합니다.");
   }
@@ -223,8 +186,12 @@ export async function validateEvidenceFile(input: EvidenceFileInput): Promise<Va
   let preflightExtractedPages: ExtractedPage[] | null = null;
   if (file.kind === "pdf") {
     try {
-      await assertPdfFlateStreamsDecode(input.bytes);
-      preflightExtractedPages = await extractEvidenceText(file.kind, input.bytes);
+      const budget = await validatePdfFlateStreams(input.bytes, preflightOptions);
+      preflightExtractedPages = await extractEvidenceText(file.kind, input.bytes, {
+        maxExtractionMs: budget.remainingMs(),
+        now: preflightOptions.now,
+        abortSignal: preflightOptions.abortSignal,
+      });
     } catch (error) {
       if (error instanceof PdfPasswordProtectedError) throw new EvidenceValidationError(error.message);
       throw new EvidenceValidationError("PDF 파일을 확인할 수 없습니다.");
@@ -247,10 +214,14 @@ function opaqueStorageKey(bundleId: string, sourceId: string, sha256: string): s
 }
 
 export class EvidenceFileStore {
-  constructor(private readonly dependencies: { bucket: EvidenceR2Bucket; registration: EvidenceSourceRegistrationPort }) {}
+  constructor(private readonly dependencies: {
+    bucket: EvidenceR2Bucket;
+    registration: EvidenceSourceRegistrationPort;
+    preflightOptions?: EvidencePdfPreflightOptions;
+  }) {}
 
   async putValidatedFile(input: EvidenceFileInput & { bundleId: string }): Promise<StoredEvidenceFile> {
-    const file = await validateEvidenceFile(input);
+    const file = await validateEvidenceFile(input, this.dependencies.preflightOptions);
     const existing = await this.dependencies.registration.findExisting(input.bundleId, file.sha256);
     if (existing !== null) return existing;
 

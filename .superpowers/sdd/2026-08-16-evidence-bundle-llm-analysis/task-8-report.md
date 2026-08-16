@@ -122,3 +122,35 @@ passed
 ```
 
 No new concerns. The pre-existing standalone `tsc --noEmit` configuration limitation documented in Fix Round 1 is unchanged; the required lint, production build, full project tests, and complete evidence matrix pass.
+
+## Fix Round 3
+
+Status: both Important Flate-validator findings from `task-8-rereview-2.md` are addressed.
+
+- Replaced the whole-file Latin-1 regular-expression scan with a bounded PDF object/dictionary tokenizer. It recognizes stream dictionaries only at indirect-object boundaries, jumps over payloads by their declared byte length, decodes PDF name `#xx` escapes, and recognizes direct `/FlateDecode`, `/Fl`, escaped equivalents, and single-filter arrays. Unresolved lengths, filters, dictionaries, excessive nesting/tokens/objects/streams, and unsupported multi-filter pipelines fail closed as typed PDF validation errors.
+- Flate validation now streams decompressed output without retaining chunks. Production limits cap decoded output at 2 MiB per stream and 4 MiB aggregate, below the existing 5 MiB extracted-text budget. Every read is raced against the shared 10-second extraction deadline, observes the caller `AbortSignal`, and cancels/releases its reader on overflow, timeout, abort, or decompressor failure.
+- The remaining shared deadline is passed into the existing PDF.js page/content preflight, whose extracted pages are still reused after persistence. No duplicate PDF.js traversal was reintroduced.
+- Escaped corrupt filters now return HTTP 415 with zero R2 objects and zero metadata. Valid compressed text, scan-only pages, and a valid uncompressed stream containing filter-like syntax bytes remain accepted.
+
+Fix-round regression coverage includes `/Flate#44ecode`, `[/F#6c]`, stream-payload false positives, a small fake decompression bomb with cancellation, multiple-stream aggregate overflow, deadline cancellation, abort cancellation, valid compressed text, route-level 415 mapping, and zero-write assertions.
+
+Verification:
+
+```text
+npx tsx --test tests/evidence-storage.test.ts tests/evidence-routes.test.ts
+49 passed, 0 failed
+
+npx tsx --test tests/evidence-analyzer.test.ts tests/evidence-auth.test.ts tests/evidence-domain.test.ts tests/evidence-jobs.test.ts tests/evidence-review.test.ts tests/evidence-routes.test.ts tests/evidence-service.test.ts tests/evidence-storage.test.ts
+158 passed, 0 failed
+
+npm test
+47 domain + 16 route/component + production build + 3 rendered HTML tests passed
+
+npm run lint
+passed
+
+git diff --check
+passed
+```
+
+Concern: the security preflight deliberately rejects indirect `/Length` values and multi-stage filter pipelines instead of accepting streams it cannot validate with the bounded supported subset. This is fail-closed behavior, but PDFs using those otherwise-valid encodings must be normalized before upload. The pre-existing standalone `tsc --noEmit` configuration limitation documented in Fix Round 1 is unchanged.

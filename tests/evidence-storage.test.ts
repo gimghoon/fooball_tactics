@@ -121,13 +121,13 @@ function textPdf(text: string): Uint8Array {
   return new TextEncoder().encode(document);
 }
 
-function corruptFlatePdf(): Uint8Array {
+function corruptFlatePdf(filter = "/FlateDecode"): Uint8Array {
   const stream = "notflate";
   const objects = [
     "<< /Type /Catalog /Pages 2 0 R >>",
     "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
     "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R >>",
-    `<< /Length ${stream.length} /Filter /FlateDecode >>\nstream\n${stream}\nendstream`,
+    `<< /Length ${stream.length} /Filter ${filter} >>\nstream\n${stream}\nendstream`,
   ];
   let document = "%PDF-1.4\n";
   const offsets = [0];
@@ -142,7 +142,30 @@ function corruptFlatePdf(): Uint8Array {
   return new TextEncoder().encode(document);
 }
 
-function validFlateTextPdf(text: string): Uint8Array {
+function textPdfWithUnreferencedPayload(payload: string): Uint8Array {
+  const stream = "BT /F1 12 Tf 72 720 Td (Press forward) Tj ET";
+  const objects = [
+    "<< /Type /Catalog /Pages 2 0 R >>",
+    "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+    "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>",
+    `<< /Length ${stream.length} >>\nstream\n${stream}\nendstream`,
+    "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+    `<< /Length ${payload.length} >>\nstream\n${payload}\nendstream`,
+  ];
+  let document = "%PDF-1.4\n";
+  const offsets = [0];
+  for (const [index, object] of objects.entries()) {
+    offsets.push(document.length);
+    document += `${index + 1} 0 obj\n${object}\nendobj\n`;
+  }
+  const xref = document.length;
+  document += `xref\n0 ${objects.length + 1}\n0000000000 65535 f \n`;
+  document += offsets.slice(1).map((offset) => `${offset.toString().padStart(10, "0")} 00000 n \n`).join("");
+  document += `trailer\n<< /Size ${objects.length + 1} /Root 1 0 R >>\nstartxref\n${xref}\n%%EOF`;
+  return new TextEncoder().encode(document);
+}
+
+function validFlateTextPdf(text: string, extraStreams: string[] = []): Uint8Array {
   const content = `BT /F1 12 Tf 72 720 Td (${text}) Tj ET`;
   const compressed = deflateSync(new TextEncoder().encode(content));
   const chunks: Uint8Array[] = [];
@@ -168,8 +191,16 @@ function validFlateTextPdf(text: string): Uint8Array {
   push("\nendstream\nendobj\n");
   offsets.push(length);
   push("5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n");
+  for (const [index, extra] of extraStreams.entries()) {
+    const extraCompressed = deflateSync(new TextEncoder().encode(extra));
+    offsets.push(length);
+    push(`${index + 6} 0 obj\n<< /Length ${extraCompressed.byteLength} /Filter /FlateDecode >>\nstream\n`);
+    push(extraCompressed);
+    push("\nendstream\nendobj\n");
+  }
   const xref = length;
-  push(`xref\n0 6\n0000000000 65535 f \n${offsets.slice(1).map((offset) => `${offset.toString().padStart(10, "0")} 00000 n \n`).join("")}trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n${xref}\n%%EOF`);
+  const size = offsets.length;
+  push(`xref\n0 ${size}\n0000000000 65535 f \n${offsets.slice(1).map((offset) => `${offset.toString().padStart(10, "0")} 00000 n \n`).join("")}trailer\n<< /Size ${size} /Root 1 0 R >>\nstartxref\n${xref}\n%%EOF`);
   const output = new Uint8Array(length);
   let cursor = 0;
   for (const chunk of chunks) {
@@ -549,6 +580,163 @@ test("rejects corrupt PDF page content before persisting objects or metadata", a
     bytes: corruptFlatePdf(),
   }), /PDF 파일을 확인할 수 없습니다/);
 
+  assert.equal(bucket.objects.size, 0);
+  assert.equal(registration.rows.length, 0);
+});
+
+test("decodes escaped Flate filter names and arrays before persistence", async () => {
+  for (const filter of ["/Flate#44ecode", "[/F#6c]"]) {
+    const bucket = new FakeR2();
+    const registration = new FakeD1();
+    const store = new EvidenceFileStore({ bucket, registration });
+
+    await assert.rejects(() => store.putValidatedFile({
+      bundleId: "bundle-1",
+      name: "escaped-corrupt-stream.pdf",
+      type: "application/pdf",
+      bytes: corruptFlatePdf(filter),
+    }), /PDF 파일을 확인할 수 없습니다/);
+
+    assert.equal(bucket.objects.size, 0);
+    assert.equal(registration.rows.length, 0);
+  }
+});
+
+test("does not interpret filter-like bytes inside an enclosing stream payload", async () => {
+  const bucket = new FakeR2();
+  const registration = new FakeD1();
+  const store = new EvidenceFileStore({ bucket, registration });
+
+  const source = await store.putValidatedFile({
+    bundleId: "bundle-1",
+    name: "payload-tokens.pdf",
+    type: "application/pdf",
+    bytes: textPdfWithUnreferencedPayload("<< /Length 8 /Filter /FlateDecode >> stream notflate endstream"),
+  });
+
+  assert.equal(source.extractionStatus, "completed");
+  assert.equal(registration.rows.length, 1);
+  assert.equal(bucket.objects.size, 2);
+});
+
+test("bounds each decoded Flate stream before any persistence", async () => {
+  const bucket = new FakeR2();
+  const registration = new FakeD1();
+  let cancelCalls = 0;
+  const store = new EvidenceFileStore({
+    bucket,
+    registration,
+    preflightOptions: {
+      maxDecodedBytesPerStream: 64,
+      decompressionStream: () => new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(new Uint8Array(40));
+          controller.enqueue(new Uint8Array(40));
+        },
+        cancel() { cancelCalls += 1; },
+      }),
+    },
+  });
+
+  await assert.rejects(() => store.putValidatedFile({
+    bundleId: "bundle-1",
+    name: "compressed-bomb.pdf",
+    type: "application/pdf",
+    bytes: validFlateTextPdf("Press forward"),
+  }), /PDF 파일을 확인할 수 없습니다/);
+
+  assert.equal(cancelCalls, 1);
+  assert.equal(bucket.objects.size, 0);
+  assert.equal(registration.rows.length, 0);
+});
+
+test("bounds aggregate decoded Flate bytes across multiple streams", async () => {
+  const bucket = new FakeR2();
+  const registration = new FakeD1();
+  const store = new EvidenceFileStore({
+    bucket,
+    registration,
+    preflightOptions: {
+      maxDecodedBytesPerStream: 1024,
+      maxDecodedBytesAggregate: 200,
+    },
+  });
+
+  await assert.rejects(() => store.putValidatedFile({
+    bundleId: "bundle-1",
+    name: "aggregate-bomb.pdf",
+    type: "application/pdf",
+    bytes: validFlateTextPdf("ok", ["A".repeat(150), "B".repeat(150)]),
+  }), /PDF 파일을 확인할 수 없습니다/);
+
+  assert.equal(bucket.objects.size, 0);
+  assert.equal(registration.rows.length, 0);
+});
+
+test("cancels Flate decoding on its shared deadline before persistence", async () => {
+  const bucket = new FakeR2();
+  const registration = new FakeD1();
+  let cancelCalls = 0;
+  let delayedChunk: ReturnType<typeof setTimeout> | undefined;
+  const store = new EvidenceFileStore({
+    bucket,
+    registration,
+    preflightOptions: {
+      maxExtractionMs: 5,
+      decompressionStream: () => new ReadableStream<Uint8Array>({
+        start(controller) {
+          delayedChunk = setTimeout(() => {
+            controller.enqueue(new Uint8Array([1]));
+            controller.close();
+          }, 100);
+        },
+        cancel() {
+          cancelCalls += 1;
+          clearTimeout(delayedChunk);
+        },
+      }),
+    },
+  });
+
+  await assert.rejects(() => store.putValidatedFile({
+    bundleId: "bundle-1",
+    name: "slow-compressed.pdf",
+    type: "application/pdf",
+    bytes: validFlateTextPdf("Press forward"),
+  }), /PDF 파일을 확인할 수 없습니다/);
+
+  assert.equal(cancelCalls, 1);
+  assert.equal(bucket.objects.size, 0);
+  assert.equal(registration.rows.length, 0);
+});
+
+test("cancels Flate decoding on abort before persistence", async () => {
+  const bucket = new FakeR2();
+  const registration = new FakeD1();
+  const controller = new AbortController();
+  let cancelCalls = 0;
+  const store = new EvidenceFileStore({
+    bucket,
+    registration,
+    preflightOptions: {
+      abortSignal: controller.signal,
+      decompressionStream: () => {
+        queueMicrotask(() => controller.abort());
+        return new ReadableStream<Uint8Array>({
+          cancel() { cancelCalls += 1; },
+        }, { highWaterMark: 0 });
+      },
+    },
+  });
+
+  await assert.rejects(() => store.putValidatedFile({
+    bundleId: "bundle-1",
+    name: "aborted-compressed.pdf",
+    type: "application/pdf",
+    bytes: validFlateTextPdf("Press forward"),
+  }), /PDF 파일을 확인할 수 없습니다/);
+
+  assert.equal(cancelCalls, 1);
   assert.equal(bucket.objects.size, 0);
   assert.equal(registration.rows.length, 0);
 });
