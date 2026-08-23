@@ -49,6 +49,54 @@ Legacy pass-only rows have empty `contentJson` and `defenseType: null`. They
 remain compatible for existing training, but cannot be transitioned to
 `reviewed` as if they were newly structured and reviewed content.
 
+## Coach evidence bundles and LLM drafts
+
+The protected `/admin/evidence` workspace lets an allowlisted administrator
+assemble a narrow evidence bundle, start analysis manually, and review every
+generated tactic card beside its citations. The LLM output is always a draft:
+it may organize uploaded evidence and operator observations, but it does not
+approve tactical truth or publish a playable scenario.
+
+Required server configuration names are:
+
+- `EVIDENCE_ADMIN_USER_IDS`: comma-separated Sites user IDs allowed to use the
+  evidence workspace.
+- `EVIDENCE_LLM_ENDPOINT`, `EVIDENCE_LLM_API_KEY`, and `EVIDENCE_LLM_MODEL`:
+  server-only analyzer configuration. Never expose their values to client code.
+- `DB`: the logical D1 binding for workflow state, versions, and audit events.
+- `EVIDENCE_FILES`: the logical R2 binding for original files and extracted
+  text.
+
+Evidence files may be PDF, TXT, Markdown, or `.markdown`, with an exact maximum
+of 20 MiB per file. Text must be UTF-8. PDF extraction supports text layers;
+image-only scans are retained but marked as requiring OCR, which this MVP does
+not perform. Video evidence is recorded as an HTTPS URL plus an increasing
+start/end timecode and a human observation; the video itself is not copied.
+
+Use the workflow in this order:
+
+1. Name one training purpose and add traceable source files or video ranges.
+2. Review the complete inventory and explicitly confirm that only those sources
+   may be analyzed.
+3. Start analysis manually. A failed job can be retried without duplicating a
+   completed stage.
+4. Compare every action and reason with its cited excerpt or timecode. Low
+   confidence, unresolved conflicts, missing citations, and stale bundle
+   versions cannot be approved.
+5. Record owner review. An approved card can create only an unreviewed scenario
+   draft and must still pass the existing source, animation timeline, and
+   explanation review gates before publication.
+
+Changing or removing evidence advances the authoritative bundle version and
+invalidates prior analysis and approval. Deletion is blocked while cards or
+scenario drafts still reference a source, and the admin UI shows that impact
+before confirmation. Original filenames are display metadata only; storage
+uses opaque keys and authenticated downloads.
+
+Anonymous team-room return keys remain a separate device credential. If a
+participant loses that key, their anonymous progress cannot be recovered; the
+evidence administration workflow does not change this rule.
+
 ## Database migration
 
 Generate a migration after changing the Drizzle schema:

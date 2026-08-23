@@ -1,6 +1,5 @@
 "use client";
 
-import Link from "next/link";
 import { useEffect, useRef, useState } from "react";
 
 type Source = { id: string; bundleId: string; originalFileName: string; mediaType: string; byteSize: number; contentHash: string; extractionStatus: string; extractionError: string | null };
@@ -180,7 +179,10 @@ export function EvidenceWizard({ initialBundles, initialBundleId, request = defa
   };
 
   return <main className="evidence-admin-shell">
-    <header className="evidence-admin-header"><div><span className="evidence-kicker">TACTIQ · COACH DESK</span><h1>근거로 만드는 전술 카드</h1><p>LLM은 초안을 정리하고, 최종 판단은 운영자와 코치가 직접 합니다.</p></div><Link href="/">훈련 화면으로</Link></header>
+    <header className="evidence-admin-header"><div><span className="evidence-kicker">TACTIQ · COACH DESK</span><h1>근거로 만드는 전술 카드</h1><p>LLM은 초안을 정리하고, 최종 판단은 운영자와 코치가 직접 합니다.</p></div>
+      {/* eslint-disable-next-line @next/next/no-html-link-for-pages */}
+      <a href="/">훈련 화면으로</a>
+    </header>
     <nav className="evidence-steps" aria-label="근거 등록 단계">{steps.map((item) => <button key={item.id} className={step === item.id ? "is-current" : ""} aria-current={step === item.id ? "step" : undefined} onClick={() => setStep(item.id)}><span>{item.number}</span>{item.label}</button>)}</nav>
     <div className="evidence-layout">
       <aside className="bundle-rail"><div className="rail-title"><strong>근거 묶음</strong><button onClick={() => { setSelectedId(""); setStep("info"); }}>새로 만들기</button></div>{bundles.map((item) => <button key={item.id} className={selectedId === item.id ? "is-selected" : ""} onClick={() => { setSelectedId(item.id); setConfirmation(false); }}><strong>{item.title}</strong><small>v{item.version} · {item.purpose}</small></button>)}</aside>
