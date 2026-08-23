@@ -83,7 +83,7 @@ test("card review places cited source context beside action reasons and shows an
 
 test("a referenced source cannot be confirmed for deletion", async () => {
   const api = async (path: string) => {
-    if (path.endsWith("/impact")) return { impact: { cardCount: 1, scenarioDraftCount: 1, cardIds: ["card-1"], scenarioDraftIds: ["scenario-1"] } };
+    if (path.endsWith("/impact")) return { impact: { sourceId: "source-1", cardIds: ["card-1"], scenarioDraftIds: ["scenario-1"] } };
     throw new Error(`unexpected ${path}`);
   };
   const container = await render(<EvidenceWizard initialBundles={[bundle]} initialBundleId="bundle-1" request={api} />);

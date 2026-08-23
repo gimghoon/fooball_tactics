@@ -51,7 +51,7 @@ export type EvidenceRouteRuntime = {
   fileStore: Pick<EvidenceFileStore, "putValidatedFile" | "getFile">;
   jobs: Pick<
     EvidenceAnalysisJobs,
-    "startAnalysis" | "retryAnalysis" | "getAnalysisStatus"
+    "startAnalysis" | "retryAnalysis" | "getAnalysisStatus" | "getLatestAnalysisStatusForBundle"
   >;
 };
 
@@ -310,9 +310,12 @@ export async function handleEvidenceBundleGet(
       bundleId,
       runtime.admin,
     );
-    return bundle === null
-      ? jsonError("근거 묶음을 찾을 수 없습니다.", 404)
-      : adminJson({ bundle: safeBundleDetail(bundle) });
+    if (bundle === null) return jsonError("근거 묶음을 찾을 수 없습니다.", 404);
+    const latestJob = await runtime.jobs.getLatestAnalysisStatusForBundle(bundleId);
+    return adminJson({
+      bundle: safeBundleDetail(bundle),
+      latestJob: latestJob === null ? null : safeJob(latestJob),
+    });
   } catch (error) {
     return routeFailure(error);
   }

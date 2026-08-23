@@ -114,6 +114,7 @@ function runtime(overrides: Partial<EvidenceRouteRuntime> = {}): EvidenceRouteRu
       startAnalysis: async () => jobRecord(),
       retryAnalysis: async () => jobRecord(),
       getAnalysisStatus: async (id) => id === "missing" ? null : jobRecord(),
+      getLatestAnalysisStatusForBundle: async () => jobRecord(),
     },
     ...overrides,
   };
@@ -238,7 +239,9 @@ test("list, create, get, and update expose safe bundle projections", async () =>
 
   const detail = await handleEvidenceBundleGet(context({ bundleId: bundle.id }), runtime());
   assert.equal(detail.status, 200);
-  const serialized = JSON.stringify(await body(detail));
+  const detailBody = await body(detail) as { latestJob?: { id: string; analyzerModel?: string } };
+  assert.equal(detailBody.latestJob?.id, "job-1");
+  const serialized = JSON.stringify(detailBody);
   for (const secret of [source.storageKey, source.extractedTextKey, "storageKey", "extractedTextKey"]) {
     assert.equal(serialized.includes(secret), false);
   }

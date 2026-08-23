@@ -339,6 +339,14 @@ export class EvidenceAnalysisJobs {
     return row === null ? null : { ...row, isStale: Boolean(row.isStale) };
   }
 
+  async getLatestAnalysisStatusForBundle(bundleId: string): Promise<EvidenceAnalysisJobRecord | null> {
+    const row = await this.dependencies.db.prepare(
+      `SELECT ${JOB_COLUMNS} FROM evidence_analysis_jobs
+        WHERE bundle_id=? ORDER BY created_at DESC,id DESC LIMIT 1`,
+    ).bind(bundleId).first<EvidenceAnalysisJobRecord>();
+    return row === null ? null : { ...row, isStale: Boolean(row.isStale) };
+  }
+
   private async findByInputVersion(bundleId: string, inputVersion: string): Promise<EvidenceAnalysisJobRecord | null> {
     const row = await this.dependencies.db.prepare(
       `SELECT ${JOB_COLUMNS} FROM evidence_analysis_jobs WHERE bundle_id=? AND input_version=?`,

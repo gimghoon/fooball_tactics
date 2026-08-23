@@ -25,7 +25,7 @@ const steps: Array<{ id: Step; label: string; number: string }> = [
   { id: "analysis", label: "분석 확인", number: "03" },
   { id: "review", label: "카드 검수", number: "04" },
 ];
-const defenseLabels: Record<string, string> = { front_press: "전방 압박", central_block: "중앙 차단", wide_funnel: "측면 유도", one_v_one: "1대1", overload: "수적 우위", underload: "수적 열세" };
+const defenseLabels: Record<string, string> = { front_press: "전방 압박", central_block: "중앙 차단", wide_funnel: "측면 유도", one_v_one: "1대1", numerical_advantage: "수적 우위", numerical_disadvantage: "수적 열세" };
 const actionLabels = { pass: "패스", dribble: "드리블", move: "이동" } as const;
 
 async function defaultRequest(path: string, init?: RequestInit): Promise<unknown> {
@@ -69,8 +69,13 @@ export function EvidenceWizard({ initialBundles, initialBundleId, request = defa
     return exists ? current.map((item) => item.id === next.id ? { ...item, ...next } : item) : [next, ...current];
   });
   const loadBundle = async (id: string) => {
-    const result = await request(`/api/admin/evidence/${id}`) as { bundle: EvidenceWizardBundle };
-    updateBundle(result.bundle);
+    const result = await request(`/api/admin/evidence/${id}`) as { bundle: EvidenceWizardBundle; latestJob?: Job | null };
+    let next = { ...result.bundle, latestJob: result.latestJob ?? undefined };
+    if (result.latestJob && (result.latestJob.status === "review_ready" || result.latestJob.status === "completed")) {
+      const status = await request(`/api/admin/evidence/jobs/${result.latestJob.id}`) as { job: Job; cards?: Card[] };
+      next = { ...next, latestJob: status.job, cards: status.cards ?? [] };
+    }
+    updateBundle(next);
   };
   const fail = (value: unknown) => { setError(value instanceof Error ? value.message : "요청을 처리하지 못했습니다."); setMessage(""); };
 
@@ -167,8 +172,8 @@ export function EvidenceWizard({ initialBundles, initialBundleId, request = defa
   const inspectDelete = async (sourceId: string) => {
     if (!bundle) return;
     try {
-      const result = await request(`/api/admin/evidence/${bundle.id}/files/${sourceId}/impact`) as { impact: { cardCount: number; scenarioDraftCount: number } };
-      setImpact({ sourceId, ...result.impact });
+      const result = await request(`/api/admin/evidence/${bundle.id}/files/${sourceId}/impact`) as { impact: { cardIds: string[]; scenarioDraftIds: string[] } };
+      setImpact({ sourceId, cardCount: result.impact.cardIds.length, scenarioDraftCount: result.impact.scenarioDraftIds.length });
     } catch (value) { fail(value); }
   };
   const deleteSource = async () => {
