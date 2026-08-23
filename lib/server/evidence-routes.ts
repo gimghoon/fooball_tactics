@@ -365,27 +365,61 @@ export async function handleEvidenceFileUpload(
     }
     if (request.body === null)
       return jsonError("업로드할 파일이 필요합니다.", 400);
+    if (request.signal.aborted)
+      return jsonError("파일 업로드가 중단되었습니다.", 400);
     let total = 0;
     let overflowed = false;
+    let aborted = false;
+    let streamTerminated = false;
     const reader = request.body.getReader();
+    let cancelPromise: Promise<void> | undefined;
+    const cancelReader = (reason: unknown) => {
+      cancelPromise ??= reader.cancel(reason).catch(() => undefined);
+      return cancelPromise;
+    };
+    const abortError = new DOMException("Evidence upload was aborted.", "AbortError");
+    let boundedController: ReadableStreamDefaultController<Uint8Array> | undefined;
+    const onAbort = () => {
+      aborted = true;
+      if (streamTerminated) return;
+      streamTerminated = true;
+      boundedController?.error(abortError);
+      void cancelReader(abortError);
+    };
+    request.signal.addEventListener("abort", onAbort, { once: true });
+    if (request.signal.aborted) onAbort();
     const boundedBody = new ReadableStream<Uint8Array>({
+      start(controller) {
+        boundedController = controller;
+        if (aborted) controller.error(abortError);
+      },
       async pull(controller) {
-        const { done, value } = await reader.read();
-        if (done) {
-          controller.close();
-          return;
+        try {
+          const { done, value } = await reader.read();
+          if (streamTerminated) return;
+          if (done) {
+            streamTerminated = true;
+            controller.close();
+            return;
+          }
+          total += value.byteLength;
+          if (total > MAX_MULTIPART_REQUEST_BYTES) {
+            overflowed = true;
+            streamTerminated = true;
+            controller.error(new EvidencePayloadTooLargeError());
+            await cancelReader(new EvidencePayloadTooLargeError());
+            return;
+          }
+          controller.enqueue(value);
+        } catch (error) {
+          if (streamTerminated) return;
+          streamTerminated = true;
+          controller.error(error);
         }
-        total += value.byteLength;
-        if (total > MAX_MULTIPART_REQUEST_BYTES) {
-          overflowed = true;
-          controller.error(new EvidencePayloadTooLargeError());
-          await reader.cancel().catch(() => undefined);
-          return;
-        }
-        controller.enqueue(value);
       },
       async cancel(reason) {
-        await reader.cancel(reason).catch(() => undefined);
+        streamTerminated = true;
+        await cancelReader(reason);
       },
     });
     let form: FormData;
@@ -395,8 +429,15 @@ export async function handleEvidenceFileUpload(
       }).formData();
     } catch {
       if (overflowed) return routeFailure(new EvidencePayloadTooLargeError());
+      if (aborted || request.signal.aborted)
+        return jsonError("파일 업로드가 중단되었습니다.", 400);
       return jsonError("파일 업로드 형식을 확인할 수 없습니다.", 400);
+    } finally {
+      request.signal.removeEventListener("abort", onAbort);
+      boundedController = undefined;
     }
+    if (aborted || request.signal.aborted)
+      return jsonError("파일 업로드가 중단되었습니다.", 400);
     const entries = [...form.entries()];
     if (entries.length !== 1 || entries[0]?.[0] !== "file") {
       return jsonError("하나의 file 항목만 업로드할 수 있습니다.", 400);
@@ -408,14 +449,19 @@ export async function handleEvidenceFileUpload(
       return jsonError("파일은 20MB 이하여야 합니다.", 413);
     }
     try {
+      const bytes = new Uint8Array(await candidate.arrayBuffer());
+      if (aborted || request.signal.aborted)
+        return jsonError("파일 업로드가 중단되었습니다.", 400);
       const source = await runtime.fileStore.putValidatedFile({
         bundleId,
         name: candidate.name,
         type: candidate.type,
-        bytes: new Uint8Array(await candidate.arrayBuffer()),
+        bytes,
       }, { abortSignal: request.signal });
       return adminJson({ source: safeSource(source) }, { status: 201 });
     } catch (error) {
+      if (aborted || request.signal.aborted)
+        return jsonError("파일 업로드가 중단되었습니다.", 400);
       if (error instanceof EvidenceValidationError)
         return routeFailure(new EvidenceUnsupportedMediaTypeError());
       if (error instanceof EvidencePublicError) return routeFailure(error);

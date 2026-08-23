@@ -27,8 +27,26 @@ import {
   type EvidenceRouteRuntime,
 } from "../lib/server/evidence-routes.ts";
 import {
+  ascii85FlateTextPdf,
+  commentedIndirectLengthTextPdf,
+  compressedObjectIndirectTextPdf,
+  corruptJpegHuffmanImageScanPdf,
+  corruptJpegImageScanPdf,
+  corruptLzwPdf,
+  corruptSecondFlatePdf,
   downstreamToleratedObjectHeaderPdf,
+  excessivePredictorColorsPdf,
+  imageBackedScanPdf,
+  jpegImageScanPdf,
+  indirectFilterCorruptFlatePdf,
+  indirectInvalidPredictorPdf,
   invalidPredictorPdf,
+  lzwTextPdf,
+  lzwFlateTextPdf,
+  multiFilterTextPdf,
+  runLengthFlateTextPdf,
+  sharedJpegTwoPageScanPdf,
+  multiFlateTextPdf,
   unsupportedFilterPdf,
 } from "./helpers/evidence-pdf-fixtures.ts";
 
@@ -124,7 +142,12 @@ function jsonRequest(path: string, body: unknown, method = "POST") {
   });
 }
 
-function streamingRequest(bodyStream: ReadableStream<Uint8Array>, contentType: string, contentLength?: number) {
+function streamingRequest(
+  bodyStream: ReadableStream<Uint8Array>,
+  contentType: string,
+  contentLength?: number,
+  signal?: AbortSignal,
+) {
   const headers = new Headers({ "content-type": contentType });
   if (contentLength !== undefined) headers.set("content-length", String(contentLength));
   return new Request("http://localhost/api/admin/evidence/bundle-1/files", {
@@ -132,6 +155,7 @@ function streamingRequest(bodyStream: ReadableStream<Uint8Array>, contentType: s
     headers,
     body: bodyStream,
     duplex: "half",
+    signal,
   } as RequestInit & { duplex: "half" });
 }
 
@@ -422,7 +446,7 @@ test("PDF preflight rejects corrupt content and preserves valid scan/text behavi
   assert.equal(objects.size, 3);
 });
 
-test("recovered PDF stream errors and request aborts return 415 with zero writes", async () => {
+test("recovered PDF stream errors return 415 and pre-aborted uploads return 400 with zero writes", async () => {
   for (const [name, bytes, aborted] of [
     ["invalid-predictor.pdf", invalidPredictorPdf(), false],
     ["unsupported-filter.pdf", unsupportedFilterPdf(), false],
@@ -452,10 +476,204 @@ test("recovered PDF stream errors and request aborts return 415 with zero writes
       runtime({ fileStore: store }),
     );
 
+    assert.equal(response.status, aborted ? 400 : 415, name);
+    assert.equal(objects.size, 0, name);
+    assert.equal(rows.length, 0, name);
+  }
+});
+
+test("real upload route rejects indirect, LZW, and later-stage stream failures with zero writes", async () => {
+  for (const [name, bytes] of [
+    ["corrupt-lzw.pdf", corruptLzwPdf()],
+    ["corrupt-jpeg.pdf", corruptJpegImageScanPdf()],
+    ["corrupt-jpeg-huffman.pdf", corruptJpegHuffmanImageScanPdf()],
+    ["excessive-predictor-colors.pdf", excessivePredictorColorsPdf()],
+    ["indirect-corrupt-flate.pdf", indirectFilterCorruptFlatePdf()],
+    ["corrupt-second-flate.pdf", corruptSecondFlatePdf()],
+    ["indirect-invalid-predictor.pdf", indirectInvalidPredictorPdf()],
+  ] as const) {
+    const objects = new Map<string, unknown>();
+    const rows: StoredEvidenceFile[] = [];
+    const store = new EvidenceFileStore({
+      bucket: {
+        async put(key, value) { objects.set(key, value); },
+        async get(key) { return objects.get(key) ?? null; },
+        async delete(key) { objects.delete(key); },
+      },
+      registration: {
+        async findExisting() { return null; },
+        async register(value) { rows.push(value); return value; },
+      },
+    });
+    const form = new FormData();
+    form.set("file", new File([bytes], name, { type: "application/pdf" }));
+
+    const response = await handleEvidenceFileUpload(
+      new Request("http://localhost", { method: "POST", body: form }),
+      context({ bundleId: bundle.id }),
+      runtime({ fileStore: store }),
+    );
+
     assert.equal(response.status, 415, name);
     assert.equal(objects.size, 0, name);
     assert.equal(rows.length, 0, name);
   }
+});
+
+test("real upload route preserves image scans, commented lengths, and validated filter chains", async () => {
+  for (const [name, bytes, expectedStatus] of [
+    ["image-scan.pdf", imageBackedScanPdf(), "failed"],
+    ["jpeg-image-scan.pdf", jpegImageScanPdf(), "failed"],
+    ["shared-jpeg-two-page-scan.pdf", sharedJpegTwoPageScanPdf(), "failed"],
+    ["commented-indirect-length.pdf", commentedIndirectLengthTextPdf(), "completed"],
+    ["compressed-object-indirect.pdf", compressedObjectIndirectTextPdf(), "completed"],
+    ["asciihex-flate.pdf", multiFilterTextPdf(), "completed"],
+    ["ascii85-flate.pdf", ascii85FlateTextPdf(), "completed"],
+    ["runlength-flate.pdf", runLengthFlateTextPdf(), "completed"],
+    ["lzw-flate.pdf", lzwFlateTextPdf(), "completed"],
+    ["double-flate.pdf", multiFlateTextPdf(), "completed"],
+    ["lzw.pdf", lzwTextPdf(), "completed"],
+  ] as const) {
+    const objects = new Map<string, unknown>();
+    const rows: StoredEvidenceFile[] = [];
+    const store = new EvidenceFileStore({
+      bucket: {
+        async put(key, value) { objects.set(key, value); },
+        async get(key) { return objects.get(key) ?? null; },
+        async delete(key) { objects.delete(key); },
+      },
+      registration: {
+        async findExisting() { return null; },
+        async register(value) { rows.push(value); return value; },
+      },
+    });
+    const form = new FormData();
+    form.set("file", new File([bytes], name, { type: "application/pdf" }));
+
+    const response = await handleEvidenceFileUpload(
+      new Request("http://localhost", { method: "POST", body: form }),
+      context({ bundleId: bundle.id }),
+      runtime({ fileStore: store }),
+    );
+
+    assert.equal(response.status, 201, name);
+    assert.equal(((await body(response)).source as Record<string, unknown>).extractionStatus, expectedStatus, name);
+    assert.equal(rows.length, 1, name);
+    assert.equal(objects.size, expectedStatus === "failed" ? 1 : 2, name);
+  }
+});
+
+test("request abort during stalled multipart parsing cancels input and persists nothing", async () => {
+  const encoder = new TextEncoder();
+  const boundary = "abort-boundary";
+  let pulls = 0;
+  let cancelCalls = 0;
+  let secondPull!: () => void;
+  const secondPullStarted = new Promise<void>((resolve) => { secondPull = resolve; });
+  const source = new ReadableStream<Uint8Array>({
+    pull(controller) {
+      pulls += 1;
+      if (pulls === 1) {
+        controller.enqueue(encoder.encode(
+          `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="notes.txt"\r\nContent-Type: text/plain\r\n\r\npartial`,
+        ));
+        return;
+      }
+      secondPull();
+      return new Promise<void>(() => undefined);
+    },
+    cancel() { cancelCalls += 1; },
+  }, { highWaterMark: 0 });
+  const objects = new Map<string, unknown>();
+  const rows: StoredEvidenceFile[] = [];
+  const store = new EvidenceFileStore({
+    bucket: {
+      async put(key, value) { objects.set(key, value); },
+      async get(key) { return objects.get(key) ?? null; },
+      async delete(key) { objects.delete(key); },
+    },
+    registration: {
+      async findExisting() { return null; },
+      async register(value) { rows.push(value); return value; },
+    },
+  });
+  const controller = new AbortController();
+  const responsePromise = handleEvidenceFileUpload(
+    streamingRequest(source, `multipart/form-data; boundary=${boundary}`, undefined, controller.signal),
+    context({ bundleId: bundle.id }),
+    runtime({ fileStore: store }),
+  );
+  await secondPullStarted;
+  controller.abort();
+
+  const response = await Promise.race([
+    responsePromise,
+    new Promise<never>((_, reject) => setTimeout(
+      () => reject(new Error("multipart upload cancellation was not observed")),
+      100,
+    )),
+  ]);
+
+  assert.equal(response.status, 400);
+  assert.equal(cancelCalls, 1);
+  assert.equal(objects.size, 0);
+  assert.equal(rows.length, 0);
+});
+
+test("request abort after body EOF but before multipart resolution persists nothing", async () => {
+  const encoder = new TextEncoder();
+  const boundary = "abort-after-eof-boundary";
+  const multipart = encoder.encode([
+    `--${boundary}`,
+    'Content-Disposition: form-data; name="file"; filename="notes.txt"',
+    "Content-Type: text/plain",
+    "",
+    "Press forward",
+    `--${boundary}--`,
+    "",
+  ].join("\r\n"));
+  const abortController = new AbortController();
+  let pulls = 0;
+  const bodyStream = new ReadableStream<Uint8Array>({
+    pull(streamController) {
+      pulls += 1;
+      if (pulls === 1) {
+        streamController.enqueue(multipart);
+        return;
+      }
+      streamController.close();
+      const abortLater = (remaining: number) => {
+        if (remaining === 0) abortController.abort();
+        else queueMicrotask(() => abortLater(remaining - 1));
+      };
+      abortLater(2);
+    },
+  });
+  let putCalls = 0;
+
+  const response = await handleEvidenceFileUpload(
+    streamingRequest(
+      bodyStream,
+      `multipart/form-data; boundary=${boundary}`,
+      undefined,
+      abortController.signal,
+    ),
+    context({ bundleId: bundle.id }),
+    runtime({
+      fileStore: {
+        putValidatedFile: async () => {
+          putCalls += 1;
+          return source;
+        },
+        getFile: async () => encoder.encode("evidence"),
+      },
+    }),
+  );
+
+  assert.equal(abortController.signal.aborted, true);
+  assert.equal(response.status, 400);
+  assert.deepEqual(await body(response), { error: "파일 업로드가 중단되었습니다." });
+  assert.equal(putCalls, 0);
 });
 
 test("upload preserves typed registration conflicts/not-found after cleanup without leaking raw messages", async () => {

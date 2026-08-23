@@ -185,3 +185,19 @@ passed
 ```
 
 No new concerns. The pre-existing standalone `tsc --noEmit` configuration limitation documented in Fix Round 1 is unchanged; the production build, full project tests, complete evidence matrix, lint, and diff checks pass.
+
+## Fix Round 5
+
+Status: the three Important findings from `task-8-rereview-4.md` and the final shared-image compatibility edge are addressed.
+
+- Every accepted PDF stream filter stage is decoded and validated with bounded output, deadline, and cancellation checks. Indirect filters and decode parameters, LZW/RunLength/ASCII wrappers, repeated Flate stages, JPEG structure/content, and compressed object references are covered; malformed inputs fail before R2 or D1 persistence.
+- Indirect values are resolved through the bounded object parser, including legal comments and compressed object streams.
+- Multipart reading observes `request.signal`, cancels stalled source streams, handles abort after EOF, and persists nothing on cancellation.
+- PDF.js image validation selects page-local `objs` or document-shared `commonObjs` according to the image identifier. A real two-page PDF reusing one JPEG now remains a valid OCR-required scan.
+
+Focused verification:
+
+```text
+node --import tsx --test tests/evidence-storage.test.ts tests/evidence-routes.test.ts
+59 passed, 0 failed
+```

@@ -22,7 +22,16 @@ export type EvidenceExtractionOptions = {
 };
 
 export type EvidencePdfTextContent = { items: Array<{ str?: string }> };
-export type EvidencePdfPage = { getTextContent: () => Promise<EvidencePdfTextContent> };
+export type EvidencePdfOperatorList = { argsArray: unknown[] };
+export type EvidencePdfObjectStore = {
+  get: (id: string, callback?: (value: unknown) => void) => unknown;
+};
+export type EvidencePdfPage = {
+  getTextContent: () => Promise<EvidencePdfTextContent>;
+  getOperatorList?: () => Promise<EvidencePdfOperatorList>;
+  objs?: EvidencePdfObjectStore;
+  commonObjs?: EvidencePdfObjectStore;
+};
 export type EvidencePdfDocument = { numPages: number; getPage: (page: number) => Promise<EvidencePdfPage> };
 export type EvidencePdfLoadingTask = { promise: Promise<EvidencePdfDocument>; destroy: () => Promise<void> };
 export type EvidencePdfLoader = {
@@ -159,6 +168,34 @@ async function defaultPdfLoader(): Promise<EvidencePdfLoader> {
   };
 }
 
+function decodedImageIds(operatorList: EvidencePdfOperatorList): string[] {
+  const ids = new Set<string>();
+  for (const argument of operatorList.argsArray) {
+    if (!Array.isArray(argument)) continue;
+    for (const value of argument) {
+      if (typeof value === "string" && (value.startsWith("img_") || value.includes("_img_"))) {
+        ids.add(value);
+      }
+    }
+  }
+  return [...ids];
+}
+
+function getDecodedPdfObject(store: EvidencePdfObjectStore, id: string): Promise<unknown> {
+  return new Promise((resolve, reject) => {
+    let callbackCalled = false;
+    try {
+      const existing = store.get(id, (value) => {
+        callbackCalled = true;
+        resolve(value);
+      });
+      if (!callbackCalled && existing !== undefined && existing !== null) resolve(existing);
+    } catch (error) {
+      reject(error);
+    }
+  });
+}
+
 async function extractPdfPages(
   bytes: Uint8Array,
   budget: ExtractionBudget,
@@ -186,6 +223,15 @@ async function extractPdfPages(
     const pages: ExtractedPage[] = [];
     for (let index = 1; index <= document.numPages; index += 1) {
       const page = await guard.wait(document.getPage(index), destroy);
+      if (page.getOperatorList !== undefined && page.objs !== undefined) {
+        const operators = await guard.wait(page.getOperatorList(), destroy);
+        for (const imageId of decodedImageIds(operators)) {
+          const objectStore = imageId.startsWith("g_") ? page.commonObjs : page.objs;
+          if (objectStore === undefined) throw new Error("PDF 이미지 스트림을 확인할 수 없습니다.");
+          const image = await guard.wait(getDecodedPdfObject(objectStore, imageId), destroy);
+          if (image === null || image === undefined) throw new Error("PDF 이미지 스트림을 확인할 수 없습니다.");
+        }
+      }
       const content = await guard.wait(page.getTextContent(), destroy);
       const text = content.items
         .filter((item): item is typeof item & { str: string } => typeof item.str === "string")

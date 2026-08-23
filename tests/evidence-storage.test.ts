@@ -7,12 +7,30 @@ import {
   validateEvidenceFile,
 } from "../lib/server/evidence-storage.ts";
 import { extractEvidenceText } from "../lib/server/evidence-text-extractor.ts";
+import { validatePdfFlateStreams } from "../lib/server/evidence-pdf-preflight.ts";
 import {
+  ascii85FlateTextPdf,
+  commentedIndirectLengthTextPdf,
+  compressedObjectIndirectTextPdf,
+  corruptJpegHuffmanImageScanPdf,
+  corruptJpegImageScanPdf,
+  corruptLzwPdf,
+  corruptSecondFlatePdf,
   downstreamToleratedObjectHeaderPdf,
+  excessivePredictorColorsPdf,
   imageBackedScanPdf,
+  jpegImageScanPdf,
+  indirectFilterCorruptFlatePdf,
+  indirectInvalidPredictorPdf,
   indirectLengthTextPdf,
   invalidPredictorPdf,
+  largeSingleRowPredictorPdf,
+  lzwTextPdf,
+  lzwFlateTextPdf,
+  multiFlateTextPdf,
   multiFilterTextPdf,
+  runLengthFlateTextPdf,
+  sharedJpegTwoPageScanPdf,
   unsupportedFilterPdf,
 } from "./helpers/evidence-pdf-fixtures.ts";
 
@@ -614,11 +632,46 @@ test("rejects PDF.js-recovered stream errors before persisting objects or metada
   }
 });
 
+test("rejects malformed indirect, LZW, and later filter stages before any persistence", async () => {
+  for (const [name, bytes] of [
+    ["corrupt-lzw.pdf", corruptLzwPdf()],
+    ["corrupt-jpeg.pdf", corruptJpegImageScanPdf()],
+    ["corrupt-jpeg-huffman.pdf", corruptJpegHuffmanImageScanPdf()],
+    ["excessive-predictor-colors.pdf", excessivePredictorColorsPdf()],
+    ["indirect-corrupt-flate.pdf", indirectFilterCorruptFlatePdf()],
+    ["corrupt-second-flate.pdf", corruptSecondFlatePdf()],
+    ["indirect-invalid-predictor.pdf", indirectInvalidPredictorPdf()],
+  ] as const) {
+    const bucket = new FakeR2();
+    const registration = new FakeD1();
+
+    await assert.rejects(() => new EvidenceFileStore({ bucket, registration }).putValidatedFile({
+      bundleId: "bundle-1",
+      name,
+      type: "application/pdf",
+      bytes,
+    }), /PDF 파일을 확인할 수 없습니다/);
+
+    assert.equal(bucket.objects.size, 0, name);
+    assert.equal(bucket.putKeys.length, 0, name);
+    assert.equal(registration.rows.length, 0, name);
+  }
+});
+
 test("accepts image scans, indirect stream lengths, and supported filter pipelines", async () => {
   for (const [name, bytes, expectedStatus] of [
     ["image-scan.pdf", imageBackedScanPdf(), "failed"],
+    ["jpeg-image-scan.pdf", jpegImageScanPdf(), "failed"],
+    ["shared-jpeg-two-page-scan.pdf", sharedJpegTwoPageScanPdf(), "failed"],
     ["indirect-length.pdf", indirectLengthTextPdf(), "completed"],
+    ["commented-indirect-length.pdf", commentedIndirectLengthTextPdf(), "completed"],
+    ["compressed-object-indirect.pdf", compressedObjectIndirectTextPdf(), "completed"],
     ["multi-filter.pdf", multiFilterTextPdf(), "completed"],
+    ["ascii85-flate.pdf", ascii85FlateTextPdf(), "completed"],
+    ["runlength-flate.pdf", runLengthFlateTextPdf(), "completed"],
+    ["lzw-flate.pdf", lzwFlateTextPdf(), "completed"],
+    ["multi-flate.pdf", multiFlateTextPdf(), "completed"],
+    ["lzw.pdf", lzwTextPdf(), "completed"],
   ] as const) {
     const bucket = new FakeR2();
     const registration = new FakeD1();
@@ -699,6 +752,44 @@ test("bounds each decoded Flate stream before any persistence", async () => {
   assert.equal(cancelCalls, 1);
   assert.equal(bucket.objects.size, 0);
   assert.equal(registration.rows.length, 0);
+});
+
+test("bounds retained ASCII85, RunLength, LZW, and ASCIIHex wrapper stages", async () => {
+  for (const [name, bytes] of [
+    ["asciihex-flate.pdf", multiFilterTextPdf()],
+    ["ascii85-flate.pdf", ascii85FlateTextPdf()],
+    ["runlength-flate.pdf", runLengthFlateTextPdf()],
+    ["lzw-flate.pdf", lzwFlateTextPdf()],
+  ] as const) {
+    const bucket = new FakeR2();
+    const registration = new FakeD1();
+    const store = new EvidenceFileStore({
+      bucket,
+      registration,
+      preflightOptions: { maxDecodedBytesPerStream: 8 },
+    });
+
+    await assert.rejects(() => store.putValidatedFile({
+      bundleId: "bundle-1",
+      name,
+      type: "application/pdf",
+      bytes,
+    }), /PDF 파일을 확인할 수 없습니다/);
+    assert.equal(bucket.putKeys.length, 0, name);
+    assert.equal(registration.rows.length, 0, name);
+  }
+});
+
+test("checks the shared deadline throughout a large single predictor row", async () => {
+  let clockChecks = 0;
+  await validatePdfFlateStreams(largeSingleRowPredictorPdf(), {
+    now: () => {
+      clockChecks += 1;
+      return 0;
+    },
+  });
+
+  assert.ok(clockChecks > 128, `expected bounded predictor checkpoints, received ${clockChecks}`);
 });
 
 test("bounds aggregate decoded Flate bytes across multiple streams", async () => {
