@@ -175,18 +175,37 @@ WITH RECURSIVE `replacements` AS (
 UPDATE `tactic_card_reviews` SET
 	`content_json`=(SELECT rewritten.`content_json` FROM `rewritten` WHERE rewritten.`review_id`=`tactic_card_reviews`.`id` ORDER BY rewritten.`ordinal` DESC LIMIT 1),
 	`citation_snapshot_json`=(SELECT rewritten.`snapshot_json` FROM `rewritten` WHERE rewritten.`review_id`=`tactic_card_reviews`.`id` ORDER BY rewritten.`ordinal` DESC LIMIT 1);--> statement-breakpoint
+CREATE TABLE `__task6_tactic_card_citations` (
+	`id` text PRIMARY KEY NOT NULL,
+	`bundle_id` text NOT NULL,
+	`card_id` text NOT NULL,
+	`chunk_id` text NOT NULL,
+	`created_at` integer NOT NULL
+);--> statement-breakpoint
+INSERT INTO `__task6_tactic_card_citations` (`id`,`bundle_id`,`card_id`,`chunk_id`,`created_at`)
+SELECT `id`,`bundle_id`,`card_id`,`chunk_id`,`created_at` FROM `tactic_card_citations`;--> statement-breakpoint
+DROP TABLE `tactic_card_citations`;--> statement-breakpoint
 DROP TABLE `evidence_chunks`;--> statement-breakpoint
 ALTER TABLE `__new_evidence_chunks` RENAME TO `evidence_chunks`;--> statement-breakpoint
-UPDATE `tactic_card_citations`
-SET `chunk_id`=(
-	SELECT mapping.`new_chunk_id`
-	FROM `__task6_chunk_versions` AS mapping
-	INNER JOIN `tactic_cards` AS card ON card.`id`=`tactic_card_citations`.`card_id`
-	WHERE mapping.`old_chunk_id`=`tactic_card_citations`.`chunk_id`
-		AND mapping.`input_version`=card.`bundle_version`
-);--> statement-breakpoint
-DROP TABLE `__task6_chunk_versions`;--> statement-breakpoint
 CREATE UNIQUE INDEX `idx_evidence_chunks_id_bundle` ON `evidence_chunks` (`id`,`bundle_id`);--> statement-breakpoint
+CREATE TABLE `tactic_card_citations` (
+	`id` text PRIMARY KEY NOT NULL,
+	`bundle_id` text NOT NULL,
+	`card_id` text NOT NULL,
+	`chunk_id` text NOT NULL,
+	`created_at` integer NOT NULL,
+	FOREIGN KEY (`card_id`,`bundle_id`) REFERENCES `tactic_cards`(`id`,`bundle_id`) ON UPDATE no action ON DELETE cascade,
+	FOREIGN KEY (`chunk_id`,`bundle_id`) REFERENCES `evidence_chunks`(`id`,`bundle_id`) ON UPDATE no action ON DELETE cascade
+);--> statement-breakpoint
+INSERT INTO `tactic_card_citations` (`id`,`bundle_id`,`card_id`,`chunk_id`,`created_at`)
+SELECT citation.`id`,citation.`bundle_id`,citation.`card_id`,mapping.`new_chunk_id`,citation.`created_at`
+FROM `__task6_tactic_card_citations` AS citation
+INNER JOIN `tactic_cards` AS card ON card.`id`=citation.`card_id`
+INNER JOIN `__task6_chunk_versions` AS mapping
+	ON mapping.`old_chunk_id`=citation.`chunk_id` AND mapping.`input_version`=card.`bundle_version`;--> statement-breakpoint
+CREATE UNIQUE INDEX `idx_tactic_card_citations_card_chunk` ON `tactic_card_citations` (`card_id`,`chunk_id`);--> statement-breakpoint
+DROP TABLE `__task6_tactic_card_citations`;--> statement-breakpoint
+DROP TABLE `__task6_chunk_versions`;--> statement-breakpoint
 CREATE UNIQUE INDEX `idx_evidence_chunks_source_input_ordinal` ON `evidence_chunks` (`bundle_id`,`input_version`,`source_id`,`ordinal`);--> statement-breakpoint
 CREATE UNIQUE INDEX `idx_evidence_chunks_clip_input_ordinal` ON `evidence_chunks` (`bundle_id`,`input_version`,`video_clip_id`,`ordinal`);--> statement-breakpoint
 CREATE TRIGGER `trg_evidence_sources_block_cited_delete`

@@ -393,6 +393,26 @@ test("migration preserves legacy resume progress while adding durable checkpoint
   ).get()?.stage, "extract_evidence");
 });
 
+test("migration rebuilds citations before replacing their evidence chunk parent", () => {
+  const migrationName = readdirSync("drizzle").find((name) => name.startsWith("0007_"));
+  assert.notEqual(migrationName, undefined, "Expected migration 0007");
+  const migration = readFileSync(`drizzle/${migrationName}`, "utf8");
+
+  const backupCitations = migration.indexOf("CREATE TABLE `__task6_tactic_card_citations`");
+  const dropCitations = migration.indexOf("DROP TABLE `tactic_card_citations`");
+  const dropChunks = migration.indexOf("DROP TABLE `evidence_chunks`");
+  const createParentKey = migration.indexOf("CREATE UNIQUE INDEX `idx_evidence_chunks_id_bundle`");
+  const recreateCitations = migration.lastIndexOf("CREATE TABLE `tactic_card_citations`");
+  const restoreCitations = migration.indexOf("INSERT INTO `tactic_card_citations`");
+
+  assert.ok(backupCitations >= 0, "citation rows must be backed up");
+  assert.ok(backupCitations < dropCitations, "citation rows must be backed up before the child table is dropped");
+  assert.ok(dropCitations < dropChunks, "the child table must be removed before replacing its parent");
+  assert.ok(dropChunks < createParentKey, "the replacement parent key must be created after the parent swap");
+  assert.ok(createParentKey < recreateCitations, "the parent key must exist before the child foreign key is recreated");
+  assert.ok(recreateCitations < restoreCitations, "citation rows must be restored only after the child is recreated");
+});
+
 test("migration upgrades the exact old queued default and runs validation first", async () => {
   const database = new DatabaseSync(":memory:");
   database.exec("PRAGMA foreign_keys = ON");
