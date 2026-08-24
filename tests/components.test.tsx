@@ -4,6 +4,7 @@ import { act, type ReactElement } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { Window } from "happy-dom";
 
+import { FutsalApp } from "../app/FutsalApp.tsx";
 import { CoachExplanationPanel } from "../app/train/[campaignId]/CoachExplanationPanel.tsx";
 import { ScenarioPlayback } from "../app/train/[campaignId]/ScenarioPlayback.tsx";
 import { TacticalPitch, type TacticalChoice } from "../app/train/[campaignId]/TacticalPitch.tsx";
@@ -100,6 +101,17 @@ function button(container: Element, label: string): HTMLButtonElement {
   assert.ok(match, `missing button ${label}`);
   return match as HTMLButtonElement;
 }
+
+test("home exposes coach evidence management only to an authorized admin", async () => {
+  const hidden = await render(<FutsalApp initialInviteCode={null} showEvidenceAdmin={false} />);
+  assert.equal(hidden.container.querySelector('a[href="/admin/evidence"]'), null);
+  await act(async () => { hidden.root.unmount(); });
+  mountedRoots.delete(hidden.root);
+  hidden.container.remove();
+
+  const visible = await render(<FutsalApp initialInviteCode={null} showEvidenceAdmin />);
+  assert.equal(visible.container.querySelector('a[href="/admin/evidence"]')?.textContent, "코치 자료 관리");
+});
 
 test("setup timeline autoplays before enabling actions", async () => {
   setupMatchMedia(false);

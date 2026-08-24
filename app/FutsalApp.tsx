@@ -35,7 +35,7 @@ function PitchPreview() {
   );
 }
 
-export function FutsalApp({ initialInviteCode }: { initialInviteCode: string | null }) {
+export function FutsalApp({ initialInviteCode, showEvidenceAdmin }: { initialInviteCode: string | null; showEvidenceAdmin: boolean }) {
   const [showRoom, setShowRoom] = useState(Boolean(initialInviteCode));
   const [nickname, setNickname] = useState("");
   const [campaignId, setCampaignId] = useState<string | null>(null);
@@ -63,7 +63,7 @@ export function FutsalApp({ initialInviteCode }: { initialInviteCode: string | n
   }
   return (
     <main className="app-shell">
-      <header className="topbar"><a className="brand" href="#top" aria-label="TACTIQ 홈"><span className="brand-mark">T</span><span>TACTIQ</span></a><button className="icon-button" aria-label="도움말">?</button></header>
+      <header className="topbar"><a className="brand" href="#top" aria-label="TACTIQ 홈"><span className="brand-mark">T</span><span>TACTIQ</span></a><div className="topbar-actions">{showEvidenceAdmin ? <a className="admin-link" href="/admin/evidence">코치 자료 관리</a> : null}<button className="icon-button" aria-label="도움말">?</button></div></header>
       <section className="hero" id="top"><div className="eyebrow"><span /> 오늘의 팀 훈련</div><h1>생각은 짧게.<br /><em>움직임은 함께.</em></h1><p>포지션을 바꿔가며 같은 장면을 풀고,<br />다음 경기에서 하나씩 실행해보세요.</p></section>
       <section className="training-card" aria-labelledby="campaign-title">
         <div className="card-topline"><span className="campaign-tag">입문 캠페인</span><span className="duration">약 10분</span></div>

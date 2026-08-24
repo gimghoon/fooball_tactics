@@ -13,6 +13,28 @@ export type EvidenceAdminApiDecision =
 
 const ADMIN_USER_IDS_ENV = "EVIDENCE_ADMIN_USER_IDS";
 
+type EvidenceAuthWorkerEnvironment = {
+  EVIDENCE_ADMIN_USER_IDS?: string;
+};
+
+export function resolveEvidenceAdminUserIds(
+  workerValue: string | undefined,
+  processValue: string | undefined,
+): string | undefined {
+  return workerValue ?? processValue;
+}
+
+async function configuredEvidenceAdminUserIds(): Promise<string | undefined> {
+  let workerValue: string | undefined;
+  try {
+    const { env } = await import("cloudflare:workers");
+    workerValue = (env as unknown as EvidenceAuthWorkerEnvironment).EVIDENCE_ADMIN_USER_IDS;
+  } catch {
+    // Node-only tests and non-Workers local tools use the process fallback.
+  }
+  return resolveEvidenceAdminUserIds(workerValue, process.env[ADMIN_USER_IDS_ENV]);
+}
+
 export function parseAdminUserIds(raw: string | undefined): Set<string> {
   return new Set(
     (raw ?? "")
@@ -57,7 +79,7 @@ export async function requireEvidenceAdminPage(
   const { getChatGPTUser, requireChatGPTUser } = await import("../../app/chatgpt-auth.ts");
   const decision = decideEvidenceAdminPage(
     await getChatGPTUser(),
-    process.env[ADMIN_USER_IDS_ENV],
+    await configuredEvidenceAdminUserIds(),
     returnTo,
   );
   if (decision.kind === "admin") return decision.admin;
@@ -74,11 +96,19 @@ export async function requireEvidenceAdminApi(
   const { getChatGPTUser } = await import("../../app/chatgpt-auth.ts");
   const decision = decideEvidenceAdminApi(
     await getChatGPTUser(),
-    process.env[ADMIN_USER_IDS_ENV],
+    await configuredEvidenceAdminUserIds(),
   );
   if (decision.kind === "admin") return decision.admin;
   return Response.json(
     { error: decision.error },
     { status: decision.status },
+  );
+}
+
+export async function getCurrentEvidenceAdmin(): Promise<EvidenceAdmin | null> {
+  const { getChatGPTUser } = await import("../../app/chatgpt-auth.ts");
+  return authorizeEvidenceAdmin(
+    await getChatGPTUser(),
+    await configuredEvidenceAdminUserIds(),
   );
 }

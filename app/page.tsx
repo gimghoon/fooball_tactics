@@ -1,4 +1,5 @@
 import type { Metadata } from "next";
+import { getCurrentEvidenceAdmin } from "@/lib/server/evidence-auth";
 import { FutsalApp } from "./FutsalApp";
 
 export const metadata: Metadata = {
@@ -7,6 +8,6 @@ export const metadata: Metadata = {
 };
 
 export default async function Home({ searchParams }: { searchParams: Promise<{ room?: string }> }) {
-  const { room } = await searchParams;
-  return <FutsalApp initialInviteCode={room?.toUpperCase() ?? null} />;
+  const [{ room }, admin] = await Promise.all([searchParams, getCurrentEvidenceAdmin()]);
+  return <FutsalApp initialInviteCode={room?.toUpperCase() ?? null} showEvidenceAdmin={admin !== null} />;
 }

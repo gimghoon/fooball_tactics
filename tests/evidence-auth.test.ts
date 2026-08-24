@@ -6,6 +6,7 @@ import {
   decideEvidenceAdminApi,
   decideEvidenceAdminPage,
   parseAdminUserIds,
+  resolveEvidenceAdminUserIds,
 } from "../lib/server/evidence-auth.ts";
 import type { ChatGPTUser } from "../app/chatgpt-auth.ts";
 
@@ -24,6 +25,11 @@ test("only exact allowlisted user IDs are admins", () => {
 test("admin IDs are trimmed and empty entries are discarded", () => {
   assert.deepEqual(parseAdminUserIds(" user-1, ,user-2 ,,"), new Set(["user-1", "user-2"]));
   assert.deepEqual(parseAdminUserIds(undefined), new Set());
+});
+
+test("Sites worker admin IDs take precedence over the local process fallback", () => {
+  assert.equal(resolveEvidenceAdminUserIds("sites-admin", "local-admin"), "sites-admin");
+  assert.equal(resolveEvidenceAdminUserIds(undefined, "local-admin"), "local-admin");
 });
 
 test("page decision sends missing login through ChatGPT sign-in with the requested return path", () => {
