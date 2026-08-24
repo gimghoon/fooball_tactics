@@ -22,6 +22,11 @@ test("only exact allowlisted user IDs are admins", () => {
   assert.equal(authorizeEvidenceAdmin(user, "user-20"), null);
 });
 
+test("an exact authenticated email can identify a Sites admin", () => {
+  assert.equal(authorizeEvidenceAdmin(user, "coach@example.test,a@x.test")?.userId, "user-2");
+  assert.equal(authorizeEvidenceAdmin(user, "other@x.test"), null);
+});
+
 test("admin IDs are trimmed and empty entries are discarded", () => {
   assert.deepEqual(parseAdminUserIds(" user-1, ,user-2 ,,"), new Set(["user-1", "user-2"]));
   assert.deepEqual(parseAdminUserIds(undefined), new Set());

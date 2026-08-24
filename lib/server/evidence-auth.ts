@@ -31,7 +31,11 @@ export function authorizeEvidenceAdmin(
   user: ChatGPTUser | null,
   raw: string | undefined,
 ): EvidenceAdmin | null {
-  if (!user || !parseAdminUserIds(raw).has(user.userId)) return null;
+  if (!user) return null;
+  const allowlist = parseAdminUserIds(raw);
+  const email = user.email.trim().toLowerCase();
+  const emailAllowed = [...allowlist].some((value) => value.toLowerCase() === email);
+  if (!allowlist.has(user.userId) && !emailAllowed) return null;
   return user;
 }
 
