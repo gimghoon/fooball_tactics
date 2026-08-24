@@ -3,16 +3,33 @@ import { readdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import test from "node:test";
 
-async function render() {
+async function render({ path = "/" } = {}) {
   const workerUrl = new URL("../dist/server/index.js", import.meta.url);
   workerUrl.searchParams.set("test", `${process.pid}-${Date.now()}`);
   const { default: worker } = await import(workerUrl.href);
   return worker.fetch(
-    new Request("http://localhost/", { headers: { accept: "text/html" } }),
-    { ASSETS: { fetch: async () => new Response("Not found", { status: 404 }) } },
+    new Request(`http://localhost${path}`, { headers: { accept: "text/html" } }),
+    {
+      ASSETS: { fetch: async () => new Response("Not found", { status: 404 }) },
+    },
     { waitUntil() {}, passThroughOnException() {} },
   );
 }
+
+test("renders the evidence upload UI while keeping its data APIs protected", async () => {
+  const response = await render({ path: "/admin/evidence" });
+  assert.equal(response.status, 200);
+  const html = await response.text();
+
+  assert.match(html, /근거 묶음/);
+  assert.match(html, /묶음 만들고 근거 추가/);
+});
+
+test("renders the coach management entry point on the home page", async () => {
+  const response = await render();
+  assert.equal(response.status, 200);
+  assert.match(await response.text(), /코치 자료 관리/);
+});
 
 async function renderedClientBundles() {
   const clientRoot = new URL("../dist/client/", import.meta.url);

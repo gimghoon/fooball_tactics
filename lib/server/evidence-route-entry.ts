@@ -1,6 +1,6 @@
 import { env, waitUntil } from "cloudflare:workers";
 
-import { requireEvidenceAdminApi } from "./evidence-auth.ts";
+import { requireEvidenceAdminApi } from "./evidence-auth-runtime.ts";
 import { createEvidenceProductionRouteRuntime } from "./evidence-route-runtime.ts";
 import { bindEvidenceSchedule, runEvidenceAdminRoute, type EvidenceRouteRuntime } from "./evidence-routes.ts";
 import type { EvidenceProductionBindings } from "./evidence-runtime.ts";
