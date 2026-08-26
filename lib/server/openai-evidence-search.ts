@@ -157,11 +157,15 @@ function transportDiagnostic(error: unknown, apiKey: string): EvidenceSearchTran
   const value = error instanceof Error ? error : new Error("unknown transport error");
   const cause = value.cause;
   const causeRecord = typeof cause === "object" && cause !== null ? cause as Record<string, unknown> : null;
+  const causeName = cause === undefined
+    ? undefined
+    : cause instanceof Error ? cause.name : cause?.constructor?.name ?? typeof cause;
+  const causeCode = typeof causeRecord?.code === "string" ? causeRecord.code : undefined;
   return {
-    name: value.name || "Error",
+    name: sanitizeDiagnosticText(value.name || "Error", apiKey),
     message: sanitizeDiagnosticText(value.message, apiKey),
-    ...(cause === undefined ? {} : { causeName: cause instanceof Error ? cause.name : cause?.constructor?.name ?? typeof cause }),
-    ...(typeof causeRecord?.code === "string" ? { causeCode: causeRecord.code.slice(0, 80) } : {}),
+    ...(causeName === undefined ? {} : { causeName: sanitizeDiagnosticText(causeName, apiKey) }),
+    ...(causeCode === undefined ? {} : { causeCode: sanitizeDiagnosticText(causeCode, apiKey) }),
   };
 }
 

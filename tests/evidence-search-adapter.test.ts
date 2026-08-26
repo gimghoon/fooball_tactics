@@ -76,6 +76,17 @@ test("server host policy owns trust and rejects model-only trust", () => {
   assert.equal(policy.classify(new URL("https://blog.example/doc")), null);
 });
 
+test("server host policy independently rejects non-HTTPS and credential-bearing URLs", () => {
+  const policy = createEvidenceSourcePolicy("1:uefa.com");
+  const insecure = new URL("http://uefa.com/doc");
+  const credentialed = new URL("https://user:pass@uefa.com/doc");
+
+  assert.equal(policy.classify(insecure), null);
+  assert.equal(policy.classify(credentialed), null);
+  assert.throws(() => policy.assertAllowed(insecure), /허용된 외부 출처/);
+  assert.throws(() => policy.assertAllowed(credentialed), /허용된 외부 출처/);
+});
+
 test("search request enables web_search and returns at most eight allowed candidates", async () => {
   const provider = createProviderWithFetch(recordingResponsesFetch(validSearchEnvelope(10)));
   const result = await provider.search(searchInput(), AbortSignal.timeout(1_000));
@@ -105,4 +116,25 @@ test("provider errors never expose keys or response bodies", async () => {
     () => provider.search(searchInput(), AbortSignal.timeout(1_000)),
     (error: Error) => !error.message.includes("sk-test") && error.message.length < 260,
   );
+});
+
+test("transport diagnostics redact keys from every emitted field", async () => {
+  const apiKey = "secret-api-key";
+  const cause = Object.assign(new Error("cause"), { name: `cause-${apiKey}`, code: `code-${apiKey}` });
+  const failure = new Error("network failure", { cause });
+  failure.name = `failure-${apiKey}`;
+  let diagnostic: Record<string, unknown> | undefined;
+  const provider = createConfiguredEvidenceSearchProvider({
+    EVIDENCE_LLM_ENDPOINT: "https://llm.example.test/v1/responses",
+    EVIDENCE_LLM_API_KEY: apiKey,
+    EVIDENCE_SEARCH_MODEL: "web-search-model",
+    EVIDENCE_EXTERNAL_ALLOWED_HOSTS: "1:uefa.com",
+  }, {
+    fetch: async () => { throw failure; },
+    onTransportError: (value) => { diagnostic = value as Record<string, unknown>; },
+  });
+
+  await assert.rejects(() => provider.search(searchInput(), AbortSignal.timeout(1_000)));
+  assert.ok(diagnostic);
+  assert.equal(JSON.stringify(diagnostic).includes(apiKey), false);
 });

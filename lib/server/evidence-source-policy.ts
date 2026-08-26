@@ -10,7 +10,10 @@ export function createEvidenceSourcePolicy(rawHosts: string): EvidenceSourcePoli
     if (!match || !match[2]!.includes(".") || match[2]!.includes("..")) throw new Error("외부 출처 호스트 설정이 올바르지 않습니다.");
     return { tier: Number(match[1]) as 1 | 2 | 3, host: match[2]!.toLowerCase().replace(/\.$/, "") };
   }).sort((a, b) => b.host.length - a.host.length);
-  const classify = (url: URL) => entries.find(({ host }) => url.hostname === host || url.hostname.endsWith(`.${host}`))?.tier ?? null;
+  const classify = (url: URL) => {
+    if (url.protocol !== "https:" || url.username || url.password) return null;
+    return entries.find(({ host }) => url.hostname === host || url.hostname.endsWith(`.${host}`))?.tier ?? null;
+  };
   return {
     classify,
     assertAllowed(url) {
