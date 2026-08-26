@@ -204,7 +204,7 @@ test("extraction adapter sends strict schema and evidence-only instructions", as
   assert.match(String(body.instructions), /conflict/i);
   assert.match(String(body.instructions), /differing conditions/i);
   assert.match(String(body.instructions), /action and reason.*cite/i);
-  assert.equal(request?.redirect, "error");
+  assert.equal(request?.redirect, "manual");
 });
 
 test("rejects all invalid Responses envelopes after inspecting every output item", async (t) => {

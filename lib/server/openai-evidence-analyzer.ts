@@ -248,8 +248,9 @@ class OpenAiEvidenceAnalyzer implements EvidenceAnalyzer {
             store: false,
           }),
           signal: controller.signal,
-          // An Authorization header must never be forwarded to a different origin.
-          redirect: "error",
+          // Edge runtimes support manual redirects; never follow one while the
+          // request carries an Authorization header.
+          redirect: "manual",
         });
       } catch (error) {
         if (abortCause === "none") this.config.onTransportError?.(transportDiagnostic(error, this.config.apiKey));
