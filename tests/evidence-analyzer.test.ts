@@ -284,6 +284,28 @@ test("classifies 408, 400, 403, 5xx, and network failures without provider leaka
   });
 });
 
+test("reports a sanitized transport diagnostic without credentials or request evidence", async () => {
+  const diagnostics: unknown[] = [];
+  const analyzer = createConfiguredEvidenceAnalyzer({
+    EVIDENCE_LLM_ENDPOINT: "https://llm.example.test/v1/responses",
+    EVIDENCE_LLM_API_KEY: "secret-key",
+    EVIDENCE_LLM_MODEL: "model",
+  }, {
+    fetch: async () => { throw new TypeError("connection failed for secret-key", { cause: { code: "EHOSTUNREACH" } }); },
+    onTransportError: (diagnostic) => diagnostics.push(diagnostic),
+  });
+
+  await assert.rejects(() => analyzer.generateCards(cardInput, AbortSignal.timeout(1_000)), EvidenceAnalyzerError);
+  assert.deepEqual(diagnostics, [{
+    name: "TypeError",
+    message: "connection failed for [redacted]",
+    causeName: "Object",
+    causeCode: "EHOSTUNREACH",
+  }]);
+  assert.equal(JSON.stringify(diagnostics).includes("secret-key"), false);
+  assert.equal(JSON.stringify(diagnostics).includes("chunk-1"), false);
+});
+
 test("distinguishes an injected adapter timeout from caller cancellation", async () => {
   const waitingFetch = async (_input: RequestInfo | URL, init?: RequestInit) => new Promise<Response>((_resolve, reject) => {
     if (init?.signal?.aborted) return reject(new DOMException("aborted", "AbortError"));

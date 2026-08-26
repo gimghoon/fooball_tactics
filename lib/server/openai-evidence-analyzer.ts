@@ -27,6 +27,14 @@ export type OpenAiEvidenceAnalyzerDependencies = {
   fetch?: typeof globalThis.fetch;
   /** Test seam; production calls retain the exact 30-second default. */
   requestTimeoutMs?: number;
+  onTransportError?: (diagnostic: EvidenceTransportDiagnostic) => void;
+};
+
+export type EvidenceTransportDiagnostic = {
+  name: string;
+  message: string;
+  causeName?: string;
+  causeCode?: string;
 };
 
 type AdapterConfig = {
@@ -35,6 +43,7 @@ type AdapterConfig = {
   model: string;
   fetch: typeof globalThis.fetch;
   requestTimeoutMs: number;
+  onTransportError?: (diagnostic: EvidenceTransportDiagnostic) => void;
 };
 
 const CARD_SCHEMA = {
@@ -149,7 +158,25 @@ export function createConfiguredEvidenceAnalyzer(
     model: required(env.EVIDENCE_LLM_MODEL, "EVIDENCE_LLM_MODEL"),
     fetch: fetchImpl,
     requestTimeoutMs: timeoutMs(dependencies.requestTimeoutMs),
+    onTransportError: dependencies.onTransportError,
   });
+}
+
+function sanitizeDiagnosticText(value: unknown, apiKey: string): string {
+  if (typeof value !== "string") return "";
+  return value.replaceAll(apiKey, "[redacted]").slice(0, 240);
+}
+
+function transportDiagnostic(error: unknown, apiKey: string): EvidenceTransportDiagnostic {
+  const value = error instanceof Error ? error : new Error("unknown transport error");
+  const cause = value.cause;
+  const causeRecord = typeof cause === "object" && cause !== null ? cause as Record<string, unknown> : null;
+  return {
+    name: value.name || "Error",
+    message: sanitizeDiagnosticText(value.message, apiKey),
+    ...(cause === undefined ? {} : { causeName: cause instanceof Error ? cause.name : cause?.constructor?.name ?? typeof cause }),
+    ...(typeof causeRecord?.code === "string" ? { causeCode: causeRecord.code.slice(0, 80) } : {}),
+  };
 }
 
 class OpenAiEvidenceAnalyzer implements EvidenceAnalyzer {
@@ -224,7 +251,8 @@ class OpenAiEvidenceAnalyzer implements EvidenceAnalyzer {
           // An Authorization header must never be forwarded to a different origin.
           redirect: "error",
         });
-      } catch {
+      } catch (error) {
+        if (abortCause === "none") this.config.onTransportError?.(transportDiagnostic(error, this.config.apiKey));
         throw transportFailure();
       }
       if (!response.ok) {

@@ -25,7 +25,11 @@ export function createEvidenceProductionRouteRuntime(
   let analysisJobs: EvidenceAnalysisJobs | null = null;
   const jobs = () => {
     if (analysisJobs !== null) return analysisJobs;
-    const analyzer = createConfiguredEvidenceAnalyzer(dependencies.analyzerEnvironment);
+    const analyzer = createConfiguredEvidenceAnalyzer(dependencies.analyzerEnvironment, {
+      onTransportError(diagnostic) {
+        console.error("evidence_llm_transport", diagnostic);
+      },
+    });
     const settings = {
       analyzerModel: analyzer.modelId,
       promptVersion: EVIDENCE_PROMPT_VERSION,
