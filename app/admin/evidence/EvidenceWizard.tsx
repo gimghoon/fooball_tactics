@@ -134,11 +134,26 @@ export function EvidenceWizard({ initialBundles, initialBundleId, request = defa
     setBusy(true); setError("");
     try {
       for (const file of files) {
-        if (file.name.toLowerCase().endsWith(".json")) parseSpatialEvidenceJson(await file.text());
+        if (!file.name.toLowerCase().endsWith(".json")) continue;
+        try { parseSpatialEvidenceJson(await file.text()); }
+        catch (value) {
+          const reason = value instanceof Error ? value.message : "공간 전술 형식이 아닙니다.";
+          throw new Error(`${file.name}: 지원하지 않는 공간 전술 JSON 형식입니다. ${reason}`);
+        }
+      }
+      const uploaded: Source[] = [];
+      for (const file of files) {
         const form = new FormData(); form.set("file", file);
         const result = await request(`/api/admin/evidence/${bundle.id}/files`, { method: "POST", body: form }) as { source: Source };
-        updateBundle({ ...bundle, sources: [...(bundle.sources ?? []).filter((item) => item.contentHash !== result.source.contentHash), result.source] });
+        uploaded.push(result.source);
       }
+      const merged = [...(bundle.sources ?? [])];
+      for (const source of uploaded) {
+        const existing = merged.findIndex((item) => item.contentHash === source.contentHash);
+        if (existing >= 0) merged[existing] = source; else merged.push(source);
+      }
+      updateBundle({ ...bundle, sources: merged });
+      await loadBundle(bundle.id);
       setMessage(`${files.length}개 파일을 등록했습니다.`);
     } catch (value) { fail(value); } finally { setBusy(false); event.target.value = ""; }
   };

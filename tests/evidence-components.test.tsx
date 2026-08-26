@@ -52,6 +52,23 @@ const bundle: EvidenceWizardBundle = {
   videoClips: [],
 };
 
+const spatialValue = {
+  source: { title: "압박", url: "https://coach.example/video", startTime: "00:00:00", endTime: "00:00:10", coachName: "코치" },
+  coordinateSystem: { width: 100, height: 136, attackDirection: "negative_y", normalized: true },
+  scene: {
+    title: "픽소 판단", decisionTime: "00:00:05", userRole: "fixo", ballOwnerId: "F1",
+    defense: { primaryType: "front_press", description: "D1 압박" },
+    players: [
+      { id: "F1", team: "attack", role: "fixo", position: { x: 50, y: 100 }, hasBall: true, confidence: "exact" },
+      { id: "D1", team: "defense", role: "defender", position: { x: 50, y: 80 }, hasBall: false, confidence: "estimated" },
+    ],
+    openSpaces: [], decisionCues: ["D1 위치"],
+    preferredSequence: [{ order: 1, type: "dribble", actorId: "F1", path: [{ x: 50, y: 100 }, { x: 70, y: 90 }], durationMs: 1000, reason: "바깥 공간 사용" }],
+    alternatives: [], riskyActions: [], expectedOutcome: "압박 회피",
+    evidence: [{ timeRange: "00:00:00-00:00:06", type: "observation", statement: "D1이 접근" }], uncertainties: [],
+  },
+};
+
 test("analysis remains disabled until the operator explicitly confirms the evidence inventory", async () => {
   const container = await render(<EvidenceWizard initialBundles={[bundle]} initialBundleId="bundle-1" />);
   await act(async () => button(container, "분석 확인").click());
@@ -105,33 +122,57 @@ test("pasted spatial JSON is validated and uploaded as a source", async () => {
     }
     throw new Error(`unexpected ${path}`);
   };
-  const value = {
-    source: { title: "압박", url: "https://coach.example/video", startTime: "00:00:00", endTime: "00:00:10", coachName: "코치" },
-    coordinateSystem: { width: 100, height: 136, attackDirection: "negative_y", normalized: true },
-    scene: {
-      title: "픽소 판단", decisionTime: "00:00:05", userRole: "fixo", ballOwnerId: "F1",
-      defense: { primaryType: "front_press", description: "D1 압박" },
-      players: [
-        { id: "F1", team: "attack", role: "fixo", position: { x: 50, y: 100 }, hasBall: true, confidence: "exact" },
-        { id: "D1", team: "defense", role: "defender", position: { x: 50, y: 80 }, hasBall: false, confidence: "estimated" },
-      ],
-      openSpaces: [], decisionCues: ["D1 위치"],
-      preferredSequence: [{ order: 1, type: "dribble", actorId: "F1", path: [{ x: 50, y: 100 }, { x: 70, y: 90 }], durationMs: 1000, reason: "바깥 공간 사용" }],
-      alternatives: [], riskyActions: [], expectedOutcome: "압박 회피",
-      evidence: [{ timeRange: "00:00:00-00:00:06", type: "observation", statement: "D1이 접근" }], uncertainties: [],
-    },
-  };
   const container = await render(<EvidenceWizard initialBundles={[bundle]} initialBundleId="bundle-1" request={api} />);
   const textarea = container.querySelector<HTMLTextAreaElement>('textarea[name="spatial-json"]');
   assert.ok(textarea);
   await act(async () => {
     const setter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, "value")?.set;
     assert.ok(setter);
-    setter.call(textarea, JSON.stringify(value));
+    setter.call(textarea, JSON.stringify(spatialValue));
     textarea.dispatchEvent(new Event("input", { bubbles: true }));
     textarea.dispatchEvent(new Event("change", { bubbles: true }));
   });
   await act(async () => textarea.closest("form")!.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true })));
   assert.match(uploadedName, /^spatial-evidence-.*\.json$/);
   assert.match(container.textContent ?? "", /JSON 근거를 등록했습니다/);
+});
+
+test("multi-file upload reloads and displays every stored JSON source", async () => {
+  const stored = [...bundle.sources!];
+  const api = async (path: string, init?: RequestInit) => {
+    if (path.endsWith("/files") && init?.body instanceof FormData) {
+      const file = init.body.get("file");
+      assert.ok(file instanceof File);
+      const source = { id: `source-${stored.length + 1}`, bundleId: bundle.id, originalFileName: file.name, mediaType: "text/plain", byteSize: file.size, contentHash: `hash-${stored.length + 1}`, extractionStatus: "completed", extractionError: null };
+      stored.push(source);
+      return { source };
+    }
+    if (path === `/api/admin/evidence/${bundle.id}`) return { bundle: { ...bundle, sources: stored }, latestJob: null };
+    throw new Error(`unexpected ${path}`);
+  };
+  const container = await render(<EvidenceWizard initialBundles={[bundle]} initialBundleId={bundle.id} request={api} />);
+  const input = container.querySelector<HTMLInputElement>("#evidence-files");
+  assert.ok(input);
+  Object.defineProperty(input, "files", { configurable: true, value: [
+    new File([JSON.stringify(spatialValue)], "one.json", { type: "application/json" }),
+    new File([JSON.stringify({ ...spatialValue, source: { ...spatialValue.source, title: "두 번째" } })], "two.json", { type: "application/json" }),
+  ] });
+  await act(async () => { input.dispatchEvent(new Event("change", { bubbles: true })); await new Promise((resolve) => setTimeout(resolve, 0)); });
+  assert.match(container.textContent ?? "", /one\.json/);
+  assert.match(container.textContent ?? "", /two\.json/);
+  assert.match(container.textContent ?? "", /2개 파일을 등록했습니다/);
+});
+
+test("unsupported combined JSON reports its file name before uploading anything", async () => {
+  let requests = 0;
+  const container = await render(<EvidenceWizard initialBundles={[bundle]} initialBundleId={bundle.id} request={async () => { requests += 1; throw new Error("should not upload"); }} />);
+  const input = container.querySelector<HTMLInputElement>("#evidence-files");
+  assert.ok(input);
+  Object.defineProperty(input, "files", { configurable: true, value: [
+    new File([JSON.stringify({ datasetId: "draft", sourceOverview: {}, cards: [] })], "combined-draft.json", { type: "application/json" }),
+  ] });
+  await act(async () => { input.dispatchEvent(new Event("change", { bubbles: true })); await new Promise((resolve) => setTimeout(resolve, 0)); });
+  assert.equal(requests, 0);
+  assert.match(container.textContent ?? "", /combined-draft\.json/);
+  assert.match(container.textContent ?? "", /지원하지 않는 공간 전술 JSON 형식/);
 });
