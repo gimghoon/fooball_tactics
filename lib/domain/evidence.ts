@@ -1,13 +1,34 @@
-import type { DefenseType } from "./content.ts";
-
 export type CardReviewStatus = "analysis_draft" | "owner_reviewed" | "coach_reviewed" | "held" | "rejected";
 export type AnalysisJobStatus = "queued" | "running" | "review_ready" | "completed" | "failed";
 export type Confidence = "high" | "medium" | "low";
-export type CardAction = { action: "pass" | "dribble" | "move"; reason: string; citationIds: string[] };
+export type EvidenceDefenseType =
+  | "front_press" | "central_block" | "wide_funnel" | "one_v_one"
+  | "numerical_advantage" | "numerical_disadvantage" | "zonal" | "man_to_man"
+  | "double_team" | "cover_shadow" | "transition_defense" | "wide_trap"
+  | "numerical_superiority" | "numerical_inferiority" | "unknown";
+export type TacticalIntent =
+  | "support" | "cover" | "press" | "delay" | "block_lane" | "hold_shape"
+  | "intercept" | "create_width" | "progress" | "retain_possession" | "transition_attack";
+export type ActionProvenance = "coach_statement" | "observation" | "inferred" | "simulation_assumption";
+export type CardAction = {
+  action: "pass" | "dribble" | "move" | "hold" | "shoot";
+  reason: string;
+  citationIds: string[];
+  /** Optional only for cards created before evidence-card-schema-v2. */
+  tacticalIntent?: TacticalIntent;
+  actorId?: string | null;
+  targetId?: string | null;
+  trigger?: string | null;
+  path?: SpatialPoint[];
+  provenance?: ActionProvenance;
+  confidence?: Confidence;
+};
 export type TacticCardContent = {
   situation: string;
   conditions: string[];
-  defenseType: DefenseType;
+  defenseType: EvidenceDefenseType;
+  /** Optional only for cards created before evidence-card-schema-v2. */
+  ballOwnerId?: string | null;
   cues: string[];
   preferred: CardAction[];
   alternatives: CardAction[];
@@ -73,16 +94,27 @@ export type EvidenceVersionInput = {
   schemaVersion: string;
 };
 
-const ACTIONS: readonly CardAction["action"][] = ["pass", "dribble", "move"];
+const ACTIONS: readonly CardAction["action"][] = ["pass", "dribble", "move", "hold", "shoot"];
 const CONFIDENCES: readonly Confidence[] = ["high", "medium", "low"];
-const DEFENSE_TYPES: readonly DefenseType[] = [
+const DEFENSE_TYPES: readonly EvidenceDefenseType[] = [
   "front_press",
   "central_block",
   "wide_funnel",
   "one_v_one",
   "numerical_advantage",
   "numerical_disadvantage",
+  "zonal",
+  "man_to_man",
+  "double_team",
+  "cover_shadow",
+  "transition_defense",
+  "wide_trap",
+  "numerical_superiority",
+  "numerical_inferiority",
+  "unknown",
 ];
+const TACTICAL_INTENTS: readonly TacticalIntent[] = ["support", "cover", "press", "delay", "block_lane", "hold_shape", "intercept", "create_width", "progress", "retain_possession", "transition_attack"];
+const PROVENANCES: readonly ActionProvenance[] = ["coach_statement", "observation", "inferred", "simulation_assumption"];
 
 export class EvidenceValidationError extends Error {}
 
@@ -174,10 +206,25 @@ function parseSpatialAction(value: Record<string, unknown>, field: string, playe
 function parseCardAction(value: unknown, field: string): CardAction {
   if (!isRecord(value)) fail(`${field}가 필요합니다.`);
   if (!ACTIONS.includes(value.action as CardAction["action"])) fail(`${field}.action이 올바르지 않습니다.`);
+  const tacticalIntent = value.tacticalIntent;
+  if (tacticalIntent !== undefined && !TACTICAL_INTENTS.includes(tacticalIntent as TacticalIntent)) fail(`${field}.tacticalIntent이 올바르지 않습니다.`);
+  const provenance = value.provenance;
+  if (provenance !== undefined && !PROVENANCES.includes(provenance as ActionProvenance)) fail(`${field}.provenance가 올바르지 않습니다.`);
+  const confidence = value.confidence;
+  if (confidence !== undefined && !CONFIDENCES.includes(confidence as Confidence)) fail(`${field}.confidence가 올바르지 않습니다.`);
+  const path = value.path === undefined ? undefined : recordArray(value.path, `${field}.path`).map((point, index) => spatialPoint(point, `${field}.path[${index}]`));
+  const nullableText = (item: unknown, name: string) => item === null || item === undefined ? null : nonEmptyString(item, name);
   return {
     action: value.action as CardAction["action"],
     reason: nonEmptyString(value.reason, `${field}.reason`),
     citationIds: stringArray(value.citationIds, `${field}.citationIds`),
+    ...(tacticalIntent === undefined ? {} : { tacticalIntent: tacticalIntent as TacticalIntent }),
+    ...(value.actorId === undefined ? {} : { actorId: nullableText(value.actorId, `${field}.actorId`) }),
+    ...(value.targetId === undefined ? {} : { targetId: nullableText(value.targetId, `${field}.targetId`) }),
+    ...(value.trigger === undefined ? {} : { trigger: nullableText(value.trigger, `${field}.trigger`) }),
+    ...(path === undefined ? {} : { path }),
+    ...(provenance === undefined ? {} : { provenance: provenance as ActionProvenance }),
+    ...(confidence === undefined ? {} : { confidence: confidence as Confidence }),
   };
 }
 
@@ -308,13 +355,14 @@ export function parseTacticCardContent(input: unknown): TacticCardContent {
     }
   }
   if (!isRecord(input)) fail("카드 콘텐츠가 필요합니다.");
-  if (!DEFENSE_TYPES.includes(input.defenseType as DefenseType)) fail("수비 유형이 올바르지 않습니다.");
+  if (!DEFENSE_TYPES.includes(input.defenseType as EvidenceDefenseType)) fail("수비 유형이 올바르지 않습니다.");
   if (!CONFIDENCES.includes(input.confidence as Confidence)) fail("확신도가 올바르지 않습니다.");
 
   return {
     situation: nonEmptyString(input.situation, "situation"),
     conditions: stringArray(input.conditions, "conditions"),
-    defenseType: input.defenseType as DefenseType,
+    defenseType: input.defenseType as EvidenceDefenseType,
+    ...(input.ballOwnerId === undefined ? {} : { ballOwnerId: input.ballOwnerId === null ? null : nonEmptyString(input.ballOwnerId, "ballOwnerId") }),
     cues: stringArray(input.cues, "cues"),
     preferred: parseCardActions(input.preferred, "preferred"),
     alternatives: parseCardActions(input.alternatives, "alternatives"),

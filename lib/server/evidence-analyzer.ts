@@ -1,4 +1,4 @@
-import type { CardAction, TacticCardContent } from "../domain/evidence.ts";
+import type { ActionProvenance, CardAction, Confidence, SpatialPoint, TacticalIntent, TacticCardContent } from "../domain/evidence.ts";
 
 export type EvidenceChunkInput = {
   id: string;
@@ -10,6 +10,8 @@ export type ExtractedEvidence = {
   citationIds: string[];
   situation: string;
   conditions: string[];
+  defenseType?: TacticCardContent["defenseType"];
+  ballOwnerId?: string | null;
   cues: string[];
   actions: CardAction[];
   outcomes: string[];
@@ -36,9 +38,13 @@ export class EvidenceAnalyzerError extends Error {
   }
 }
 
-const ACTIONS = new Set<CardAction["action"]>(["pass", "dribble", "move"]);
+const ACTIONS = new Set<CardAction["action"]>(["pass", "dribble", "move", "hold", "shoot"]);
+const TACTICAL_INTENTS = new Set<TacticalIntent>(["support", "cover", "press", "delay", "block_lane", "hold_shape", "intercept", "create_width", "progress", "retain_possession", "transition_attack"]);
+const PROVENANCES = new Set<ActionProvenance>(["coach_statement", "observation", "inferred", "simulation_assumption"]);
 const DEFENSE_TYPES = new Set<TacticCardContent["defenseType"]>([
   "front_press", "central_block", "wide_funnel", "one_v_one", "numerical_advantage", "numerical_disadvantage",
+  "zonal", "man_to_man", "double_team", "cover_shadow", "transition_defense", "wide_trap",
+  "numerical_superiority", "numerical_inferiority", "unknown",
 ]);
 const CONFIDENCES = new Set<TacticCardContent["confidence"]>(["high", "medium", "low"]);
 
@@ -72,6 +78,23 @@ function booleanValue(value: unknown, field: string): boolean {
   return value;
 }
 
+function nullableString(value: unknown, field: string): string | null {
+  return value === null ? null : nonEmptyString(value, field);
+}
+
+function pathValue(value: unknown, field: string): SpatialPoint[] {
+  if (!Array.isArray(value)) fail(`${field} 배열이 필요합니다.`);
+  return value.map((item, index) => {
+    if (!isRecord(item)) fail(`${field}[${index}] 좌표가 필요합니다.`);
+    exactKeys(item, ["x", "y"], `${field}[${index}]`);
+    const x = item.x;
+    const y = item.y;
+    if (typeof x !== "number" || !Number.isFinite(x) || x < 0 || x > 100) fail(`${field}[${index}].x가 올바르지 않습니다.`);
+    if (typeof y !== "number" || !Number.isFinite(y) || y < 0 || y > 136) fail(`${field}[${index}].y가 올바르지 않습니다.`);
+    return { x, y };
+  });
+}
+
 function citationIds(value: unknown, field: string, allowed: Set<string>): string[] {
   const ids = stringArray(value, field);
   if (ids.length === 0) fail(`${field}에는 하나 이상의 근거가 필요합니다.`);
@@ -81,10 +104,28 @@ function citationIds(value: unknown, field: string, allowed: Set<string>): strin
 
 function parseAction(value: unknown, field: string, allowed: Set<string>): CardAction {
   if (!isRecord(value)) fail(`${field}가 필요합니다.`);
-  exactKeys(value, ["action", "reason", "citationIds"], field);
+  const enriched = ["tacticalIntent", "actorId", "targetId", "trigger", "path", "provenance", "confidence"].some((key) => key in value);
+  exactKeys(value, enriched
+    ? ["action", "tacticalIntent", "actorId", "targetId", "trigger", "path", "provenance", "confidence", "reason", "citationIds"]
+    : ["action", "reason", "citationIds"], field);
   if (!ACTIONS.has(value.action as CardAction["action"])) fail(`${field}.action 행동이 올바르지 않습니다.`);
+  if (!enriched) return {
+    action: value.action as CardAction["action"],
+    reason: nonEmptyString(value.reason, `${field}.reason`),
+    citationIds: citationIds(value.citationIds, `${field}.citationIds`, allowed),
+  };
+  if (!TACTICAL_INTENTS.has(value.tacticalIntent as TacticalIntent)) fail(`${field}.tacticalIntent 전술 의도가 올바르지 않습니다.`);
+  if (!PROVENANCES.has(value.provenance as ActionProvenance)) fail(`${field}.provenance 근거 수준이 올바르지 않습니다.`);
+  if (!CONFIDENCES.has(value.confidence as Confidence)) fail(`${field}.confidence 확신도가 올바르지 않습니다.`);
   return {
     action: value.action as CardAction["action"],
+    tacticalIntent: value.tacticalIntent as TacticalIntent,
+    actorId: nullableString(value.actorId, `${field}.actorId`),
+    targetId: nullableString(value.targetId, `${field}.targetId`),
+    trigger: nullableString(value.trigger, `${field}.trigger`),
+    path: pathValue(value.path, `${field}.path`),
+    provenance: value.provenance as ActionProvenance,
+    confidence: value.confidence as Confidence,
     reason: nonEmptyString(value.reason, `${field}.reason`),
     citationIds: citationIds(value.citationIds, `${field}.citationIds`, allowed),
   };
@@ -154,9 +195,11 @@ export function parseAnalyzerCards(
   const cards = cardArray(value).map((candidate, index) => {
     const field = `cards[${index}]`;
     if (!isRecord(candidate)) fail(`${field}가 필요합니다.`);
+    const enriched = "ballOwnerId" in candidate;
     exactKeys(candidate, [
       "situation", "conditions", "defenseType", "cues", "preferred", "alternatives", "risky", "confidence",
       "uncertainties", "conflicts", "scenarioSuitable", "animationSuitable",
+      ...(enriched ? ["ballOwnerId"] : []),
     ], field);
     if (!DEFENSE_TYPES.has(candidate.defenseType as TacticCardContent["defenseType"])) fail(`${field}.defenseType 수비 유형이 올바르지 않습니다.`);
     if (!CONFIDENCES.has(candidate.confidence as TacticCardContent["confidence"])) fail(`${field}.confidence 확신도가 올바르지 않습니다.`);
@@ -166,19 +209,40 @@ export function parseAnalyzerCards(
     if (preferred.length + alternatives.length + risky.length === 0) {
       fail(`${field}에는 하나 이상의 행동이 필요합니다.`);
     }
+    const ballOwnerId = enriched ? nullableString(candidate.ballOwnerId, `${field}.ballOwnerId`) : undefined;
+    const actions = [...preferred, ...alternatives, ...risky];
+    const defensiveIntents = new Set<TacticalIntent>(["cover", "press", "delay", "block_lane", "hold_shape", "intercept"]);
+    for (const action of actions) {
+      if (action.tacticalIntent && defensiveIntents.has(action.tacticalIntent) && !["move", "hold"].includes(action.action)) {
+        fail(`${field}의 수비 전술 의도는 드리블·패스·슛으로 표현할 수 없습니다.`);
+      }
+      if (enriched && action.action === "dribble" && typeof ballOwnerId === "string" && action.actorId !== ballOwnerId) {
+        fail(`${field}의 드리블 선수는 공 소유자여야 합니다.`);
+      }
+      if (enriched && action.action === "pass" && ((typeof ballOwnerId === "string" && action.actorId !== ballOwnerId) || (action.targetId !== null && action.targetId === action.actorId))) {
+        fail(`${field}의 패스는 공 소유자가 다른 선수에게 해야 합니다.`);
+      }
+      if (action.provenance === "simulation_assumption" && action.confidence === "high") action.confidence = "medium";
+    }
+    const conflicts = stringArray(candidate.conflicts, `${field}.conflicts`);
+    const hasAnimationData = enriched && ballOwnerId !== null && actions.every((action) =>
+      Boolean(action.actorId)
+      && ((action.action === "move" || action.action === "dribble") ? (action.path?.length ?? 0) >= 2 : true)
+      && (action.action === "pass" ? Boolean(action.targetId) : true));
     return {
       situation: nonEmptyString(candidate.situation, `${field}.situation`),
       conditions: stringArray(candidate.conditions, `${field}.conditions`),
       defenseType: candidate.defenseType as TacticCardContent["defenseType"],
+      ...(enriched ? { ballOwnerId } : {}),
       cues: stringArray(candidate.cues, `${field}.cues`),
       preferred,
       alternatives,
       risky,
       confidence: candidate.confidence as TacticCardContent["confidence"],
       uncertainties: stringArray(candidate.uncertainties, `${field}.uncertainties`),
-      conflicts: stringArray(candidate.conflicts, `${field}.conflicts`),
-      scenarioSuitable: booleanValue(candidate.scenarioSuitable, `${field}.scenarioSuitable`),
-      animationSuitable: booleanValue(candidate.animationSuitable, `${field}.animationSuitable`),
+      conflicts,
+      scenarioSuitable: booleanValue(candidate.scenarioSuitable, `${field}.scenarioSuitable`) && conflicts.length === 0,
+      animationSuitable: booleanValue(candidate.animationSuitable, `${field}.animationSuitable`) && conflicts.length === 0 && (!enriched || hasAnimationData),
     };
   });
   if (cards.length === 0) fail("카드 결과에는 하나 이상의 행동이 필요합니다.");
@@ -201,11 +265,17 @@ export function parseExtractedEvidence(
   return records.map((candidate, index) => {
     const field = `extracted[${index}]`;
     if (!isRecord(candidate)) fail(`${field}가 필요합니다.`);
-    exactKeys(candidate, ["citationIds", "situation", "conditions", "cues", "actions", "outcomes", "exceptions"], field);
+    const enriched = "defenseType" in candidate || "ballOwnerId" in candidate;
+    exactKeys(candidate, ["citationIds", "situation", "conditions", ...(enriched ? ["defenseType", "ballOwnerId"] : []), "cues", "actions", "outcomes", "exceptions"], field);
+    if (enriched && !DEFENSE_TYPES.has(candidate.defenseType as TacticCardContent["defenseType"])) fail(`${field}.defenseType 수비 유형이 올바르지 않습니다.`);
     return {
       citationIds: citationIds(candidate.citationIds, `${field}.citationIds`, allowed),
       situation: nonEmptyString(candidate.situation, `${field}.situation`),
       conditions: stringArray(candidate.conditions, `${field}.conditions`),
+      ...(enriched ? {
+        defenseType: candidate.defenseType as TacticCardContent["defenseType"],
+        ballOwnerId: nullableString(candidate.ballOwnerId, `${field}.ballOwnerId`),
+      } : {}),
       cues: stringArray(candidate.cues, `${field}.cues`),
       actions: parseActions(candidate.actions, `${field}.actions`, allowed),
       outcomes: stringArray(candidate.outcomes, `${field}.outcomes`),

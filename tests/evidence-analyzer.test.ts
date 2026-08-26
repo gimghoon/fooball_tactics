@@ -58,13 +58,81 @@ test("rejects malformed JSON and citations outside the supplied evidence", () =>
 test("rejects unknown fields, enums, empty action reasons, and empty citations", () => {
   assert.throws(() => parseAnalyzerCards(JSON.stringify([{ ...card(), providerResponse: "raw" }]), chunks), /알 수 없는/);
   assert.throws(() => parseAnalyzerCards(JSON.stringify([{ ...card(), defenseType: "other" }]), chunks), /수비 유형/);
-  assert.throws(() => parseAnalyzerCards(JSON.stringify([{ ...card(), preferred: [{ action: "shoot", reason: "x", citationIds: ["chunk-1"] }] }]), chunks), /행동/);
+  assert.throws(() => parseAnalyzerCards(JSON.stringify([{ ...card(), preferred: [{ action: "screen", reason: "x", citationIds: ["chunk-1"] }] }]), chunks), /행동/);
   assert.throws(() => parseAnalyzerCards(JSON.stringify([{ ...card(), preferred: [{ action: "pass", reason: "", citationIds: ["chunk-1"] }] }]), chunks), /필요/);
   assert.throws(() => parseAnalyzerCards(JSON.stringify([card([])]), chunks), /근거/);
   assert.throws(() => parseAnalyzerCards(JSON.stringify([{ ...card(), preferred: [], alternatives: [], risky: [] }]), chunks), /행동/);
   const actionless = { ...card(), preferred: [], alternatives: [], risky: [] };
   assert.throws(() => parseAnalyzerCards(JSON.stringify([card(), actionless]), chunks), /행동/);
   assert.throws(() => parseAnalyzerCards(JSON.stringify([]), chunks), /행동/);
+});
+
+test("preserves defensive intent and zonal defense without inventing a dribble", () => {
+  const result = parseAnalyzerCards(JSON.stringify({ cards: [{
+    ...card(),
+    defenseType: "zonal",
+    ballOwnerId: "A1",
+    preferred: [{
+      action: "move",
+      tacticalIntent: "cover",
+      actorId: "D2",
+      targetId: null,
+      trigger: "D1이 압박을 시작하면",
+      path: [{ x: 52, y: 70 }, { x: 48, y: 62 }],
+      provenance: "coach_statement",
+      confidence: "high",
+      reason: "D2가 먼저 뒤 공간을 커버한다.",
+      citationIds: ["chunk-1"],
+    }],
+    risky: [],
+  }] }), chunks);
+
+  assert.equal(result[0]?.defenseType, "zonal");
+  assert.equal(result[0]?.preferred[0]?.action, "move");
+  assert.equal(result[0]?.preferred[0]?.tacticalIntent, "cover");
+});
+
+test("semantic validation blocks impossible possession actions and unsafe animation claims", () => {
+  const impossible = {
+    ...card(),
+    ballOwnerId: "A1",
+    preferred: [{
+      action: "dribble", tacticalIntent: "press", actorId: "D1", targetId: null,
+      trigger: "즉시", path: [{ x: 50, y: 80 }, { x: 50, y: 70 }],
+      provenance: "inferred", confidence: "high", reason: "공을 압박한다.", citationIds: ["chunk-1"],
+    }],
+    risky: [],
+  };
+  assert.throws(() => parseAnalyzerCards(JSON.stringify({ cards: [impossible] }), chunks), /드리블|수비 전술 의도/);
+
+  const missingPath = {
+    ...card(),
+    ballOwnerId: "A1",
+    preferred: [{
+      action: "move", tacticalIntent: "support", actorId: "A2", targetId: null,
+      trigger: "A1이 공을 잡으면", path: [], provenance: "observation", confidence: "medium",
+      reason: "패스 각도를 만든다.", citationIds: ["chunk-1"],
+    }],
+    risky: [],
+  };
+  assert.equal(parseAnalyzerCards(JSON.stringify({ cards: [missingPath] }), chunks)[0]?.animationSuitable, false);
+});
+
+test("simulation assumptions cannot remain high-confidence but stay available for human review", () => {
+  const assumption = {
+    ...card(),
+    ballOwnerId: "A1",
+    preferred: [{
+      action: "move", tacticalIntent: "support", actorId: "A2", targetId: null,
+      trigger: "A1이 전진하면", path: [{ x: 20, y: 90 }, { x: 30, y: 75 }],
+      provenance: "simulation_assumption", confidence: "high",
+      reason: "지원 각도를 만든다고 가정한다.", citationIds: ["chunk-1"],
+    }],
+    risky: [],
+  };
+  const result = parseAnalyzerCards(JSON.stringify({ cards: [assumption] }), chunks)[0]!;
+  assert.equal(result.preferred[0]?.confidence, "medium");
+  assert.equal(result.scenarioSuitable, true);
 });
 
 test("configured adapter sends a strict Responses structured-output request and returns only domain cards", async () => {
@@ -103,7 +171,12 @@ test("configured adapter sends a strict Responses structured-output request and 
   assert.equal(cardItems.additionalProperties, false);
   assert.ok((cardItems.required as string[]).includes("situation"));
   assert.equal(preferredItems.additionalProperties, false);
+  assert.ok((preferredItems.required as string[]).includes("tacticalIntent"));
+  assert.ok((preferredItems.required as string[]).includes("actorId"));
+  assert.ok((cardItems.required as string[]).includes("ballOwnerId"));
   assert.match(String(body.instructions), /supplied evidence/i);
+  assert.match(String(body.instructions), /press.*cover.*dribble/i);
+  assert.match(String(body.instructions), /different triggers.*not.*conflict/i);
 });
 
 test("rejects non-HTTPS endpoints and provider refusals or incomplete responses", async () => {
@@ -159,10 +232,18 @@ test("extraction parser rejects unknown fields, blank values, unknown citations,
   assert.throws(() => parseExtractedEvidence(JSON.stringify({ extracted: [{ ...extracted(), providerResponse: "raw" }] }), chunks), /알 수 없는/);
   assert.throws(() => parseExtractedEvidence(JSON.stringify({ extracted: [{ ...extracted(), situation: " " }] }), chunks), /필요/);
   assert.throws(() => parseExtractedEvidence(JSON.stringify({ extracted: [{ ...extracted(), citationIds: ["unknown"] }] }), chunks), /근거/);
-  assert.throws(() => parseExtractedEvidence(JSON.stringify({ extracted: [{ ...extracted(), actions: [{ action: "shoot", reason: "x", citationIds: ["chunk-1"] }] }] }), chunks), /행동/);
+  assert.throws(() => parseExtractedEvidence(JSON.stringify({ extracted: [{ ...extracted(), actions: [{ action: "screen", reason: "x", citationIds: ["chunk-1"] }] }] }), chunks), /행동/);
   assert.throws(() => parseExtractedEvidence(JSON.stringify({ extracted: [{ ...extracted(), actions: [{ action: "pass", reason: " ", citationIds: ["chunk-1"] }] }] }), chunks), /필요/);
   assert.throws(() => parseExtractedEvidence(JSON.stringify({ extracted: [{ ...extracted(), actions: [{ action: "pass", reason: "x", citationIds: [] }] }] }), chunks), /근거/);
   assert.throws(() => parseExtractedEvidence(JSON.stringify({ extracted: [] }), chunks), /근거/);
+});
+
+test("extraction preserves the ball owner and named defense type for card generation", () => {
+  const result = parseExtractedEvidence({ extracted: [{
+    ...extracted(), defenseType: "zonal", ballOwnerId: "A1",
+  }] }, chunks);
+  assert.equal(result[0]?.defenseType, "zonal");
+  assert.equal(result[0]?.ballOwnerId, "A1");
 });
 
 test("stage one rejects empty or blank chunks and stage two requires extracted citations", async () => {
@@ -198,7 +279,7 @@ test("extraction adapter sends strict schema and evidence-only instructions", as
   assert.equal(format.name, "evidence_extraction");
   assert.equal(extractionSchema.additionalProperties, false);
   assert.equal(extractionItems.additionalProperties, false);
-  assert.deepEqual(extractionItems.required, ["citationIds", "situation", "conditions", "cues", "actions", "outcomes", "exceptions"]);
+  assert.deepEqual(extractionItems.required, ["citationIds", "situation", "conditions", "defenseType", "ballOwnerId", "cues", "actions", "outcomes", "exceptions"]);
   assert.equal(record(JSON.parse(String(body.input))).stage, "extract_evidence");
   assert.deepEqual(body.reasoning, { effort: "minimal" });
   assert.match(String(body.instructions), /only.*supplied evidence/i);

@@ -56,10 +56,11 @@ const CARD_SCHEMA = {
       items: {
         type: "object",
         additionalProperties: false,
-        required: ["situation", "conditions", "defenseType", "cues", "preferred", "alternatives", "risky", "confidence", "uncertainties", "conflicts", "scenarioSuitable", "animationSuitable"],
+        required: ["situation", "conditions", "defenseType", "ballOwnerId", "cues", "preferred", "alternatives", "risky", "confidence", "uncertainties", "conflicts", "scenarioSuitable", "animationSuitable"],
         properties: {
           situation: { type: "string" }, conditions: { type: "array", items: { type: "string" } },
-          defenseType: { type: "string", enum: ["front_press", "central_block", "wide_funnel", "one_v_one", "numerical_advantage", "numerical_disadvantage"] },
+          defenseType: { type: "string", enum: ["front_press", "central_block", "wide_funnel", "one_v_one", "numerical_advantage", "numerical_disadvantage", "zonal", "man_to_man", "double_team", "cover_shadow", "transition_defense", "wide_trap", "numerical_superiority", "numerical_inferiority", "unknown"] },
+          ballOwnerId: { type: ["string", "null"] },
           cues: { type: "array", items: { type: "string" } },
           preferred: actionArraySchema(), alternatives: actionArraySchema(), risky: actionArraySchema(),
           confidence: { type: "string", enum: ["high", "medium", "low"] },
@@ -81,10 +82,12 @@ const EXTRACTION_SCHEMA = {
       items: {
         type: "object",
         additionalProperties: false,
-        required: ["citationIds", "situation", "conditions", "cues", "actions", "outcomes", "exceptions"],
+        required: ["citationIds", "situation", "conditions", "defenseType", "ballOwnerId", "cues", "actions", "outcomes", "exceptions"],
         properties: {
           citationIds: { type: "array", items: { type: "string" } }, situation: { type: "string" },
           conditions: { type: "array", items: { type: "string" } }, cues: { type: "array", items: { type: "string" } },
+          defenseType: { type: "string", enum: ["front_press", "central_block", "wide_funnel", "one_v_one", "numerical_advantage", "numerical_disadvantage", "zonal", "man_to_man", "double_team", "cover_shadow", "transition_defense", "wide_trap", "numerical_superiority", "numerical_inferiority", "unknown"] },
+          ballOwnerId: { type: ["string", "null"] },
           actions: actionArraySchema(), outcomes: { type: "array", items: { type: "string" } }, exceptions: { type: "array", items: { type: "string" } },
         },
       },
@@ -98,9 +101,16 @@ function actionArraySchema() {
     items: {
       type: "object",
       additionalProperties: false,
-      required: ["action", "reason", "citationIds"],
+      required: ["action", "tacticalIntent", "actorId", "targetId", "trigger", "path", "provenance", "confidence", "reason", "citationIds"],
       properties: {
-        action: { type: "string", enum: ["pass", "dribble", "move"] },
+        action: { type: "string", enum: ["pass", "dribble", "move", "hold", "shoot"] },
+        tacticalIntent: { type: "string", enum: ["support", "cover", "press", "delay", "block_lane", "hold_shape", "intercept", "create_width", "progress", "retain_possession", "transition_attack"] },
+        actorId: { type: ["string", "null"] },
+        targetId: { type: ["string", "null"] },
+        trigger: { type: ["string", "null"] },
+        path: { type: "array", items: { type: "object", additionalProperties: false, required: ["x", "y"], properties: { x: { type: "number" }, y: { type: "number" } } } },
+        provenance: { type: "string", enum: ["coach_statement", "observation", "inferred", "simulation_assumption"] },
+        confidence: { type: "string", enum: ["high", "medium", "low"] },
         reason: { type: "string" },
         citationIds: { type: "array", items: { type: "string" } },
       },
@@ -110,14 +120,22 @@ function actionArraySchema() {
 
 const EXTRACTION_INSTRUCTIONS = [
   "Use only the supplied evidence. Never add general tactical knowledge or facts not present in it.",
-  "Preserve conflicts instead of resolving them and keep differing conditions distinct.",
+  "Write all user-facing situation, condition, cue, trigger, reason, outcome, exception, uncertainty, and conflict text in Korean.",
+  "Keep physical action separate from tacticalIntent. A press or cover is tactical intent and must never be converted into a dribble.",
+  "Preserve the named defense type, action order, and trigger exactly when the evidence provides them.",
+  "Preserve real conflicts instead of resolving them and keep differing conditions distinct, but claims with different triggers or different times are not a conflict.",
+  "Classify provenance as coach_statement, observation, inferred, or simulation_assumption. A simulation assumption cannot have high confidence.",
   "Extract only explicit situations, conditions, cues, actions, outcomes, and exceptions.",
   "Every extracted action and reason must cite one or more supplied evidence chunk IDs.",
 ].join(" ");
 
 const CARD_INSTRUCTIONS = [
   "Use only supplied evidence in the extracted records and allowed citation IDs. Never add general tactical knowledge.",
-  "Preserve conflicts, record them in conflicts, and split principles with differing conditions into separate cards.",
+  "Write every user-facing field in Korean.",
+  "Keep physical action separate from tacticalIntent: press and cover must never become dribble. Dribble is allowed only for ballOwnerId; pass is allowed only from ballOwnerId to another player.",
+  "Preserve defense type, order, and trigger. Claims with different triggers or different times are not a conflict; record a conflict only when the same condition and time contain incompatible claims.",
+  "Use provenance to distinguish coach_statement, observation, inferred, and simulation_assumption. A simulation assumption cannot be high confidence.",
+  "Set animationSuitable false when actor, target, ball owner, coordinates, or path needed to animate the action is missing. Set both suitability flags false for an important conflict.",
   "Every action and reason must cite one or more allowed evidence chunk IDs.",
 ].join(" ");
 

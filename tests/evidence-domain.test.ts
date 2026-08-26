@@ -128,7 +128,7 @@ test("bundle inputs require a title and analysis purpose", () => {
 });
 
 test("tactic card content rejects an unsupported defense type", () => {
-  assert.throws(() => parseTacticCardContent({ ...validCard(), defenseType: "unknown" }));
+  assert.throws(() => parseTacticCardContent({ ...validCard(), defenseType: "other" }));
 });
 
 test("evidence versions are stable across source and clip ordering", async () => {

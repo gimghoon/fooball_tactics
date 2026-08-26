@@ -4,8 +4,8 @@ import { EvidenceAnalysisJobs } from "./evidence-jobs.ts";
 import { createEvidenceProductionRuntime, type EvidenceProductionBindings } from "./evidence-runtime.ts";
 import type { EvidenceRouteRuntime } from "./evidence-routes.ts";
 
-export const EVIDENCE_PROMPT_VERSION = "evidence-prompt-v1";
-export const EVIDENCE_SCHEMA_VERSION = "evidence-card-schema-v1";
+export const EVIDENCE_PROMPT_VERSION = "evidence-prompt-v2";
+export const EVIDENCE_SCHEMA_VERSION = "evidence-card-schema-v2";
 
 export type EvidenceProductionRouteRuntimeDependencies = {
   admin: EvidenceAdmin;
