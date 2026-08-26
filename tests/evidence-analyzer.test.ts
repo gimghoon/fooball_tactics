@@ -200,6 +200,7 @@ test("extraction adapter sends strict schema and evidence-only instructions", as
   assert.equal(extractionItems.additionalProperties, false);
   assert.deepEqual(extractionItems.required, ["citationIds", "situation", "conditions", "cues", "actions", "outcomes", "exceptions"]);
   assert.equal(record(JSON.parse(String(body.input))).stage, "extract_evidence");
+  assert.deepEqual(body.reasoning, { effort: "minimal" });
   assert.match(String(body.instructions), /only.*supplied evidence/i);
   assert.match(String(body.instructions), /conflict/i);
   assert.match(String(body.instructions), /differing conditions/i);

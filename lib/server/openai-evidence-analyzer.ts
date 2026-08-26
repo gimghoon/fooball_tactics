@@ -242,6 +242,7 @@ class OpenAiEvidenceAnalyzer implements EvidenceAnalyzer {
           headers: { "content-type": "application/json", authorization: `Bearer ${this.config.apiKey}` },
           body: JSON.stringify({
             model: this.config.model,
+            reasoning: { effort: "minimal" },
             instructions,
             input: JSON.stringify(input),
             text: { format: { type: "json_schema", name: schemaName, schema, strict: true } },
