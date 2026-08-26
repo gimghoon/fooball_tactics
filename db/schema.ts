@@ -60,11 +60,18 @@ export const evidenceBundles = sqliteTable("evidence_bundles", {
 export const evidenceSources = sqliteTable("evidence_sources", {
   id: text("id").primaryKey(),
   bundleId: text("bundle_id").notNull().references(() => evidenceBundles.id, { onDelete: "cascade" }),
+  origin: text("origin", { enum: ["uploaded", "external_web"] }).notNull().default("uploaded"),
   originalFileName: text("original_file_name").notNull(),
   mediaType: text("media_type").notNull(),
   byteSize: integer("byte_size").notNull(),
   contentHash: text("content_hash").notNull(),
   storageKey: text("storage_key").notNull(),
+  canonicalUrl: text("canonical_url"),
+  publisher: text("publisher"),
+  publishedAt: text("published_at"),
+  retrievedAt: integer("retrieved_at", { mode: "timestamp_ms" }),
+  searchCandidateId: text("search_candidate_id"),
+  externalTextHash: text("external_text_hash"),
   extractedTextKey: text("extracted_text_key"),
   extractionStatus: text("extraction_status", { enum: ["pending", "completed", "failed"] }).notNull().default("pending"),
   extractionError: text("extraction_error"),
@@ -72,11 +79,65 @@ export const evidenceSources = sqliteTable("evidence_sources", {
   updatedAt: integer("updated_at", { mode: "timestamp_ms" }).notNull(),
 }, (table) => [
   uniqueIndex("idx_evidence_sources_bundle_content_hash").on(table.bundleId, table.contentHash),
+  uniqueIndex("idx_evidence_sources_bundle_canonical_url").on(table.bundleId, table.canonicalUrl).where(sql`${table.canonicalUrl} IS NOT NULL`),
   uniqueIndex("idx_evidence_sources_id_bundle").on(table.id, table.bundleId),
   check(
     "ck_evidence_sources_media_type_and_size",
     sql`${table.mediaType} IN ('application/pdf', 'text/plain', 'text/markdown') AND ${table.byteSize} BETWEEN 0 AND 20971520`,
   ),
+]);
+
+export const evidenceSearchRuns = sqliteTable("evidence_search_runs", {
+  id: text("id").primaryKey(),
+  bundleId: text("bundle_id").notNull().references(() => evidenceBundles.id, { onDelete: "cascade" }),
+  inputVersion: text("input_version").notNull(),
+  bundleVersion: integer("bundle_version").notNull(),
+  status: text("status").notNull().default("queued"),
+  searchModel: text("search_model").notNull(),
+  promptVersion: text("prompt_version").notNull(),
+  queryJson: text("query_json").notNull(),
+  errorMessage: text("error_message"),
+  isStale: integer("is_stale", { mode: "boolean" }).notNull().default(false),
+  startedAt: integer("started_at", { mode: "timestamp_ms" }),
+  completedAt: integer("completed_at", { mode: "timestamp_ms" }),
+  createdAt: integer("created_at", { mode: "timestamp_ms" }).notNull(),
+  updatedAt: integer("updated_at", { mode: "timestamp_ms" }).notNull(),
+}, (table) => [
+  uniqueIndex("idx_evidence_search_runs_input").on(table.bundleId, table.inputVersion),
+  uniqueIndex("idx_evidence_search_runs_id_bundle").on(table.id, table.bundleId),
+]);
+
+export const evidenceSearchCandidates = sqliteTable("evidence_search_candidates", {
+  id: text("id").primaryKey(),
+  runId: text("run_id").notNull(),
+  bundleId: text("bundle_id").notNull(),
+  url: text("url").notNull(),
+  canonicalUrl: text("canonical_url").notNull(),
+  title: text("title").notNull(),
+  publisher: text("publisher").notNull(),
+  publishedAt: text("published_at").notNull(),
+  retrievedAt: integer("retrieved_at", { mode: "timestamp_ms" }),
+  documentType: text("document_type").notNull(),
+  quote: text("quote").notNull(),
+  relevance: text("relevance").notNull(),
+  trustTier: integer("trust_tier").notNull(),
+  rank: integer("rank").notNull(),
+  status: text("status").notNull().default("candidate"),
+  selectedBy: text("selected_by"),
+  selectedAt: integer("selected_at", { mode: "timestamp_ms" }),
+  sourceId: text("source_id"),
+  contentHash: text("content_hash"),
+  failureReason: text("failure_reason"),
+  createdAt: integer("created_at", { mode: "timestamp_ms" }).notNull(),
+  updatedAt: integer("updated_at", { mode: "timestamp_ms" }).notNull(),
+}, (table) => [
+  foreignKey({
+    name: "fk_search_candidate_run_bundle",
+    columns: [table.runId, table.bundleId],
+    foreignColumns: [evidenceSearchRuns.id, evidenceSearchRuns.bundleId],
+  }).onDelete("cascade"),
+  uniqueIndex("idx_search_candidate_run_url").on(table.runId, table.canonicalUrl),
+  index("idx_search_candidate_bundle_status").on(table.bundleId, table.status),
 ]);
 
 export const evidenceMutationReceipts = sqliteTable("evidence_mutation_receipts", {
