@@ -1,4 +1,4 @@
-import { EvidenceValidationError } from "../domain/evidence.ts";
+import { EvidenceValidationError, parseSpatialEvidenceJson } from "../domain/evidence.ts";
 import {
   extractEvidenceText,
   type EvidenceFileKind,
@@ -171,6 +171,10 @@ function resolveKindAndMediaType(input: EvidenceFileInput): Pick<ValidatedEviden
     if (isUnsafeTextSignature(input.bytes)) invalidFormat();
     return { kind: "text", mediaType: "text/markdown" };
   }
+  if (extension === "json" && (input.type === "application/json" || input.type === "text/plain")) {
+    if (isUnsafeTextSignature(input.bytes)) invalidFormat();
+    return { kind: "text", mediaType: "text/plain" };
+  }
   return invalidFormat();
 }
 
@@ -199,8 +203,13 @@ export async function validateEvidenceFile(
   }
   if (file.kind === "text") {
     try {
-      new TextDecoder("utf-8", { fatal: true }).decode(input.bytes);
-    } catch {
+      const text = new TextDecoder("utf-8", { fatal: true }).decode(input.bytes);
+      if (extensionFor(input.name) === "json") parseSpatialEvidenceJson(text);
+    } catch (error) {
+      if (extensionFor(input.name) === "json") {
+        if (error instanceof EvidenceValidationError) throw error;
+        throw new EvidenceValidationError("공간 근거 JSON을 확인해 주세요.");
+      }
       throw new EvidenceValidationError("텍스트 파일은 UTF-8이어야 합니다.");
     }
   }

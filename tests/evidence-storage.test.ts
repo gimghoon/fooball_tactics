@@ -42,6 +42,28 @@ function textFile(bytes: Uint8Array) {
   };
 }
 
+function jsonFile(value: unknown) {
+  const text = typeof value === "string" ? value : JSON.stringify(value);
+  return { name: "spatial-evidence.json", type: "application/json", bytes: new TextEncoder().encode(text) };
+}
+
+const minimalSpatialEvidence = {
+  source: { title: "압박", url: "https://coach.example/video", startTime: "00:00:00", endTime: "00:00:10", coachName: "코치" },
+  coordinateSystem: { width: 100, height: 136, attackDirection: "negative_y", normalized: true },
+  scene: {
+    title: "픽소 판단", decisionTime: "00:00:05", userRole: "fixo", ballOwnerId: "F1",
+    defense: { primaryType: "front_press", description: "D1 압박" },
+    players: [
+      { id: "F1", team: "attack", role: "fixo", position: { x: 50, y: 100 }, hasBall: true, confidence: "exact" },
+      { id: "D1", team: "defense", role: "defender", position: { x: 50, y: 80 }, hasBall: false, confidence: "estimated" },
+    ],
+    openSpaces: [], decisionCues: ["D1 위치"],
+    preferredSequence: [{ order: 1, type: "dribble", actorId: "F1", path: [{ x: 50, y: 100 }, { x: 70, y: 90 }], durationMs: 1000, reason: "바깥 공간 사용" }],
+    alternatives: [], riskyActions: [], expectedOutcome: "압박 회피",
+    evidence: [{ timeRange: "00:00:00-00:00:06", type: "observation", statement: "D1이 접근" }], uncertainties: [],
+  },
+};
+
 function fakePdfWithZipSignature() {
   return {
     name: "notes.pdf",
@@ -240,6 +262,14 @@ test("accepts the exact 20 MiB boundary and rejects one byte over", async () => 
   const bytes = new Uint8Array(20 * 1024 * 1024 + 1).fill(0x61);
   await assert.doesNotReject(() => validateEvidenceFile(textFile(bytes.subarray(0, -1))));
   await assert.rejects(() => validateEvidenceFile(textFile(bytes)), /20MB/);
+});
+
+test("accepts only schema-valid spatial JSON evidence as extracted text", async () => {
+  const valid = await validateEvidenceFile(jsonFile(minimalSpatialEvidence));
+  assert.equal(valid.kind, "text");
+  assert.equal(valid.mediaType, "text/plain");
+  await assert.rejects(() => validateEvidenceFile(jsonFile("{broken")), /JSON/);
+  await assert.rejects(() => validateEvidenceFile(jsonFile({ ...minimalSpatialEvidence, scene: { ...minimalSpatialEvidence.scene, ballOwnerId: "missing" } })), /ballOwnerId/);
 });
 
 test("rejects MIME, extension, signature, archive, executable, and encrypted PDF mismatches", async () => {

@@ -9,10 +9,36 @@ import {
   assertCardReviewTransition,
   computeEvidenceVersion,
   parseBundleInput,
+  parseSpatialEvidenceJson,
   parseTacticCardContent,
   parseVideoClip,
   type TacticCardContent,
 } from "../lib/domain/evidence.ts";
+
+const spatialEvidence = {
+  source: { title: "전방 압박", url: "https://coach.example/video", startTime: "00:00:10.000", endTime: "00:00:20.000", coachName: "코치" },
+  coordinateSystem: { width: 100, height: 136, attackDirection: "negative_y", normalized: true },
+  scene: {
+    title: "픽소의 판단", decisionTime: "00:00:14.000", userRole: "fixo", ballOwnerId: "F1",
+    defense: { primaryType: "front_press", description: "D1이 중앙을 막으며 압박" },
+    players: [
+      { id: "F1", team: "attack", role: "fixo", position: { x: 50, y: 108 }, hasBall: true, confidence: "estimated" },
+      { id: "A2", team: "attack", role: "ala", position: { x: 78, y: 80 }, hasBall: false, confidence: "estimated" },
+      { id: "D1", team: "defense", role: "defender", position: { x: 50, y: 92 }, hasBall: false, confidence: "estimated" },
+    ],
+    openSpaces: [{ id: "RIGHT", xMin: 70, xMax: 88, yMin: 88, yMax: 104 }],
+    decisionCues: ["D1의 몸 방향", "오른쪽 공간"],
+    preferredSequence: [
+      { order: 1, type: "dribble", actorId: "F1", path: [{ x: 50, y: 108 }, { x: 72, y: 96 }], durationMs: 1800, reason: "D1을 이동시킨다" },
+      { order: 2, type: "pass", actorId: "F1", targetId: "A2", trigger: "D1이 따라온다", reason: "열린 알라에게 연결" },
+    ],
+    alternatives: [],
+    riskyActions: [{ type: "pass", actorId: "F1", targetId: "A2", reason: "수비가 길을 닫으면 위험" }],
+    expectedOutcome: "오른쪽 전진 공간 확보",
+    evidence: [{ timeRange: "00:00:10.000-00:00:16.000", type: "observation", statement: "D1이 중앙을 막는다" }],
+    uncertainties: ["A2의 출발 시점은 추정"],
+  },
+};
 
 function validCard(overrides: Partial<TacticCardContent> = {}): TacticCardContent {
   return {
@@ -65,6 +91,22 @@ test("video clips require HTTPS and increasing timecodes", () => {
   assert.throws(() => parseVideoClip({ url: "http://x.test/v", startMs: 0, endMs: 10, observation: "압박" }));
   assert.throws(() => parseVideoClip({ url: "https://x.test/v", startMs: 10, endMs: 10, observation: "압박" }));
   assert.deepEqual(parseVideoClip({ url: "https://x.test/v", startMs: 0, endMs: 10, observation: "압박" }).startMs, 0);
+});
+
+test("spatial evidence JSON accepts referenced players and animation paths", () => {
+  const parsed = parseSpatialEvidenceJson(JSON.stringify(spatialEvidence));
+  assert.equal(parsed.scene.preferredSequence[1]?.targetId, "A2");
+  assert.deepEqual(parsed.scene.preferredSequence[0]?.path?.[1], { x: 72, y: 96 });
+});
+
+test("spatial evidence JSON reports the exact invalid coordinate and player reference", () => {
+  const badCoordinate = structuredClone(spatialEvidence);
+  badCoordinate.scene.players[0]!.position.x = 101;
+  assert.throws(() => parseSpatialEvidenceJson(badCoordinate), /scene\.players\[0\]\.position\.x/);
+
+  const missingTarget = structuredClone(spatialEvidence);
+  missingTarget.scene.preferredSequence[1]!.targetId = "A9";
+  assert.throws(() => parseSpatialEvidenceJson(missingTarget), /scene\.preferredSequence\[1\]\.targetId/);
 });
 
 test("a reviewable card requires supported actions and reasons", () => {

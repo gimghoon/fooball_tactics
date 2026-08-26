@@ -93,3 +93,45 @@ test("a referenced source cannot be confirmed for deletion", async () => {
   assert.match(container.textContent ?? "", /시나리오 초안 1개/);
   assert.equal(button(container, "삭제 확인").disabled, true);
 });
+
+test("pasted spatial JSON is validated and uploaded as a source", async () => {
+  let uploadedName = "";
+  const api = async (path: string, init?: RequestInit) => {
+    if (path.endsWith("/files") && init?.body instanceof FormData) {
+      const file = init.body.get("file");
+      assert.ok(file instanceof File);
+      uploadedName = file.name;
+      return { source: { id: "json-1", bundleId: "bundle-1", originalFileName: file.name, mediaType: "text/plain", byteSize: file.size, contentHash: "json-hash", extractionStatus: "completed", extractionError: null } };
+    }
+    throw new Error(`unexpected ${path}`);
+  };
+  const value = {
+    source: { title: "압박", url: "https://coach.example/video", startTime: "00:00:00", endTime: "00:00:10", coachName: "코치" },
+    coordinateSystem: { width: 100, height: 136, attackDirection: "negative_y", normalized: true },
+    scene: {
+      title: "픽소 판단", decisionTime: "00:00:05", userRole: "fixo", ballOwnerId: "F1",
+      defense: { primaryType: "front_press", description: "D1 압박" },
+      players: [
+        { id: "F1", team: "attack", role: "fixo", position: { x: 50, y: 100 }, hasBall: true, confidence: "exact" },
+        { id: "D1", team: "defense", role: "defender", position: { x: 50, y: 80 }, hasBall: false, confidence: "estimated" },
+      ],
+      openSpaces: [], decisionCues: ["D1 위치"],
+      preferredSequence: [{ order: 1, type: "dribble", actorId: "F1", path: [{ x: 50, y: 100 }, { x: 70, y: 90 }], durationMs: 1000, reason: "바깥 공간 사용" }],
+      alternatives: [], riskyActions: [], expectedOutcome: "압박 회피",
+      evidence: [{ timeRange: "00:00:00-00:00:06", type: "observation", statement: "D1이 접근" }], uncertainties: [],
+    },
+  };
+  const container = await render(<EvidenceWizard initialBundles={[bundle]} initialBundleId="bundle-1" request={api} />);
+  const textarea = container.querySelector<HTMLTextAreaElement>('textarea[name="spatial-json"]');
+  assert.ok(textarea);
+  await act(async () => {
+    const setter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, "value")?.set;
+    assert.ok(setter);
+    setter.call(textarea, JSON.stringify(value));
+    textarea.dispatchEvent(new Event("input", { bubbles: true }));
+    textarea.dispatchEvent(new Event("change", { bubbles: true }));
+  });
+  await act(async () => textarea.closest("form")!.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true })));
+  assert.match(uploadedName, /^spatial-evidence-.*\.json$/);
+  assert.match(container.textContent ?? "", /JSON 근거를 등록했습니다/);
+});
