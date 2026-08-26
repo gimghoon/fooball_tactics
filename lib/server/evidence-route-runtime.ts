@@ -64,6 +64,7 @@ export function createEvidenceProductionRouteRuntime(
       startAnalysis: (bundleId, admin) => jobs().startAnalysis(bundleId, admin),
       retryAnalysis: (jobId, admin) => jobs().retryAnalysis(jobId, admin),
       getAnalysisStatus: (jobId) => jobs().getAnalysisStatus(jobId),
+      getLatestAnalysisStatusForBundle: (bundleId) => jobs().getLatestAnalysisStatusForBundle(bundleId),
     },
   };
 }
