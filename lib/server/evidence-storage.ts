@@ -1,4 +1,5 @@
 import { EvidenceValidationError, parseSpatialEvidenceJson } from "../domain/evidence.ts";
+import { normalizeExternalUrl } from "../domain/evidence-search.ts";
 import {
   extractEvidenceText,
   type EvidenceFileKind,
@@ -46,6 +47,15 @@ export type EvidenceFileInput = {
   bytes: Uint8Array;
 };
 
+export type ExternalSourceMetadata = {
+  origin: "external_web";
+  canonicalUrl: string;
+  publisher: string;
+  publishedAt: string;
+  retrievedAt: number;
+  searchCandidateId: string;
+};
+
 export type StoredEvidenceFile = {
   id: string;
   bundleId: string;
@@ -57,6 +67,12 @@ export type StoredEvidenceFile = {
   extractedTextKey: string | null;
   extractionStatus: "pending" | "completed" | "failed";
   extractionError: string | null;
+  origin?: "uploaded" | "external_web";
+  canonicalUrl?: string;
+  publisher?: string;
+  publishedAt?: string;
+  retrievedAt?: number;
+  searchCandidateId?: string;
 };
 
 export type EvidenceR2Bucket = {
@@ -80,7 +96,7 @@ export type EvidenceD1Database = {
 
 /** Service-owned registration keeps a new source in the same version/audit mutation. */
 export type EvidenceSourceRegistrationPort = {
-  findExisting(bundleId: string, contentHash: string): Promise<StoredEvidenceFile | null>;
+  findExisting(bundleId: string, contentHash: string, canonicalUrl?: string): Promise<StoredEvidenceFile | null>;
   register(source: StoredEvidenceFile): Promise<StoredEvidenceFile>;
 };
 
@@ -222,6 +238,52 @@ function opaqueStorageKey(bundleId: string, sourceId: string, sha256: string): s
   return `bundles/${bundleId}/${sourceId}/${crypto.randomUUID()}-${sha256}`;
 }
 
+function validPublishedAt(value: string): boolean {
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value);
+  if (!match) return false;
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  const date = new Date(Date.UTC(year, month - 1, day));
+  return date.getUTCFullYear() === year && date.getUTCMonth() === month - 1 && date.getUTCDate() === day;
+}
+
+function normalizedExternalMetadata(value: ExternalSourceMetadata | undefined): ExternalSourceMetadata | undefined {
+  if (value === undefined) return undefined;
+  if (value.origin !== "external_web") throw new EvidenceValidationError("외부 출처 메타데이터가 올바르지 않습니다.");
+  const publisher = value.publisher.trim();
+  const searchCandidateId = value.searchCandidateId.trim();
+  if (
+    publisher === "" || publisher.length > 160
+    || searchCandidateId === "" || searchCandidateId.length > 200
+    || !validPublishedAt(value.publishedAt)
+    || !Number.isSafeInteger(value.retrievedAt) || value.retrievedAt < 0
+  ) {
+    throw new EvidenceValidationError("외부 출처 메타데이터가 올바르지 않습니다.");
+  }
+  let canonicalUrl: string;
+  try {
+    canonicalUrl = normalizeExternalUrl(value.canonicalUrl);
+  } catch {
+    throw new EvidenceValidationError("외부 출처 URL이 올바르지 않습니다.");
+  }
+  return { ...value, canonicalUrl, publisher, searchCandidateId };
+}
+
+function safeExternalFileName(canonicalUrl: string, mediaType: string): string {
+  const url = new URL(canonicalUrl);
+  const encodedLeaf = url.pathname.split("/").filter(Boolean).at(-1) ?? "document";
+  let leaf: string;
+  try { leaf = decodeURIComponent(encodedLeaf); } catch { leaf = encodedLeaf; }
+  leaf = [...leaf.normalize("NFKC")].map((character) => {
+    const codePoint = character.codePointAt(0)!;
+    return codePoint < 0x20 || codePoint === 0x7f || character === "/" || character === "\\" ? "_" : character;
+  }).join("")
+    .replace(/[^\p{L}\p{N}._-]+/gu, "_").replace(/^\.+|\.+$/g, "").slice(0, 100) || "document";
+  const stem = leaf.replace(/\.[a-z0-9]{1,10}$/i, "") || "document";
+  return mediaType === "application/pdf" ? `${stem}.pdf` : `${stem}.txt`;
+}
+
 export class EvidenceFileStore {
   constructor(private readonly dependencies: {
     bucket: EvidenceR2Bucket;
@@ -230,14 +292,19 @@ export class EvidenceFileStore {
   }) {}
 
   async putValidatedFile(
-    input: EvidenceFileInput & { bundleId: string },
+    input: EvidenceFileInput & { bundleId: string; externalMetadata?: ExternalSourceMetadata },
     requestPreflightOptions: EvidencePdfPreflightOptions = {},
   ): Promise<StoredEvidenceFile> {
-    const file = await validateEvidenceFile(input, {
+    const externalMetadata = normalizedExternalMetadata(input.externalMetadata);
+    const validatedInput = externalMetadata === undefined ? input : {
+      ...input,
+      name: safeExternalFileName(externalMetadata.canonicalUrl, input.type),
+    };
+    const file = await validateEvidenceFile(validatedInput, {
       ...this.dependencies.preflightOptions,
       ...requestPreflightOptions,
     });
-    const existing = await this.dependencies.registration.findExisting(input.bundleId, file.sha256);
+    const existing = await this.dependencies.registration.findExisting(input.bundleId, file.sha256, externalMetadata?.canonicalUrl);
     if (existing !== null) return existing;
 
     const id = crypto.randomUUID();
@@ -264,7 +331,7 @@ export class EvidenceFileStore {
     const source: StoredEvidenceFile = {
       id,
       bundleId: input.bundleId,
-      originalFileName: input.name,
+      originalFileName: validatedInput.name,
       mediaType: file.mediaType,
       byteSize: file.bytes.byteLength,
       contentHash: file.sha256,
@@ -272,12 +339,14 @@ export class EvidenceFileStore {
       extractedTextKey,
       extractionStatus,
       extractionError,
+      origin: externalMetadata?.origin ?? "uploaded",
+      ...externalMetadata,
     };
     try {
       return await this.dependencies.registration.register(source);
     } catch (error) {
       await this.deleteFilePair(storageKey, extractedTextKey);
-      const winner = await this.dependencies.registration.findExisting(input.bundleId, file.sha256);
+      const winner = await this.dependencies.registration.findExisting(input.bundleId, file.sha256, externalMetadata?.canonicalUrl);
       if (winner !== null) return winner;
       throw error;
     }

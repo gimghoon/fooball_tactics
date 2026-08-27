@@ -10,6 +10,13 @@ export type ExtractedPage = {
 export const MAX_PDF_PAGES = 200;
 export const MAX_EXTRACTED_OUTPUT_BYTES = 5 * 1024 * 1024;
 export const MAX_EXTRACTION_MS = 10_000;
+const HTML_SECTION_BYTES = 32 * 1024;
+const HTML_STRIPPED_ELEMENTS = new Set(["script", "style", "form", "iframe", "object", "embed", "svg"]);
+const HTML_BLOCK_ELEMENTS = new Set([
+  "address", "article", "aside", "blockquote", "br", "dd", "div", "dl", "dt", "figcaption", "figure",
+  "footer", "h1", "h2", "h3", "h4", "h5", "h6", "header", "hr", "li", "main", "nav", "ol", "p",
+  "pre", "section", "table", "tbody", "td", "tfoot", "th", "thead", "tr", "ul",
+]);
 
 export type EvidenceExtractionOptions = {
   maxPages?: number;
@@ -19,6 +26,11 @@ export type EvidenceExtractionOptions = {
   abortSignal?: AbortSignal;
   /** Server-only test seam for interruptible PDF.js operations. */
   pdfLoader?: EvidencePdfLoader;
+};
+
+export type HtmlEvidenceExtractionOptions = {
+  maxPages?: number;
+  maxOutputBytes?: number;
 };
 
 export type EvidencePdfTextContent = { items: Array<{ str?: string }> };
@@ -143,6 +155,115 @@ function strictText(bytes: Uint8Array): string {
   } catch {
     throw new Error("텍스트 파일은 UTF-8이어야 합니다.");
   }
+}
+
+function htmlTagEnd(html: string, start: number): number {
+  let quote = "";
+  for (let index = start + 1; index < html.length; index += 1) {
+    const character = html[index]!;
+    if (quote !== "") {
+      if (character === quote) quote = "";
+      continue;
+    }
+    if (character === "\"" || character === "'") quote = character;
+    else if (character === ">") return index;
+  }
+  return -1;
+}
+
+function decodeHtmlEntity(entity: string): string {
+  const named: Record<string, string> = {
+    amp: "&", apos: "'", copy: "©", emsp: " ", ensp: " ", gt: ">", hellip: "…", lt: "<",
+    mdash: "—", nbsp: " ", ndash: "–", quot: "\"", reg: "®",
+  };
+  if (entity[0] !== "#") return named[entity.toLowerCase()] ?? `&${entity};`;
+  const hexadecimal = entity[1]?.toLowerCase() === "x";
+  const digits = entity.slice(hexadecimal ? 2 : 1);
+  if (!(hexadecimal ? /^[0-9a-f]+$/i : /^\d+$/).test(digits)) return `&${entity};`;
+  const codePoint = Number.parseInt(digits, hexadecimal ? 16 : 10);
+  if (codePoint <= 0 || codePoint > 0x10ffff || (codePoint >= 0xd800 && codePoint <= 0xdfff)) return "�";
+  return String.fromCodePoint(codePoint);
+}
+
+/** Converts untrusted HTML to plain text without creating a DOM or retaining active content. */
+function inertHtmlText(html: string): string {
+  const output: string[] = [];
+  const strippedStack: string[] = [];
+  let cursor = 0;
+  while (cursor < html.length) {
+    if (html[cursor] !== "<") {
+      const nextTag = html.indexOf("<", cursor);
+      const end = nextTag === -1 ? html.length : nextTag;
+      if (strippedStack.length === 0) output.push(html.slice(cursor, end));
+      cursor = end;
+      continue;
+    }
+    if (html.startsWith("<!--", cursor)) {
+      const commentEnd = html.indexOf("-->", cursor + 4);
+      cursor = commentEnd === -1 ? html.length : commentEnd + 3;
+      continue;
+    }
+    const end = htmlTagEnd(html, cursor);
+    if (end === -1) break;
+    const token = html.slice(cursor + 1, end);
+    const match = /^\s*(\/?)\s*([a-z][a-z0-9:-]*)/i.exec(token);
+    if (!match) {
+      if (strippedStack.length === 0) output.push("<");
+      cursor += 1;
+      continue;
+    }
+    const closing = match[1] === "/";
+    const name = match[2]!.toLowerCase();
+    const selfClosing = /\/\s*$/.test(token) || ["br", "embed", "hr", "img", "input", "meta", "link"].includes(name);
+    if (HTML_STRIPPED_ELEMENTS.has(name)) {
+      if (closing) {
+        if (strippedStack.at(-1) === name) strippedStack.pop();
+      } else if (!selfClosing) {
+        strippedStack.push(name);
+      }
+    } else if (strippedStack.length === 0 && HTML_BLOCK_ELEMENTS.has(name)) {
+      output.push("\n");
+    }
+    cursor = end + 1;
+  }
+  return output.join("")
+    .replace(/&(#(?:x[0-9a-f]+|\d+)|[a-z][a-z0-9]+);/gi, (_match, entity: string) => decodeHtmlEntity(entity))
+    .replace(/[\s\u00a0]+/gu, " ")
+    .trim();
+}
+
+/** Extracts bounded section locators from an inert, whitespace-normalized HTML snapshot. */
+export function extractHtmlTextSections(
+  html: string,
+  options: HtmlEvidenceExtractionOptions = {},
+): { text: string; pages: ExtractedPage[] } {
+  const maxPages = Math.min(options.maxPages ?? 64, 64);
+  const maxOutputBytes = Math.min(options.maxOutputBytes ?? 2 * 1024 * 1024, 2 * 1024 * 1024);
+  const text = inertHtmlText(html);
+  const encoder = new TextEncoder();
+  if (encoder.encode(text).byteLength > maxOutputBytes) throw new Error("추출 텍스트 크기 제한을 초과했습니다.");
+  if (text === "") return { text, pages: [] };
+
+  const sections: string[] = [];
+  let section = "";
+  let sectionBytes = 0;
+  for (const character of text) {
+    const characterBytes = encoder.encode(character).byteLength;
+    if (sectionBytes + characterBytes > HTML_SECTION_BYTES && section !== "") {
+      sections.push(section.trim());
+      section = "";
+      sectionBytes = 0;
+      if (sections.length >= maxPages) throw new Error("웹 문서 섹션 제한을 초과했습니다.");
+    }
+    section += character;
+    sectionBytes += characterBytes;
+  }
+  if (section.trim() !== "") sections.push(section.trim());
+  if (sections.length > maxPages) throw new Error("웹 문서 섹션 제한을 초과했습니다.");
+  return {
+    text,
+    pages: sections.map((value, index) => ({ locator: `section:${index + 1}`, text: value })),
+  };
 }
 
 function extractTextParagraphs(bytes: Uint8Array, budget: ExtractionBudget): ExtractedPage[] {

@@ -362,6 +362,12 @@ type SourceRow = {
   extractedTextKey: string | null;
   extractionStatus: "pending" | "completed" | "failed";
   extractionError: string | null;
+  origin?: "uploaded" | "external_web";
+  canonicalUrl?: string;
+  publisher?: string;
+  publishedAt?: string;
+  retrievedAt?: number;
+  searchCandidateId?: string;
 };
 
 class FakeR2 {
@@ -431,8 +437,10 @@ class FakeD1 {
     return new FakeD1Statement(sql, this);
   }
 
-  async findExisting(bundleId: string, contentHash: string): Promise<SourceRow | null> {
-    return this.rows.find((row) => row.bundleId === bundleId && row.contentHash === contentHash) ?? null;
+  async findExisting(bundleId: string, contentHash: string, canonicalUrl?: string): Promise<SourceRow | null> {
+    return this.rows.find((row) => row.bundleId === bundleId && (
+      row.contentHash === contentHash || (canonicalUrl !== undefined && row.canonicalUrl === canonicalUrl)
+    )) ?? null;
   }
 
   async register(source: SourceRow): Promise<SourceRow> {
@@ -472,6 +480,140 @@ test("persists one opaque original and extracted pair, then reuses a duplicate s
   await store.deleteFilePair(first.storageKey, first.extractedTextKey);
   assert.equal(await store.getFile(first.storageKey), null);
   assert.equal(await store.getFile(first.extractedTextKey ?? "missing"), null);
+});
+
+test("normalizes and forwards external source metadata while keeping both R2 keys opaque", async () => {
+  const bucket = new FakeR2();
+  const database = new FakeD1();
+  const source = await new EvidenceFileStore({ bucket, registration: database }).putValidatedFile({
+    bundleId: "bundle-external",
+    name: "public-guidance.txt",
+    type: "text/plain",
+    bytes: new TextEncoder().encode("Use the wide lane."),
+    externalMetadata: {
+      origin: "external_web",
+      canonicalUrl: "https://FIFA.com/guidance/?z=2&a=1#section",
+      publisher: "FIFA",
+      publishedAt: "2026-08-20",
+      retrievedAt: 1_777_000_000_000,
+      searchCandidateId: "candidate-1",
+    },
+  });
+
+  assert.equal(source.origin, "external_web");
+  assert.equal(source.canonicalUrl, "https://fifa.com/guidance/?a=1&z=2");
+  assert.equal(source.publisher, "FIFA");
+  assert.equal(source.publishedAt, "2026-08-20");
+  assert.equal(source.retrievedAt, 1_777_000_000_000);
+  assert.equal(source.searchCandidateId, "candidate-1");
+  assert.equal(database.rows.length, 1);
+  for (const key of bucket.putKeys) {
+    assert.equal(key.includes("fifa.com"), false);
+    assert.equal(key.includes("public-guidance"), false);
+  }
+});
+
+test("returns an existing external source for either canonical URL or content hash without new R2 writes", async () => {
+  const bucket = new FakeR2();
+  const database = new FakeD1();
+  const store = new EvidenceFileStore({ bucket, registration: database });
+  const metadata = {
+    origin: "external_web" as const,
+    canonicalUrl: "https://fifa.com/guidance/width",
+    publisher: "FIFA",
+    publishedAt: "2026-08-20",
+    retrievedAt: 1_777_000_000_000,
+    searchCandidateId: "candidate-1",
+  };
+  const first = await store.putValidatedFile({
+    bundleId: "bundle-external",
+    name: "width.txt",
+    type: "text/plain",
+    bytes: new TextEncoder().encode("first body"),
+    externalMetadata: metadata,
+  });
+  const writesAfterFirst = bucket.putKeys.length;
+  const sameUrl = await store.putValidatedFile({
+    bundleId: "bundle-external",
+    name: "changed.txt",
+    type: "text/plain",
+    bytes: new TextEncoder().encode("changed body"),
+    externalMetadata: { ...metadata, searchCandidateId: "candidate-2" },
+  });
+  const sameHash = await store.putValidatedFile({
+    bundleId: "bundle-external",
+    name: "mirror.txt",
+    type: "text/plain",
+    bytes: new TextEncoder().encode("first body"),
+    externalMetadata: { ...metadata, canonicalUrl: "https://fifa.com/guidance/mirror", searchCandidateId: "candidate-3" },
+  });
+
+  assert.equal(sameUrl.id, first.id);
+  assert.equal(sameHash.id, first.id);
+  assert.equal(bucket.putKeys.length, writesAfterFirst);
+  assert.equal(database.rows.length, 1);
+});
+
+test("rejects invalid external metadata before any R2 or D1 write", async () => {
+  for (const externalMetadata of [
+    { origin: "external_web", canonicalUrl: "http://fifa.com/a", publisher: "FIFA", publishedAt: "2026-08-20", retrievedAt: 1, searchCandidateId: "candidate-1" },
+    { origin: "external_web", canonicalUrl: "https://fifa.com/a", publisher: "", publishedAt: "2026-08-20", retrievedAt: 1, searchCandidateId: "candidate-1" },
+    { origin: "external_web", canonicalUrl: "https://fifa.com/a", publisher: "FIFA", publishedAt: "not-a-date", retrievedAt: 1, searchCandidateId: "candidate-1" },
+  ]) {
+    const bucket = new FakeR2();
+    const database = new FakeD1();
+    await assert.rejects(() => new EvidenceFileStore({ bucket, registration: database }).putValidatedFile({
+      bundleId: "bundle-external",
+      name: "width.txt",
+      type: "text/plain",
+      bytes: new TextEncoder().encode("body"),
+      externalMetadata: externalMetadata as never,
+    }));
+    assert.equal(bucket.putKeys.length, 0);
+    assert.equal(database.rows.length, 0);
+  }
+});
+
+test("deletes a canonical-URL race loser and returns the registered winner", async () => {
+  const bucket = new FakeR2();
+  const database = new FakeD1();
+  const winner: SourceRow = {
+    id: "winner-by-url",
+    bundleId: "bundle-external",
+    originalFileName: "winner.txt",
+    mediaType: "text/plain",
+    byteSize: 6,
+    contentHash: "different-hash",
+    storageKey: "bundles/bundle-external/winner/original",
+    extractedTextKey: "bundles/bundle-external/winner/extracted",
+    extractionStatus: "completed",
+    extractionError: null,
+    origin: "external_web",
+    canonicalUrl: "https://fifa.com/guidance/width",
+    publisher: "FIFA",
+    publishedAt: "2026-08-20",
+    retrievedAt: 1_777_000_000_000,
+    searchCandidateId: "winner-candidate",
+  };
+  database.nextUniqueConflict = winner;
+
+  const source = await new EvidenceFileStore({ bucket, registration: database }).putValidatedFile({
+    bundleId: "bundle-external",
+    name: "loser.txt",
+    type: "text/plain",
+    bytes: new TextEncoder().encode("loser body"),
+    externalMetadata: {
+      origin: "external_web",
+      canonicalUrl: winner.canonicalUrl!,
+      publisher: "FIFA",
+      publishedAt: "2026-08-20",
+      retrievedAt: 1_777_000_000_001,
+      searchCandidateId: "loser-candidate",
+    },
+  });
+
+  assert.equal(source.id, winner.id);
+  assert.equal(bucket.objects.size, 0);
 });
 
 test("reconciles both R2 keys after a one-sided pair deletion failure", async () => {
