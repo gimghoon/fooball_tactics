@@ -73,6 +73,23 @@ function seed0009EvidenceHistory(persistTo) {
     VALUES ('upgrade-citation', 'upgrade-bundle', 'upgrade-card', 'upgrade-chunk', 1);
     INSERT INTO tactic_card_reviews (id, card_id, actor_user_id, status, version_kind, producer_job_id, producer_model, content_json, citation_snapshot_json, bundle_version, created_at)
     VALUES ('upgrade-review', 'upgrade-card', 'operator-1', 'owner_reviewed', 'status_change', NULL, NULL, '{"cardId":"upgrade-card"}', '[{"chunkId":"upgrade-chunk"}]', 'v1', 1);
+    INSERT INTO scenarios (id, campaign_id, role, principle, prompt, hint, explanation, pitch_json, answer_json, review_status, order_index, content_json)
+    VALUES ('upgrade-scenario', 'diamond-121-intro', 'fixo', '보존', '기존 시나리오', '힌트', '설명', '{}', '{}', 'pending', 99, '{}');
+    INSERT INTO scenario_evidence_sources (scenario_id, source_id)
+    VALUES ('upgrade-scenario', 'upgrade-source');
+    INSERT INTO scenario_evidence_chunks (scenario_id, chunk_id)
+    VALUES ('upgrade-scenario', 'upgrade-chunk');
+    INSERT INTO scenario_tactic_card_reviews (scenario_id, card_id, card_review_id, created_at)
+    VALUES ('upgrade-scenario', 'upgrade-card', 'upgrade-review', 1);
+  `);
+}
+
+function seed0010SearchCandidate(persistTo) {
+  query(persistTo, `
+    INSERT INTO evidence_search_runs (id, bundle_id, input_version, bundle_version, status, search_model, prompt_version, query_json, is_stale, created_at, updated_at)
+    VALUES ('upgrade-search-run', 'upgrade-bundle', 'v1', 1, 'ready', 'search-model', 'search-prompt-v1', '[]', false, 1, 1);
+    INSERT INTO evidence_search_candidates (id, run_id, bundle_id, url, canonical_url, title, publisher, published_at, document_type, quote, relevance, trust_tier, rank, status, created_at, updated_at)
+    VALUES ('upgrade-search-candidate', 'upgrade-search-run', 'upgrade-bundle', 'https://official.example/legacy', 'https://official.example/legacy', '기존 검색 후보', '공식 기관', '2026-08-01', 'web_page', '기존 인용문', '기존 근거와 관련됨', 1, 1, 'candidate', 1, 1);
   `);
 }
 
@@ -121,7 +138,9 @@ test("0009 upgrade preserves uploaded evidence, card citation, and review histor
 
   applyMigrations(persistTo, "0009_smiling_synch.sql");
   seed0009EvidenceHistory(persistTo);
-  applyMigrations(persistTo, "0013_quick_layla_miller.sql", "0010_external_evidence_search.sql");
+  applyMigrations(persistTo, "0010_external_evidence_search.sql", "0010_external_evidence_search.sql");
+  seed0010SearchCandidate(persistTo);
+  applyMigrations(persistTo, "0013_quick_layla_miller.sql", "0011_evidence_r2_cleanup_receipts.sql");
 
   const result = query(persistTo, `
     SELECT id, bundle_id FROM evidence_sources WHERE id='upgrade-source';
@@ -129,8 +148,20 @@ test("0009 upgrade preserves uploaded evidence, card citation, and review histor
     SELECT id, job_id, current_content_json FROM tactic_cards WHERE id='upgrade-card';
     SELECT id, card_id, chunk_id FROM tactic_card_citations WHERE id='upgrade-citation';
     SELECT id, card_id, citation_snapshot_json FROM tactic_card_reviews WHERE id='upgrade-review';
+    SELECT id, campaign_id FROM scenarios WHERE id='upgrade-scenario';
+    SELECT scenario_id, source_id FROM scenario_evidence_sources WHERE scenario_id='upgrade-scenario';
+    SELECT scenario_id, chunk_id FROM scenario_evidence_chunks WHERE scenario_id='upgrade-scenario';
+    SELECT scenario_id, card_id, card_review_id FROM scenario_tactic_card_reviews WHERE scenario_id='upgrade-scenario';
+    SELECT id, bundle_id, input_version FROM evidence_search_runs WHERE id='upgrade-search-run';
+    SELECT id, run_id, bundle_id, canonical_url FROM evidence_search_candidates WHERE id='upgrade-search-candidate';
     SELECT name FROM sqlite_master WHERE type='table'
       AND name IN ('evidence_search_runs', 'evidence_search_candidates') ORDER BY name;
+    SELECT name FROM pragma_table_info('evidence_search_runs')
+      WHERE name IN ('lease_token', 'lease_expires_at') ORDER BY name;
+    SELECT name FROM pragma_table_info('evidence_search_candidates')
+      WHERE name IN ('lease_token', 'lease_expires_at') ORDER BY name;
+    SELECT name FROM sqlite_master WHERE type='index'
+      AND name IN ('idx_evidence_search_runs_recovery', 'idx_search_candidate_run_recovery') ORDER BY name;
     PRAGMA foreign_key_check;
   `);
 
@@ -151,9 +182,34 @@ test("0009 upgrade preserves uploaded evidence, card citation, and review histor
     card_id: "upgrade-card",
     citation_snapshot_json: '[{"chunkId":"upgrade-chunk"}]',
   }]);
-  assert.deepEqual(result[5].results, [
+  assert.deepEqual(result[5].results, [{ id: "upgrade-scenario", campaign_id: "diamond-121-intro" }]);
+  assert.deepEqual(result[6].results, [{ scenario_id: "upgrade-scenario", source_id: "upgrade-source" }]);
+  assert.deepEqual(result[7].results, [{ scenario_id: "upgrade-scenario", chunk_id: "upgrade-chunk" }]);
+  assert.deepEqual(result[8].results, [{
+    scenario_id: "upgrade-scenario",
+    card_id: "upgrade-card",
+    card_review_id: "upgrade-review",
+  }]);
+  assert.deepEqual(result[9].results, [{
+    id: "upgrade-search-run",
+    bundle_id: "upgrade-bundle",
+    input_version: "v1",
+  }]);
+  assert.deepEqual(result[10].results, [{
+    id: "upgrade-search-candidate",
+    run_id: "upgrade-search-run",
+    bundle_id: "upgrade-bundle",
+    canonical_url: "https://official.example/legacy",
+  }]);
+  assert.deepEqual(result[11].results, [
     { name: "evidence_search_candidates" },
     { name: "evidence_search_runs" },
   ]);
-  assert.deepEqual(result[6].results, []);
+  assert.deepEqual(result[12].results, [{ name: "lease_expires_at" }, { name: "lease_token" }]);
+  assert.deepEqual(result[13].results, [{ name: "lease_expires_at" }, { name: "lease_token" }]);
+  assert.deepEqual(result[14].results, [
+    { name: "idx_evidence_search_runs_recovery" },
+    { name: "idx_search_candidate_run_recovery" },
+  ]);
+  assert.deepEqual(result[15].results, []);
 });
