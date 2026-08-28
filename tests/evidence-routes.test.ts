@@ -22,6 +22,11 @@ import {
   handleEvidenceFileUpload,
   handleEvidenceJobRetry,
   handleEvidenceJobStatus,
+  handleEvidenceSearchGet,
+  handleEvidenceSearchImport,
+  handleEvidenceSearchLatest,
+  handleEvidenceSearchSelection,
+  handleEvidenceSearchStart,
   handleEvidenceScenarioDraft,
   runEvidenceAdminRoute,
   type EvidenceRouteRuntime,
@@ -124,6 +129,13 @@ function runtime(overrides: Partial<EvidenceRouteRuntime> = {}): EvidenceRouteRu
       getAnalysisStatus: async (id) => id === "missing" ? null : jobRecord(),
       getLatestAnalysisStatusForBundle: async () => jobRecord(),
     },
+    searchJobs: {
+      startSearch: async () => searchRunRecord(),
+      getLatestSearch: async () => searchDetail(),
+      getSearch: async (_bundleId, runId) => runId === "missing" ? null : searchDetail(),
+      saveSelection: async () => searchDetail(),
+      startImport: async () => ({ ...searchRunRecord(), status: "importing" as const }),
+    },
     ...overrides,
   };
 }
@@ -136,6 +148,35 @@ function jobRecord() {
     errorMessage: null, startedAt: null, completedAt: null, attemptCount: 0,
     extractedEvidenceJson: "{\"extractedText\":\"secret\"}", generatedCardsJson: "{\"llm\":\"secret\"}",
     isStale: false, createdAt: 1, updatedAt: 2,
+  };
+}
+
+function searchRunRecord(status: "queued" | "searching" | "ready" | "importing" | "completed" | "failed" = "queued") {
+  return {
+    id: "search-1", bundleId: bundle.id, inputVersion: "secret-input-version",
+    bundleVersion: bundle.version, status, searchModel: "secret-search-model",
+    promptVersion: "secret-search-prompt", queries: ["secret generated query"],
+    errorMessage: status === "failed" ? "socket error sk-test" : null,
+    isStale: false, startedAt: 3, completedAt: null, createdAt: 2, updatedAt: 3,
+    queryJson: "[\"secret generated query\"]", rawProviderBody: "sk-test provider body",
+    leaseToken: "search-lease-token",
+  };
+}
+
+function searchDetail() {
+  return {
+    run: searchRunRecord("ready"),
+    candidates: [{
+      id: "candidate-1", runId: "search-1", bundleId: bundle.id,
+      url: "https://uefa.example/private-original", canonicalUrl: "https://uefa.example/pressing",
+      title: "Pressing", publisher: "UEFA", publishedAt: "2026-01-02", retrievedAt: 4,
+      documentType: "web_page" as const, quote: "Press together", relevance: "압박 원칙",
+      trustTier: 1 as const, rank: 1, status: "candidate" as const,
+      selectedBy: "selector-user-secret", selectedAt: 5, sourceId: "source-secret",
+      contentHash: "content-hash-secret", failureReason: "socket error sk-test",
+      storageKey: "bundles/private/imported-key", leaseToken: "candidate-lease-token",
+      createdAt: 3, updatedAt: 4,
+    }],
   };
 }
 
@@ -213,6 +254,11 @@ test("every evidence endpoint authorizes before parsing or creating runtime reso
     () => handleEvidenceAnalyzeStart(context({ bundleId: "missing" }), runtime()),
     () => handleEvidenceJobStatus(new Request("http://test/"), context({ jobId: "missing" }), runtime()),
     () => handleEvidenceJobRetry(context({ jobId: "missing" }), runtime()),
+    () => handleEvidenceSearchStart(context({ bundleId: "missing" }), runtime()),
+    () => handleEvidenceSearchLatest(context({ bundleId: "missing" }), runtime()),
+    () => handleEvidenceSearchGet(context({ bundleId: "missing", runId: "missing" }), runtime()),
+    () => handleEvidenceSearchSelection(request, context({ bundleId: "missing", runId: "missing" }), runtime()),
+    () => handleEvidenceSearchImport(context({ bundleId: "missing", runId: "missing" }), runtime()),
     () => handleEvidenceCardReview(request, context({ cardId: "missing" }), runtime()),
     () => handleEvidenceScenarioDraft(request, context({ cardId: "missing" }), runtime()),
   ];
@@ -936,6 +982,120 @@ test("unavailable analysis configuration is 503 without leaking provider details
   const serialized = JSON.stringify(await body(response));
   assert.equal(serialized.includes("provider-secret"), false);
   assert.equal(serialized.includes("EVIDENCE_LLM_API_KEY"), false);
+});
+
+test("search routes expose safe scoped workflow responses with accepted start semantics", async () => {
+  const started = await handleEvidenceSearchStart(context({ bundleId: bundle.id }), runtime());
+  assert.equal(started.status, 202);
+  assert.deepEqual(await body(started), {
+    search: {
+      id: "search-1", bundleId: bundle.id, bundleVersion: bundle.version,
+      status: "queued", errorMessage: null, isStale: false,
+      startedAt: 3, completedAt: null, createdAt: 2, updatedAt: 3,
+    },
+  });
+
+  const deduplicated = await handleEvidenceSearchStart(context({ bundleId: bundle.id }), runtime({
+    searchJobs: { ...runtime().searchJobs, startSearch: async () => searchRunRecord("ready") },
+  }));
+  assert.equal(deduplicated.status, 200);
+
+  const latest = await handleEvidenceSearchLatest(context({ bundleId: bundle.id }), runtime());
+  const detail = await handleEvidenceSearchGet(context({ bundleId: bundle.id, runId: "search-1" }), runtime());
+  const selected = await handleEvidenceSearchSelection(
+    jsonRequest("/", { expectedBundleVersion: 2, selectedIds: ["candidate-1"], excludedIds: [] }, "PATCH"),
+    context({ bundleId: bundle.id, runId: "search-1" }),
+    runtime(),
+  );
+  const imported = await handleEvidenceSearchImport(
+    context({ bundleId: bundle.id, runId: "search-1" }),
+    runtime(),
+  );
+  assert.equal(latest.status, 200);
+  assert.equal(detail.status, 200);
+  assert.equal(selected.status, 200);
+  assert.equal(imported.status, 202);
+
+  for (const response of [started, deduplicated, latest, detail, selected, imported]) {
+    assert.equal(response.headers.get("cache-control"), "private, no-store");
+    assert.equal(response.headers.has("access-control-allow-origin"), false);
+  }
+});
+
+test("safe search responses omit prompts, provider bodies, selectors, storage keys, and internal failures", async () => {
+  const response = await handleEvidenceSearchGet(
+    context({ bundleId: bundle.id, runId: "search-1" }),
+    runtime(),
+  );
+  const value = await body(response) as {
+    search: { candidates: Array<Record<string, unknown>> };
+  };
+  assert.deepEqual(value.search.candidates[0], {
+    id: "candidate-1",
+    title: "Pressing",
+    publisher: "UEFA",
+    publishedAt: "2026-01-02",
+    canonicalUrl: "https://uefa.example/pressing",
+    documentType: "web_page",
+    quote: "Press together",
+    relevance: "압박 원칙",
+    trustTier: 1,
+    rank: 1,
+    status: "candidate",
+    failureReason: "외부 문서를 가져오지 못했습니다.",
+  });
+  const json = JSON.stringify(value);
+  for (const secret of [
+    "queryJson", "queries", "secret generated query", "rawProviderBody", "provider body",
+    "searchModel", "promptVersion", "secret-search-model", "secret-search-prompt",
+    "selectedBy", "selector-user-secret", "sourceId", "source-secret", "storageKey",
+    "bundles/private", "contentHash", "content-hash-secret", "leaseToken",
+    "socket error", "sk-test",
+  ]) assert.doesNotMatch(json, new RegExp(secret));
+});
+
+test("search selection maps malformed, stale, oversized, missing, and unavailable cases", async () => {
+  const malformed = await handleEvidenceSearchSelection(
+    jsonRequest("/", "{broken", "PATCH"),
+    context({ bundleId: bundle.id, runId: "search-1" }),
+    runtime(),
+  );
+  assert.equal(malformed.status, 400);
+
+  const stale = await handleEvidenceSearchSelection(
+    jsonRequest("/", { expectedBundleVersion: 1, selectedIds: ["stale"], excludedIds: [] }, "PATCH"),
+    context({ bundleId: bundle.id, runId: "search-1" }),
+    runtime({
+      searchJobs: { ...runtime().searchJobs, saveSelection: async () => { throw new EvidenceConflictError("SECRET_STALE"); } },
+    }),
+  );
+  assert.equal(stale.status, 409);
+
+  const sixIds = Array.from({ length: 6 }, (_, index) => `candidate-${index}`);
+  const oversized = await handleEvidenceSearchSelection(
+    jsonRequest("/", { expectedBundleVersion: 2, selectedIds: sixIds, excludedIds: [] }, "PATCH"),
+    context({ bundleId: bundle.id, runId: "search-1" }),
+    runtime({
+      searchJobs: { ...runtime().searchJobs, saveSelection: async () => { throw new EvidenceRequestValidationError(); } },
+    }),
+  );
+  assert.equal(oversized.status, 400);
+
+  const missing = await handleEvidenceSearchGet(
+    context({ bundleId: bundle.id, runId: "missing" }),
+    runtime(),
+  );
+  assert.equal(missing.status, 404);
+
+  const unavailable = await handleEvidenceSearchStart(context({ bundleId: bundle.id }), runtime({
+    searchJobs: { ...runtime().searchJobs, startSearch: async () => { throw new EvidenceUnavailableError("EVIDENCE_SEARCH_MODEL sk-test"); } },
+  }));
+  assert.equal(unavailable.status, 503);
+
+  for (const response of [stale, oversized, missing, unavailable]) {
+    const json = JSON.stringify(await body(response));
+    assert.doesNotMatch(json, /SECRET_STALE|EVIDENCE_SEARCH_MODEL|sk-test/);
+  }
 });
 
 test("card review and scenario conversion map stale conflicts and omit immutable internal snapshots", async () => {
