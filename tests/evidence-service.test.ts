@@ -58,6 +58,7 @@ class SQLiteD1Statement implements EvidenceD1Statement {
 class SQLiteD1Database implements EvidenceD1Database {
   readonly database = new DatabaseSync(":memory:");
   beforeNextBatch: (() => void | Promise<void>) | null = null;
+  afterNextBatchCommit: (() => void | Promise<void>) | null = null;
 
   constructor() {
     this.database.exec("PRAGMA foreign_keys = ON");
@@ -81,6 +82,9 @@ class SQLiteD1Database implements EvidenceD1Database {
         return statement.execute();
       });
       this.database.exec("COMMIT");
+      const afterCommit = this.afterNextBatchCommit;
+      this.afterNextBatchCommit = null;
+      await afterCommit?.();
       return results;
     } catch (error) {
       this.database.exec("ROLLBACK");
@@ -105,10 +109,19 @@ class SQLiteD1Database implements EvidenceD1Database {
 
 class MemoryR2Bucket implements EvidenceR2Bucket {
   readonly objects = new Map<string, Uint8Array | string>();
+  readonly putKeys: string[] = [];
   afterObjectsDeleted: (() => void | Promise<void>) | null = null;
+  afterPutCount: { count: number; callback: () => void | Promise<void> } | null = null;
+  failDelete: ((key: string) => boolean) | null = null;
 
   async put(key: string, value: Uint8Array | string): Promise<void> {
+    this.putKeys.push(key);
     this.objects.set(key, value instanceof Uint8Array ? value.slice() : value);
+    if (this.afterPutCount !== null && this.putKeys.length === this.afterPutCount.count) {
+      const callback = this.afterPutCount.callback;
+      this.afterPutCount = null;
+      await callback();
+    }
   }
 
   async get(key: string): Promise<Uint8Array | string | null> {
@@ -118,6 +131,7 @@ class MemoryR2Bucket implements EvidenceR2Bucket {
   }
 
   async delete(key: string): Promise<void> {
+    if (this.failDelete?.(key)) throw new Error(`permanent delete failure for ${key}`);
     this.objects.delete(key);
     if (this.objects.size === 0 && this.afterObjectsDeleted !== null) {
       const afterObjectsDeleted = this.afterObjectsDeleted;
@@ -233,6 +247,154 @@ test("production source upload atomically inserts, versions, invalidates approve
     context.database.all<{ action: string }>("SELECT action FROM evidence_audit_events ORDER BY created_at").map((row) => row.action),
     ["bundle.created", "source.added"],
   );
+});
+
+test("production external registration persists every metadata field and deduplicates by URL or hash", async () => {
+  const context = createContext();
+  const bundle = await context.service.createBundle(bundleInput, admin);
+  const metadata = {
+    origin: "external_web" as const,
+    canonicalUrl: "https://fifa.com/guidance/width?a=1&z=2",
+    publisher: "FIFA",
+    publishedAt: "2026-08-20",
+    retrievedAt: 1_777_000_000_000,
+    searchCandidateId: "candidate-1",
+  };
+  const bytes = new TextEncoder().encode("Use the wide lane.");
+
+  const source = await context.fileStore.putValidatedFile({
+    bundleId: bundle.id,
+    name: "ignored-user-name.txt",
+    type: "text/plain",
+    bytes,
+    externalMetadata: metadata,
+  });
+  const row = context.database.first<Record<string, unknown>>(
+    `SELECT origin,canonical_url AS canonicalUrl,publisher,published_at AS publishedAt,
+      retrieved_at AS retrievedAt,search_candidate_id AS searchCandidateId,external_text_hash AS externalTextHash
+      FROM evidence_sources WHERE id=?`,
+    source.id,
+  );
+  assert.deepEqual({ ...row }, {
+    origin: "external_web",
+    canonicalUrl: metadata.canonicalUrl,
+    publisher: metadata.publisher,
+    publishedAt: metadata.publishedAt,
+    retrievedAt: metadata.retrievedAt,
+    searchCandidateId: metadata.searchCandidateId,
+    externalTextHash: source.externalTextHash,
+  });
+  assert.match(String(row.externalTextHash), /^[a-f0-9]{64}$/);
+  assert.deepEqual({ ...await context.repository.findSource(source.id) }, source);
+
+  const objectCount = context.bucket.objects.size;
+  const sameUrl = await context.fileStore.putValidatedFile({
+    bundleId: bundle.id,
+    name: "changed.txt",
+    type: "text/plain",
+    bytes: new TextEncoder().encode("Changed upstream body."),
+    externalMetadata: { ...metadata, searchCandidateId: "candidate-2" },
+  });
+  const sameHash = await context.fileStore.putValidatedFile({
+    bundleId: bundle.id,
+    name: "mirror.txt",
+    type: "text/plain",
+    bytes,
+    externalMetadata: { ...metadata, canonicalUrl: "https://fifa.com/guidance/mirror", searchCandidateId: "candidate-3" },
+  });
+
+  assert.equal(sameUrl.id, source.id);
+  assert.equal(sameHash.id, source.id);
+  assert.equal(context.bucket.objects.size, objectCount);
+  assert.equal(context.database.first<{ count: number }>("SELECT count(*) AS count FROM evidence_sources").count, 1);
+});
+
+test("production registration retains committed R2 objects when D1 commits and the transport then throws", async () => {
+  const context = createContext();
+  const bundle = await context.service.createBundle(bundleInput, admin);
+  context.database.afterNextBatchCommit = () => { throw new Error("simulated post-commit transport failure"); };
+
+  const source = await uploadText(context, bundle.id);
+
+  assert.equal((await context.repository.findSource(source.id))?.id, source.id);
+  assert.equal(context.bucket.objects.has(source.storageKey), true);
+  assert.equal(source.extractedTextKey === null ? false : context.bucket.objects.has(source.extractedTextKey), true);
+  assert.equal(context.database.first<{ count: number }>("SELECT count(*) AS count FROM evidence_r2_cleanup_receipts").count, 0);
+});
+
+test("production repository durably tracks pending and completed unowned R2 cleanup", async () => {
+  const context = createContext();
+  const bundle = await context.service.createBundle(bundleInput, admin);
+  await context.repository.createR2CleanupReceipt({
+    id: "cleanup-1",
+    bundleId: bundle.id,
+    sourceId: "unowned-source",
+    storageKey: "unowned-original",
+    extractedTextKey: "unowned-extracted",
+    createdAt: 2_000,
+  });
+  assert.deepEqual({ ...context.database.first("SELECT status,error_message AS errorMessage FROM evidence_r2_cleanup_receipts WHERE id='cleanup-1'") }, {
+    status: "pending",
+    errorMessage: null,
+  });
+
+  await context.repository.finishR2CleanupReceipt("cleanup-1", "delete failure", 2_001);
+  assert.deepEqual({ ...context.database.first("SELECT status,error_message AS errorMessage,updated_at AS updatedAt FROM evidence_r2_cleanup_receipts WHERE id='cleanup-1'") }, {
+    status: "pending",
+    errorMessage: "delete failure",
+    updatedAt: 2_001,
+  });
+
+  await context.repository.finishR2CleanupReceipt("cleanup-1", null, 2_002);
+  assert.deepEqual({ ...context.database.first("SELECT status,error_message AS errorMessage,updated_at AS updatedAt FROM evidence_r2_cleanup_receipts WHERE id='cleanup-1'") }, {
+    status: "completed",
+    errorMessage: null,
+    updatedAt: 2_002,
+  });
+});
+
+test("production URL-race cleanup never restores a deleted loser object and leaves a pending receipt on failure", async () => {
+  const context = createContext();
+  const bundle = await context.service.createBundle(bundleInput, admin);
+  const canonicalUrl = "https://fifa.com/guidance/race";
+  context.bucket.afterPutCount = {
+    count: 2,
+    callback: () => context.database.run(
+      `INSERT INTO evidence_sources
+        (id,bundle_id,origin,original_file_name,media_type,byte_size,content_hash,storage_key,canonical_url,
+          publisher,published_at,retrieved_at,search_candidate_id,external_text_hash,extracted_text_key,
+          extraction_status,extraction_error,created_at,updated_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      "winner-source", bundle.id, "external_web", "winner.txt", "text/plain", 6, "winner-hash", "winner-original",
+      canonicalUrl, "FIFA", "2026-08-20", 1_777_000_000_000, "winner-candidate", "winner-text-hash",
+      "winner-extracted", "completed", null, 2_000, 2_000,
+    ),
+  };
+  context.bucket.failDelete = (key) => key === context.bucket.putKeys[0];
+
+  await assert.rejects(() => context.fileStore.putValidatedFile({
+    bundleId: bundle.id,
+    name: "loser.txt",
+    type: "text/plain",
+    bytes: new TextEncoder().encode("loser body"),
+    externalMetadata: {
+      origin: "external_web",
+      canonicalUrl,
+      publisher: "FIFA",
+      publishedAt: "2026-08-20",
+      retrievedAt: 1_777_000_000_001,
+      searchCandidateId: "loser-candidate",
+    },
+  }), /정리/);
+
+  assert.equal(context.database.first<{ count: number }>("SELECT count(*) AS count FROM evidence_sources").count, 1);
+  assert.equal((await context.repository.findSourceByHash(bundle.id, "unmatched", canonicalUrl))?.id, "winner-source");
+  assert.equal(context.bucket.objects.has(context.bucket.putKeys[0]!), true);
+  assert.equal(context.bucket.objects.has(context.bucket.putKeys[1]!), false);
+  assert.equal(context.bucket.putKeys.length, 2, "loser cleanup must not restore the deleted extracted object");
+  assert.deepEqual({ ...context.database.first(
+    "SELECT status,error_message AS errorMessage FROM evidence_r2_cleanup_receipts",
+  ) }, { status: "pending", errorMessage: `permanent delete failure for ${context.bucket.putKeys[0]}` });
 });
 
 test("a lost bundle CAS changes none of the guarded source, work, or audit rows", async () => {

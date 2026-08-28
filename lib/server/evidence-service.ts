@@ -15,6 +15,7 @@ import {
 } from "../domain/evidence.ts";
 import type { EvidenceAdmin } from "./evidence-auth.ts";
 import type {
+  EvidenceCleanupReceiptInput,
   EvidenceFileStore,
   StoredEvidenceFile,
 } from "./evidence-storage.ts";
@@ -187,7 +188,10 @@ export type EvidenceServiceRepository = {
   findSourceByHash(
     bundleId: string,
     hash: string,
+    canonicalUrl?: string,
   ): Promise<StoredEvidenceFile | null>;
+  createR2CleanupReceipt(receipt: EvidenceCleanupReceiptInput & { id: string; createdAt: number }): Promise<void>;
+  finishR2CleanupReceipt(receiptId: string, error: string | null, updatedAt: number): Promise<void>;
   describeDeleteImpact(sourceId: string): Promise<EvidenceDeleteImpact>;
   createBundle(
     bundle: EvidenceBundleRecord,
@@ -323,7 +327,7 @@ export class D1EvidenceServiceRepository implements EvidenceServiceRepository {
     return (
       await this.db
         .prepare(
-          "SELECT id,bundle_id AS bundleId,original_file_name AS originalFileName,media_type AS mediaType,byte_size AS byteSize,content_hash AS contentHash,storage_key AS storageKey,extracted_text_key AS extractedTextKey,extraction_status AS extractionStatus,extraction_error AS extractionError FROM evidence_sources WHERE bundle_id=?",
+          "SELECT id,bundle_id AS bundleId,origin,original_file_name AS originalFileName,media_type AS mediaType,byte_size AS byteSize,content_hash AS contentHash,storage_key AS storageKey,canonical_url AS canonicalUrl,publisher,published_at AS publishedAt,retrieved_at AS retrievedAt,search_candidate_id AS searchCandidateId,external_text_hash AS externalTextHash,extracted_text_key AS extractedTextKey,extraction_status AS extractionStatus,extraction_error AS extractionError FROM evidence_sources WHERE bundle_id=?",
         )
         .bind(bundleId)
         .all<StoredEvidenceFile>()
@@ -332,7 +336,7 @@ export class D1EvidenceServiceRepository implements EvidenceServiceRepository {
   async findSource(id: string) {
     return this.db
       .prepare(
-        "SELECT id,bundle_id AS bundleId,original_file_name AS originalFileName,media_type AS mediaType,byte_size AS byteSize,content_hash AS contentHash,storage_key AS storageKey,extracted_text_key AS extractedTextKey,extraction_status AS extractionStatus,extraction_error AS extractionError FROM evidence_sources WHERE id=?",
+        "SELECT id,bundle_id AS bundleId,origin,original_file_name AS originalFileName,media_type AS mediaType,byte_size AS byteSize,content_hash AS contentHash,storage_key AS storageKey,canonical_url AS canonicalUrl,publisher,published_at AS publishedAt,retrieved_at AS retrievedAt,search_candidate_id AS searchCandidateId,external_text_hash AS externalTextHash,extracted_text_key AS extractedTextKey,extraction_status AS extractionStatus,extraction_error AS extractionError FROM evidence_sources WHERE id=?",
       )
       .bind(id)
       .first<StoredEvidenceFile>();
@@ -347,13 +351,33 @@ export class D1EvidenceServiceRepository implements EvidenceServiceRepository {
         .all<EvidenceVideoClipRecord>()
     ).results;
   }
-  async findSourceByHash(bundleId: string, hash: string) {
+  async findSourceByHash(bundleId: string, hash: string, canonicalUrl?: string) {
     return this.db
       .prepare(
-        "SELECT id,bundle_id AS bundleId,original_file_name AS originalFileName,media_type AS mediaType,byte_size AS byteSize,content_hash AS contentHash,storage_key AS storageKey,extracted_text_key AS extractedTextKey,extraction_status AS extractionStatus,extraction_error AS extractionError FROM evidence_sources WHERE bundle_id=? AND content_hash=?",
+        "SELECT id,bundle_id AS bundleId,origin,original_file_name AS originalFileName,media_type AS mediaType,byte_size AS byteSize,content_hash AS contentHash,storage_key AS storageKey,canonical_url AS canonicalUrl,publisher,published_at AS publishedAt,retrieved_at AS retrievedAt,search_candidate_id AS searchCandidateId,external_text_hash AS externalTextHash,extracted_text_key AS extractedTextKey,extraction_status AS extractionStatus,extraction_error AS extractionError FROM evidence_sources WHERE bundle_id=? AND (content_hash=? OR canonical_url=?) LIMIT 1",
       )
-      .bind(bundleId, hash)
+      .bind(bundleId, hash, canonicalUrl ?? null)
       .first<StoredEvidenceFile>();
+  }
+  async createR2CleanupReceipt(receipt: EvidenceCleanupReceiptInput & { id: string; createdAt: number }) {
+    await this.db.prepare(
+      `INSERT INTO evidence_r2_cleanup_receipts
+        (id,bundle_id,source_id,storage_key,extracted_text_key,status,error_message,created_at,updated_at)
+        VALUES (?,?,?,?,?,'pending',NULL,?,?)`,
+    ).bind(
+      receipt.id,
+      receipt.bundleId,
+      receipt.sourceId,
+      receipt.storageKey,
+      receipt.extractedTextKey,
+      receipt.createdAt,
+      receipt.createdAt,
+    ).run();
+  }
+  async finishR2CleanupReceipt(receiptId: string, error: string | null, updatedAt: number) {
+    await this.db.prepare(
+      "UPDATE evidence_r2_cleanup_receipts SET status=?,error_message=?,updated_at=? WHERE id=?",
+    ).bind(error === null ? "completed" : "pending", error, updatedAt, receiptId).run();
   }
   async describeDeleteImpact(sourceId: string) {
     const [cards, scenarios] = await Promise.all([
@@ -443,17 +467,24 @@ export class D1EvidenceServiceRepository implements EvidenceServiceRepository {
       statements.push(
         this.db
           .prepare(
-            `INSERT INTO evidence_sources (id,bundle_id,original_file_name,media_type,byte_size,content_hash,storage_key,extracted_text_key,extraction_status,extraction_error,created_at,updated_at)
-          SELECT ?,?,?,?,?,?,?,?,?,?,?,? WHERE ${guard}`,
+            `INSERT INTO evidence_sources (id,bundle_id,origin,original_file_name,media_type,byte_size,content_hash,storage_key,canonical_url,publisher,published_at,retrieved_at,search_candidate_id,external_text_hash,extracted_text_key,extraction_status,extraction_error,created_at,updated_at)
+          SELECT ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,? WHERE ${guard}`,
           )
           .bind(
             source.id,
             source.bundleId,
+            source.origin ?? "uploaded",
             source.originalFileName,
             source.mediaType,
             source.byteSize,
             source.contentHash,
             source.storageKey,
+            source.canonicalUrl ?? null,
+            source.publisher ?? null,
+            source.publishedAt ?? null,
+            source.retrievedAt ?? null,
+            source.searchCandidateId ?? null,
+            source.externalTextHash ?? null,
             source.extractedTextKey,
             source.extractionStatus,
             source.extractionError,
@@ -953,9 +984,17 @@ export class EvidenceService {
   }
   sourceRegistration(a: EvidenceAdmin) {
     return {
-      findExisting: (b: string, h: string) =>
-        this.d.repository.findSourceByHash(b, h),
+      findExisting: (b: string, h: string, canonicalUrl?: string) =>
+        this.d.repository.findSourceByHash(b, h, canonicalUrl),
+      findById: (sourceId: string) => this.d.repository.findSource(sourceId),
       register: (s: StoredEvidenceFile) => this.addSource(s, a),
+      startCleanup: async (input: EvidenceCleanupReceiptInput) => {
+        const id = this.id();
+        await this.d.repository.createR2CleanupReceipt({ ...input, id, createdAt: this.now() });
+        return id;
+      },
+      finishCleanup: (receiptId: string, error: string | null) =>
+        this.d.repository.finishR2CleanupReceipt(receiptId, error, this.now()),
     };
   }
   async addSource(s: StoredEvidenceFile, a: EvidenceAdmin) {

@@ -78,6 +78,13 @@
       "when": 1787746780175,
       "tag": "0010_external_evidence_search",
       "breakpoints": true
+    },
+    {
+      "idx": 11,
+      "version": "6",
+      "when": 1787911935144,
+      "tag": "0011_evidence_r2_cleanup_receipts",
+      "breakpoints": true
     }
   ]
 }

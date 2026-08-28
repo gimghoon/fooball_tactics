@@ -214,11 +214,12 @@ function inertHtmlText(html: string): string {
     }
     const closing = match[1] === "/";
     const name = match[2]!.toLowerCase();
-    const selfClosing = /\/\s*$/.test(token) || ["br", "embed", "hr", "img", "input", "meta", "link"].includes(name);
     if (HTML_STRIPPED_ELEMENTS.has(name)) {
       if (closing) {
         if (strippedStack.at(-1) === name) strippedStack.pop();
-      } else if (!selfClosing) {
+      } else {
+        // HTML ignores self-closing syntax on these content-bearing elements.
+        // Keep stripping until the matching end tag instead of trusting `/ >`.
         strippedStack.push(name);
       }
     } else if (strippedStack.length === 0 && HTML_BLOCK_ELEMENTS.has(name)) {

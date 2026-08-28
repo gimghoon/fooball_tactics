@@ -368,6 +368,17 @@ type SourceRow = {
   publishedAt?: string;
   retrievedAt?: number;
   searchCandidateId?: string;
+  externalTextHash?: string;
+};
+
+type CleanupReceipt = {
+  id: string;
+  bundleId: string;
+  sourceId: string;
+  storageKey: string | null;
+  extractedTextKey: string | null;
+  status: "pending" | "completed";
+  error: string | null;
 };
 
 class FakeR2 {
@@ -375,6 +386,7 @@ class FakeR2 {
   readonly putKeys: string[] = [];
   readonly deleteAttempts = new Map<string, number>();
   readonly deleteFailures = new Map<string, number>();
+  failFirstPutDeletes = false;
 
   async put(key: string, value: unknown): Promise<void> {
     this.putKeys.push(key);
@@ -388,6 +400,7 @@ class FakeR2 {
   async delete(key: string): Promise<void> {
     this.deleteAttempts.set(key, (this.deleteAttempts.get(key) ?? 0) + 1);
     const failures = this.deleteFailures.get(key) ?? 0;
+    if (this.failFirstPutDeletes && key === this.putKeys[0]) throw new Error(`injected permanent delete failure for ${key}`);
     if (failures > 0) {
       this.deleteFailures.set(key, failures - 1);
       throw new Error(`injected delete failure for ${key}`);
@@ -431,7 +444,9 @@ class FakeD1Statement {
 
 class FakeD1 {
   readonly rows: SourceRow[] = [];
+  readonly cleanupReceipts: CleanupReceipt[] = [];
   nextUniqueConflict: SourceRow | null = null;
+  commitThenThrow = false;
 
   prepare(sql: string): FakeD1Statement {
     return new FakeD1Statement(sql, this);
@@ -443,7 +458,29 @@ class FakeD1 {
     )) ?? null;
   }
 
+  async findById(sourceId: string): Promise<SourceRow | null> {
+    return this.rows.find((row) => row.id === sourceId) ?? null;
+  }
+
+  async startCleanup(input: Omit<CleanupReceipt, "id" | "status" | "error">): Promise<string> {
+    const id = `cleanup-${this.cleanupReceipts.length + 1}`;
+    this.cleanupReceipts.push({ id, ...input, status: "pending", error: null });
+    return id;
+  }
+
+  async finishCleanup(id: string, error: string | null): Promise<void> {
+    const receipt = this.cleanupReceipts.find((value) => value.id === id);
+    assert.ok(receipt);
+    receipt.status = error === null ? "completed" : "pending";
+    receipt.error = error;
+  }
+
   async register(source: SourceRow): Promise<SourceRow> {
+    if (this.commitThenThrow) {
+      this.rows.push(source);
+      this.commitThenThrow = false;
+      throw new Error("transport failed after commit");
+    }
     if (this.nextUniqueConflict !== null) {
       this.rows.push(this.nextUniqueConflict);
       this.nextUniqueConflict = null;
@@ -574,6 +611,32 @@ test("rejects invalid external metadata before any R2 or D1 write", async () => 
   }
 });
 
+test("rejects canonical URLs over the UTF-8 byte limit before and after normalization with zero writes", async () => {
+  for (const canonicalUrl of [
+    `https://fifa.com/guidance?q=${"a".repeat(5_000)}`,
+    `https://fifa.com/guidance?q=${"é".repeat(1_000)}`,
+  ]) {
+    const bucket = new FakeR2();
+    const database = new FakeD1();
+    await assert.rejects(() => new EvidenceFileStore({ bucket, registration: database }).putValidatedFile({
+      bundleId: "bundle-external",
+      name: "width.txt",
+      type: "text/plain",
+      bytes: new TextEncoder().encode("body"),
+      externalMetadata: {
+        origin: "external_web",
+        canonicalUrl,
+        publisher: "FIFA",
+        publishedAt: "2026-08-20",
+        retrievedAt: 1,
+        searchCandidateId: "candidate-1",
+      },
+    }), /URL.*크기|크기.*URL/);
+    assert.equal(bucket.putKeys.length, 0);
+    assert.equal(database.rows.length, 0);
+  }
+});
+
 test("deletes a canonical-URL race loser and returns the registered winner", async () => {
   const bucket = new FakeR2();
   const database = new FakeD1();
@@ -614,6 +677,60 @@ test("deletes a canonical-URL race loser and returns the registered winner", asy
 
   assert.equal(source.id, winner.id);
   assert.equal(bucket.objects.size, 0);
+  assert.deepEqual(database.cleanupReceipts.map(({ status, error }) => ({ status, error })), [
+    { status: "completed", error: null },
+  ]);
+});
+
+test("retains the exact committed source objects when registration commits and then throws", async () => {
+  const bucket = new FakeR2();
+  const database = new FakeD1();
+  database.commitThenThrow = true;
+
+  const source = await new EvidenceFileStore({ bucket, registration: database }).putValidatedFile({
+    bundleId: "bundle-1",
+    name: "commit.md",
+    type: "text/markdown",
+    bytes: new TextEncoder().encode("committed body"),
+  });
+
+  assert.equal(database.rows[0]?.id, source.id);
+  assert.equal(bucket.objects.has(source.storageKey), true);
+  assert.equal(source.extractedTextKey === null ? false : bucket.objects.has(source.extractedTextKey), true);
+  assert.equal(database.cleanupReceipts.length, 0);
+  assert.equal(bucket.deleteAttempts.size, 0);
+});
+
+test("does not restore unowned loser objects when cleanup deletion fails and leaves a durable pending receipt", async () => {
+  const bucket = new FakeR2();
+  bucket.failFirstPutDeletes = true;
+  const database = new FakeD1();
+  database.nextUniqueConflict = {
+    id: "winner",
+    bundleId: "bundle-1",
+    originalFileName: "winner.md",
+    mediaType: "text/markdown",
+    byteSize: 6,
+    contentHash: "winner-hash",
+    storageKey: "winner-original",
+    extractedTextKey: "winner-extracted",
+    extractionStatus: "completed",
+    extractionError: null,
+  };
+
+  await assert.rejects(() => new EvidenceFileStore({ bucket, registration: database }).putValidatedFile({
+    bundleId: "bundle-1",
+    name: "loser.md",
+    type: "text/markdown",
+    bytes: new TextEncoder().encode("loser body"),
+  }), /정리/);
+
+  assert.equal(bucket.objects.has(bucket.putKeys[0]!), true);
+  assert.equal(bucket.objects.has(bucket.putKeys[1]!), false);
+  assert.equal(bucket.putKeys.length, 2, "unowned cleanup must never restore a deleted object");
+  assert.equal(database.cleanupReceipts.length, 1);
+  assert.equal(database.cleanupReceipts[0]?.status, "pending");
+  assert.match(database.cleanupReceipts[0]?.error ?? "", /delete failure/);
 });
 
 test("reconciles both R2 keys after a one-sided pair deletion failure", async () => {

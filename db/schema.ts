@@ -147,6 +147,18 @@ export const evidenceMutationReceipts = sqliteTable("evidence_mutation_receipts"
   createdAt: integer("created_at", { mode: "timestamp_ms" }).notNull(),
 }, (table) => [index("idx_evidence_mutation_receipts_bundle_source").on(table.bundleId, table.sourceId)]);
 
+export const evidenceR2CleanupReceipts = sqliteTable("evidence_r2_cleanup_receipts", {
+  id: text("id").primaryKey(),
+  bundleId: text("bundle_id").notNull().references(() => evidenceBundles.id, { onDelete: "cascade" }),
+  sourceId: text("source_id").notNull(),
+  storageKey: text("storage_key"),
+  extractedTextKey: text("extracted_text_key"),
+  status: text("status", { enum: ["pending", "completed"] }).notNull().default("pending"),
+  errorMessage: text("error_message"),
+  createdAt: integer("created_at", { mode: "timestamp_ms" }).notNull(),
+  updatedAt: integer("updated_at", { mode: "timestamp_ms" }).notNull(),
+}, (table) => [index("idx_evidence_r2_cleanup_status").on(table.status, table.updatedAt)]);
+
 export const scenarioEvidenceSources = sqliteTable("scenario_evidence_sources", {
   scenarioId: text("scenario_id").notNull().references(() => scenarios.id, { onDelete: "cascade" }),
   sourceId: text("source_id").notNull().references(() => evidenceSources.id, { onDelete: "restrict" }),

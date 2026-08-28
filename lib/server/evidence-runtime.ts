@@ -29,13 +29,25 @@ export function createEvidenceProductionRuntime(dependencies: EvidenceProduction
   const repository = new D1EvidenceServiceRepository(dependencies.bindings.DB);
   let registration: EvidenceSourceRegistrationPort | null = null;
   const requiredRegistration: EvidenceSourceRegistrationPort = {
-    findExisting(bundleId, contentHash) {
+    findExisting(bundleId, contentHash, canonicalUrl) {
       if (registration === null) throw new Error("근거 자료 등록 서비스가 구성되지 않았습니다.");
-      return registration.findExisting(bundleId, contentHash);
+      return registration.findExisting(bundleId, contentHash, canonicalUrl);
+    },
+    findById(sourceId) {
+      if (registration === null) throw new Error("근거 자료 등록 서비스가 구성되지 않았습니다.");
+      return registration.findById!(sourceId);
     },
     register(source) {
       if (registration === null) throw new Error("근거 자료 등록 서비스가 구성되지 않았습니다.");
       return registration.register(source);
+    },
+    startCleanup(input) {
+      if (registration === null) throw new Error("근거 자료 등록 서비스가 구성되지 않았습니다.");
+      return registration.startCleanup!(input);
+    },
+    finishCleanup(receiptId, error) {
+      if (registration === null) throw new Error("근거 자료 등록 서비스가 구성되지 않았습니다.");
+      return registration.finishCleanup!(receiptId, error);
     },
   };
   const fileStore = new EvidenceFileStore({

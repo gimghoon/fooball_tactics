@@ -29,6 +29,7 @@ const EXECUTABLE_SIGNATURES = [
 ];
 const PDF_EOF_MARKER = new TextEncoder().encode("%%EOF");
 const DELETE_RECONCILIATION_ATTEMPTS = 2;
+const MAX_EXTERNAL_CANONICAL_URL_BYTES = 4 * 1024;
 
 export type EvidenceMediaType = "application/pdf" | "text/plain" | "text/markdown";
 
@@ -73,6 +74,7 @@ export type StoredEvidenceFile = {
   publishedAt?: string;
   retrievedAt?: number;
   searchCandidateId?: string;
+  externalTextHash?: string;
 };
 
 export type EvidenceR2Bucket = {
@@ -97,8 +99,23 @@ export type EvidenceD1Database = {
 /** Service-owned registration keeps a new source in the same version/audit mutation. */
 export type EvidenceSourceRegistrationPort = {
   findExisting(bundleId: string, contentHash: string, canonicalUrl?: string): Promise<StoredEvidenceFile | null>;
+  findById?: (sourceId: string) => Promise<StoredEvidenceFile | null>;
   register(source: StoredEvidenceFile): Promise<StoredEvidenceFile>;
+  startCleanup?: (input: EvidenceCleanupReceiptInput) => Promise<string>;
+  finishCleanup?: (receiptId: string, error: string | null) => Promise<void>;
 };
+
+export type EvidenceCleanupReceiptInput = {
+  bundleId: string;
+  sourceId: string;
+  storageKey: string | null;
+  extractedTextKey: string | null;
+};
+
+async function sha256(bytes: Uint8Array): Promise<string> {
+  const digest = await crypto.subtle.digest("SHA-256", bytes);
+  return Array.from(new Uint8Array(digest), (value) => value.toString(16).padStart(2, "0")).join("");
+}
 
 function isEvidenceR2Body(value: unknown): value is EvidenceR2Body {
   return typeof value === "object" && value !== null && "body" in value;
@@ -229,9 +246,7 @@ export async function validateEvidenceFile(
       throw new EvidenceValidationError("텍스트 파일은 UTF-8이어야 합니다.");
     }
   }
-  const digest = await crypto.subtle.digest("SHA-256", input.bytes);
-  const sha256 = Array.from(new Uint8Array(digest), (value) => value.toString(16).padStart(2, "0")).join("");
-  return { ...file, sha256, bytes: input.bytes, preflightExtractedPages };
+  return { ...file, sha256: await sha256(input.bytes), bytes: input.bytes, preflightExtractedPages };
 }
 
 function opaqueStorageKey(bundleId: string, sourceId: string, sha256: string): string {
@@ -263,8 +278,15 @@ function normalizedExternalMetadata(value: ExternalSourceMetadata | undefined): 
   }
   let canonicalUrl: string;
   try {
+    if (new TextEncoder().encode(value.canonicalUrl).byteLength > MAX_EXTERNAL_CANONICAL_URL_BYTES) {
+      throw new EvidenceValidationError("외부 출처 URL 크기 제한을 초과했습니다.");
+    }
     canonicalUrl = normalizeExternalUrl(value.canonicalUrl);
-  } catch {
+    if (new TextEncoder().encode(canonicalUrl).byteLength > MAX_EXTERNAL_CANONICAL_URL_BYTES) {
+      throw new EvidenceValidationError("외부 출처 URL 크기 제한을 초과했습니다.");
+    }
+  } catch (error) {
+    if (error instanceof EvidenceValidationError) throw error;
     throw new EvidenceValidationError("외부 출처 URL이 올바르지 않습니다.");
   }
   return { ...value, canonicalUrl, publisher, searchCandidateId };
@@ -310,12 +332,16 @@ export class EvidenceFileStore {
     const id = crypto.randomUUID();
     const storageKey = opaqueStorageKey(input.bundleId, id, file.sha256);
     let extractedTextKey: string | null = null;
+    let externalTextHash: string | undefined;
     let extractionStatus: StoredEvidenceFile["extractionStatus"] = "completed";
     let extractionError: string | null = null;
 
     await this.dependencies.bucket.put(storageKey, file.bytes);
     try {
       const extracted = file.preflightExtractedPages ?? await extractEvidenceText(file.kind, file.bytes);
+      if (externalMetadata !== undefined) {
+        externalTextHash = await sha256(new TextEncoder().encode(JSON.stringify(extracted satisfies ExtractedPage[])));
+      }
       if (file.kind === "pdf" && extracted.some((page) => page.text.trim() === "")) {
         extractionStatus = "failed";
         extractionError = "스캔 PDF는 OCR을 지원하지 않습니다.";
@@ -341,15 +367,80 @@ export class EvidenceFileStore {
       extractionError,
       origin: externalMetadata?.origin ?? "uploaded",
       ...externalMetadata,
+      ...(externalTextHash === undefined ? {} : { externalTextHash }),
     };
     try {
       return await this.dependencies.registration.register(source);
     } catch (error) {
-      await this.deleteFilePair(storageKey, extractedTextKey);
-      const winner = await this.dependencies.registration.findExisting(input.bundleId, file.sha256, externalMetadata?.canonicalUrl);
-      if (winner !== null) return winner;
-      throw error;
+      return this.reconcileFailedRegistration(source, error);
     }
+  }
+
+  private async reconcileFailedRegistration(source: StoredEvidenceFile, registrationError: unknown): Promise<StoredEvidenceFile> {
+    const registration = this.dependencies.registration;
+    if (registration.findById === undefined || registration.startCleanup === undefined || registration.finishCleanup === undefined) {
+      throw new AggregateError(
+        [registrationError, new Error("근거 자료 등록 정리 서비스가 구성되지 않았습니다.")],
+        "등록 결과를 안전하게 확인할 수 없습니다.",
+      );
+    }
+
+    const exact = await registration.findById(source.id);
+    const duplicate = await registration.findExisting(source.bundleId, source.contentHash, source.canonicalUrl);
+    const owner = exact ?? duplicate;
+    const ownedKeys = new Set(
+      [exact, duplicate].flatMap((candidate) => candidate === null
+        ? []
+        : [candidate.storageKey, ...(candidate.extractedTextKey === null ? [] : [candidate.extractedTextKey])]),
+    );
+    const unownedStorageKey = ownedKeys.has(source.storageKey) ? null : source.storageKey;
+    const unownedExtractedKey = source.extractedTextKey === null || ownedKeys.has(source.extractedTextKey)
+      ? null
+      : source.extractedTextKey;
+
+    if (unownedStorageKey === null && unownedExtractedKey === null) {
+      if (owner !== null) return owner;
+      throw registrationError;
+    }
+
+    const receiptId = await registration.startCleanup({
+      bundleId: source.bundleId,
+      sourceId: source.id,
+      storageKey: unownedStorageKey,
+      extractedTextKey: unownedExtractedKey,
+    });
+    const cleanupErrors = await this.deleteUnownedKeys([unownedStorageKey, unownedExtractedKey].filter((key): key is string => key !== null));
+    const cleanupError = cleanupErrors.length === 0
+      ? null
+      : cleanupErrors.map((value) => value instanceof Error ? value.message : "unknown cleanup failure").join("; ").slice(0, 500);
+    try {
+      await registration.finishCleanup(receiptId, cleanupError);
+    } catch (receiptError) {
+      throw new AggregateError([registrationError, ...cleanupErrors, receiptError], "미소유 근거 객체 정리 상태를 기록하지 못했습니다.");
+    }
+    if (cleanupErrors.length > 0) {
+      throw new AggregateError([registrationError, ...cleanupErrors], "미소유 근거 객체를 모두 정리하지 못했습니다.");
+    }
+    if (owner !== null) return owner;
+    throw registrationError;
+  }
+
+  private async deleteUnownedKeys(keys: string[]): Promise<unknown[]> {
+    let remaining = [...keys];
+    let errors: unknown[] = [];
+    for (let attempt = 0; attempt < DELETE_RECONCILIATION_ATTEMPTS && remaining.length > 0; attempt += 1) {
+      const results = await Promise.allSettled(remaining.map((key) => this.dependencies.bucket.delete(key)));
+      const failedKeys: string[] = [];
+      errors = [];
+      results.forEach((result, index) => {
+        if (result.status === "rejected") {
+          failedKeys.push(remaining[index]!);
+          errors.push(result.reason);
+        }
+      });
+      remaining = failedKeys;
+    }
+    return errors;
   }
 
   getFile(key: string): Promise<unknown | null> {
