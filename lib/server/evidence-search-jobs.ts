@@ -28,6 +28,7 @@ const MAX_SELECTION = 5;
 const MAX_DIRECT_SUMMARY_BYTES = 4_000;
 const MAX_DIRECT_SUMMARY_CODE_UNITS = 2_000;
 const MAX_ERROR_LENGTH = 240;
+const ACQUISITION_LEASE_MS = 60_000;
 const SEARCH_REUSABLE_STATUSES = new Set<SearchRunStatus>(["queued", "searching", "ready"]);
 const SELECTION_STATUSES = new Set<SearchRunStatus>(["ready", "completed"]);
 const IMPORT_START_STATUSES = new Set<SearchRunStatus>(["ready", "completed", "failed"]);
@@ -42,6 +43,8 @@ type EvidenceSearchRunRow = {
   promptVersion: string;
   queryJson: string;
   errorMessage: string | null;
+  leaseToken: string | null;
+  leaseExpiresAt: number | null;
   isStale: number | boolean;
   startedAt: number | null;
   completedAt: number | null;
@@ -70,6 +73,8 @@ type EvidenceSearchCandidateRow = {
   sourceId: string | null;
   contentHash: string | null;
   failureReason: string | null;
+  leaseToken: string | null;
+  leaseExpiresAt: number | null;
   createdAt: number;
   updatedAt: number;
 };
@@ -90,13 +95,16 @@ type DirectSourceRow = {
 
 export type EvidenceSearchRunRecord = Omit<
   EvidenceSearchRunRow,
-  "queryJson" | "isStale"
+  "queryJson" | "leaseToken" | "leaseExpiresAt" | "isStale"
 > & {
   queries: string[];
   isStale: boolean;
 };
 
-export type EvidenceSearchCandidateRecord = EvidenceSearchCandidateRow;
+export type EvidenceSearchCandidateRecord = Omit<
+  EvidenceSearchCandidateRow,
+  "leaseToken" | "leaseExpiresAt"
+>;
 
 export type EvidenceSearchRunDetail = {
   run: EvidenceSearchRunRecord;
@@ -121,12 +129,14 @@ export type EvidenceExternalSearchJobDependencies = {
 
 const RUN_COLUMNS = `id,bundle_id AS bundleId,input_version AS inputVersion,
   bundle_version AS bundleVersion,status,search_model AS searchModel,prompt_version AS promptVersion,
-  query_json AS queryJson,error_message AS errorMessage,is_stale AS isStale,
+  query_json AS queryJson,error_message AS errorMessage,lease_token AS leaseToken,
+  lease_expires_at AS leaseExpiresAt,is_stale AS isStale,
   started_at AS startedAt,completed_at AS completedAt,created_at AS createdAt,updated_at AS updatedAt`;
 const CANDIDATE_COLUMNS = `id,run_id AS runId,bundle_id AS bundleId,url,canonical_url AS canonicalUrl,
   title,publisher,published_at AS publishedAt,retrieved_at AS retrievedAt,document_type AS documentType,
   quote,relevance,trust_tier AS trustTier,rank,status,selected_by AS selectedBy,selected_at AS selectedAt,
   source_id AS sourceId,content_hash AS contentHash,failure_reason AS failureReason,
+  lease_token AS leaseToken,lease_expires_at AS leaseExpiresAt,
   created_at AS createdAt,updated_at AS updatedAt`;
 
 function changes(value: { meta?: { changes?: number } } | undefined): number {
@@ -159,6 +169,13 @@ function asRun(row: EvidenceSearchRunRow): EvidenceSearchRunRecord {
     updatedAt: row.updatedAt,
     queries,
   };
+}
+
+function asCandidate(row: EvidenceSearchCandidateRow): EvidenceSearchCandidateRecord {
+  const candidate: Partial<EvidenceSearchCandidateRow> = { ...row };
+  delete candidate.leaseToken;
+  delete candidate.leaseExpiresAt;
+  return candidate as EvidenceSearchCandidateRecord;
 }
 
 async function sha256(value: string): Promise<string> {
@@ -277,8 +294,8 @@ export class EvidenceExternalSearchJobs {
     }));
     const existing = await this.findRunByInput(bundleId, inputVersion);
     if (existing !== null && SEARCH_REUSABLE_STATUSES.has(existing.status)) {
-      if (existing.status === "queued") {
-        await this.scheduleQueuedSearch(existing.id, bundle, directEvidenceSummary);
+      if (existing.status === "queued" || existing.status === "searching") {
+        await this.scheduleSearchContinuation(existing.id, bundle, directEvidenceSummary);
         const repaired = await this.run(existing.id);
         if (repaired === null) throw new EvidenceConflictError();
         return asRun(repaired);
@@ -339,7 +356,7 @@ export class EvidenceExternalSearchJobs {
         result = await this.dependencies.db.prepare(
           `UPDATE evidence_search_runs
             SET status='queued',query_json='[]',error_message=NULL,is_stale=0,started_at=NULL,completed_at=NULL,
-              bundle_version=?,search_model=?,prompt_version=?,updated_at=?
+              lease_token=NULL,lease_expires_at=NULL,bundle_version=?,search_model=?,prompt_version=?,updated_at=?
             WHERE id=? AND bundle_id=? AND input_version=? AND status='failed'
               AND NOT EXISTS (SELECT 1 FROM evidence_search_candidates WHERE run_id=evidence_search_runs.id)
               AND EXISTS (SELECT 1 FROM evidence_bundles WHERE id=? AND version=? AND content_version=?)`,
@@ -369,7 +386,7 @@ export class EvidenceExternalSearchJobs {
       }
     }
 
-    await this.scheduleQueuedSearch(runId, bundle, directEvidenceSummary);
+    await this.scheduleSearchContinuation(runId, bundle, directEvidenceSummary);
     const created = await this.run(runId);
     if (created === null) throw new EvidenceConflictError();
     return asRun(created);
@@ -451,7 +468,7 @@ export class EvidenceExternalSearchJobs {
         this.dependencies.db.prepare(
           `UPDATE evidence_search_candidates
             SET status='selected',selected_by=?,selected_at=?,source_id=NULL,content_hash=NULL,
-              failure_reason=NULL,updated_at=?
+              failure_reason=NULL,lease_token=NULL,lease_expires_at=NULL,updated_at=?
             WHERE id=? AND run_id=? AND ${authority}`,
         ).bind(admin.userId, now, now, id, runId, ...authorityValues),
         this.auditStatement(bundleId, admin, "search_candidate.selected", id, runId, now, authority, authorityValues),
@@ -462,7 +479,7 @@ export class EvidenceExternalSearchJobs {
         this.dependencies.db.prepare(
           `UPDATE evidence_search_candidates
             SET status='excluded',selected_by=?,selected_at=?,source_id=NULL,content_hash=NULL,
-              failure_reason=NULL,updated_at=?
+              failure_reason=NULL,lease_token=NULL,lease_expires_at=NULL,updated_at=?
             WHERE id=? AND run_id=? AND ${authority}`,
         ).bind(admin.userId, now, now, id, runId, ...authorityValues),
         this.auditStatement(bundleId, admin, "search_candidate.excluded", id, runId, now, authority, authorityValues),
@@ -520,7 +537,7 @@ export class EvidenceExternalSearchJobs {
     try {
       result = await this.dependencies.db.prepare(
         `UPDATE evidence_search_runs
-          SET status='importing',error_message=NULL,completed_at=NULL,updated_at=?
+          SET status='importing',error_message=NULL,completed_at=NULL,lease_token=NULL,lease_expires_at=NULL,updated_at=?
           WHERE id=? AND bundle_id=? AND updated_at=? AND is_stale=0
             AND status IN ('ready','completed','failed') AND bundle_version=?
             AND EXISTS (SELECT 1 FROM evidence_bundles WHERE id=? AND version=?)
@@ -529,7 +546,7 @@ export class EvidenceExternalSearchJobs {
       ).bind(now, runId, bundleId, run.updatedAt, bundle.version, bundleId, bundle.version, runId).run();
     } catch (error) {
       const committed = await this.run(runId);
-      if (committed?.status !== "importing" || committed.updatedAt !== now) throw error;
+      if (committed?.status !== "importing" || committed.bundleVersion !== bundle.version) throw error;
     }
     if (changes(result) !== 1) {
       const winner = await this.run(runId);
@@ -539,10 +556,6 @@ export class EvidenceExternalSearchJobs {
     try {
       this.scheduleImportContinuation(bundleId, runId);
     } catch {
-      await this.dependencies.db.prepare(
-        `UPDATE evidence_search_runs SET status='failed',error_message=?,completed_at=?,updated_at=?
-          WHERE id=? AND status='importing' AND updated_at=?`,
-      ).bind("외부 문서 가져오기 작업을 예약하지 못했습니다.", now, now, runId, now).run();
       throw new EvidenceUnavailableError("외부 문서 가져오기 작업을 예약하지 못했습니다.");
     }
     const started = await this.run(runId);
@@ -556,25 +569,33 @@ export class EvidenceExternalSearchJobs {
     directEvidenceSummary: string,
   ): Promise<void> {
     const startedAt = this.now();
+    const leaseToken = this.leaseToken();
+    const leaseExpiresAt = startedAt + ACQUISITION_LEASE_MS;
     let acquired: { meta?: { changes?: number } } | undefined;
     try {
       acquired = await this.dependencies.db.prepare(
-        `UPDATE evidence_search_runs SET status='searching',started_at=?,error_message=NULL,updated_at=?
-          WHERE id=? AND bundle_id=? AND status='queued' AND is_stale=0 AND bundle_version=?
+        `UPDATE evidence_search_runs
+          SET status='searching',lease_token=?,lease_expires_at=?,started_at=COALESCE(started_at,?),
+            error_message=NULL,updated_at=?
+          WHERE id=? AND bundle_id=? AND is_stale=0 AND bundle_version=?
+            AND (status='queued' OR (status='searching' AND (lease_expires_at IS NULL OR lease_expires_at<=?)))
             AND EXISTS (SELECT 1 FROM evidence_bundles WHERE id=? AND version=? AND content_version=?)`,
       ).bind(
+        leaseToken,
+        leaseExpiresAt,
         startedAt,
         startedAt,
         runId,
         bundle.id,
         bundle.version,
+        startedAt,
         bundle.id,
         bundle.version,
         bundle.contentVersion,
       ).run();
     } catch {
       const current = await this.run(runId);
-      if (current?.status !== "searching" || current.startedAt !== startedAt || current.updatedAt !== startedAt) {
+      if (current?.status !== "searching" || current.leaseToken !== leaseToken) {
         await this.staleRunIfBundleChanged(runId, bundle);
         return;
       }
@@ -611,9 +632,17 @@ export class EvidenceExternalSearchJobs {
         .map((query) => query.trim().slice(0, 200))
         .slice(0, 5);
       const guard = `EXISTS (SELECT 1 FROM evidence_search_runs
-          WHERE id=? AND bundle_id=? AND status='searching' AND is_stale=0 AND bundle_version=?)
+          WHERE id=? AND bundle_id=? AND status='searching' AND is_stale=0 AND bundle_version=? AND lease_token=?)
         AND EXISTS (SELECT 1 FROM evidence_bundles WHERE id=? AND version=? AND content_version=?)`;
-      const guardValues = [runId, bundle.id, bundle.version, bundle.id, bundle.version, bundle.contentVersion];
+      const guardValues = [
+        runId,
+        bundle.id,
+        bundle.version,
+        leaseToken,
+        bundle.id,
+        bundle.version,
+        bundle.contentVersion,
+      ];
       const statements = candidates.map((candidate, rank) => this.dependencies.db.prepare(
         `INSERT INTO evidence_search_candidates
           (id,run_id,bundle_id,url,canonical_url,title,publisher,published_at,retrieved_at,document_type,
@@ -640,8 +669,9 @@ export class EvidenceExternalSearchJobs {
       ));
       statements.push(this.dependencies.db.prepare(
         `UPDATE evidence_search_runs
-          SET status='ready',query_json=?,error_message=NULL,completed_at=?,updated_at=?
-          WHERE id=? AND bundle_id=? AND status='searching' AND is_stale=0 AND bundle_version=?
+          SET status='ready',query_json=?,error_message=NULL,lease_token=NULL,lease_expires_at=NULL,
+            completed_at=?,updated_at=?
+          WHERE id=? AND bundle_id=? AND status='searching' AND is_stale=0 AND bundle_version=? AND lease_token=?
             AND EXISTS (SELECT 1 FROM evidence_bundles WHERE id=? AND version=? AND content_version=?)`,
       ).bind(
         JSON.stringify(queries),
@@ -650,6 +680,7 @@ export class EvidenceExternalSearchJobs {
         runId,
         bundle.id,
         bundle.version,
+        leaseToken,
         bundle.id,
         bundle.version,
         bundle.contentVersion,
@@ -663,20 +694,26 @@ export class EvidenceExternalSearchJobs {
       }
     } catch (error) {
       const current = await this.run(runId);
-      if (current?.status === "ready" || current?.isStale) return;
+      if (current?.status === "ready" || current?.isStale || current?.leaseToken !== leaseToken) return;
       const now = this.now();
       await this.dependencies.db.prepare(
         `UPDATE evidence_search_runs
-          SET status='failed',error_message=?,completed_at=?,updated_at=?
-          WHERE id=? AND status='searching' AND is_stale=0`,
-      ).bind(safeError(searchErrorMessage(error)), now, now, runId).run();
+          SET status='failed',error_message=?,lease_token=NULL,lease_expires_at=NULL,completed_at=?,updated_at=?
+          WHERE id=? AND status='searching' AND is_stale=0 AND lease_token=?`,
+      ).bind(safeError(searchErrorMessage(error)), now, now, runId, leaseToken).run();
     }
   }
 
   private async executeImports(bundleId: string, runId: string): Promise<void> {
     try {
+      const now = this.now();
       const candidates = (await this.candidates(runId)).filter((candidate) =>
-        candidate.selectedBy !== null && (candidate.status === "selected" || candidate.status === "failed"),
+        candidate.selectedBy !== null && (
+          candidate.status === "selected"
+          || candidate.status === "failed"
+          || (candidate.status === "importing"
+            && (candidate.leaseExpiresAt === null || candidate.leaseExpiresAt <= now))
+        ),
       ).slice(0, MAX_SELECTION);
       for (const candidate of candidates) {
         try {
@@ -696,19 +733,34 @@ export class EvidenceExternalSearchJobs {
     candidate: EvidenceSearchCandidateRow,
   ): Promise<void> {
     const acquiredAt = this.now();
+    const leaseToken = this.leaseToken();
+    const leaseExpiresAt = acquiredAt + ACQUISITION_LEASE_MS;
     let acquired: { meta?: { changes?: number } } | undefined;
     try {
       acquired = await this.dependencies.db.prepare(
         `UPDATE evidence_search_candidates
-          SET status='importing',failure_reason=NULL,updated_at=?
-          WHERE id=? AND run_id=? AND bundle_id=? AND selected_by IS NOT NULL AND status IN ('selected','failed')
+          SET status='importing',lease_token=?,lease_expires_at=?,failure_reason=NULL,updated_at=?
+          WHERE id=? AND run_id=? AND bundle_id=? AND selected_by IS NOT NULL
+            AND (status IN ('selected','failed')
+              OR (status='importing' AND (lease_expires_at IS NULL OR lease_expires_at<=?)))
             AND EXISTS (SELECT 1 FROM evidence_search_runs
               WHERE id=? AND bundle_id=? AND status='importing' AND is_stale=0
                 AND bundle_version=(SELECT version FROM evidence_bundles WHERE id=?))`,
-      ).bind(acquiredAt, candidate.id, runId, bundleId, runId, bundleId, bundleId).run();
+      ).bind(
+        leaseToken,
+        leaseExpiresAt,
+        acquiredAt,
+        candidate.id,
+        runId,
+        bundleId,
+        acquiredAt,
+        runId,
+        bundleId,
+        bundleId,
+      ).run();
     } catch (error) {
       const after = await this.candidate(candidate.id);
-      if (after?.status !== "importing" || after.updatedAt !== acquiredAt) throw error;
+      if (after?.status !== "importing" || after.leaseToken !== leaseToken) throw error;
       acquired = { meta: { changes: 1 } };
     }
     if (changes(acquired) !== 1) return;
@@ -735,21 +787,24 @@ export class EvidenceExternalSearchJobs {
           publishedAt: candidate.publishedAt,
           retrievedAt: fetched.retrievedAt,
           searchCandidateId: candidate.id,
+          searchCandidateLeaseToken: leaseToken,
         },
       });
-      await this.finishCandidateImport(runId, candidate.id, source);
+      await this.finishCandidateImport(runId, candidate.id, leaseToken, source);
     } catch (error) {
       const current = await this.candidate(candidate.id);
       if (current?.status === "imported") return;
+      if (current?.status !== "importing" || current.leaseToken !== leaseToken) return;
       const now = this.now();
       const message = safeError(importErrorMessage(error));
       try {
-        await this.failCandidateImport(runId, candidate.id, message, now);
+        await this.failCandidateImport(runId, candidate.id, leaseToken, message, now);
       } catch (failureError) {
         const after = await this.candidate(candidate.id);
         if (after?.status === "failed" || after?.status === "imported") return;
+        if (after?.status !== "importing" || after.leaseToken !== leaseToken) return;
         try {
-          await this.failCandidateImport(runId, candidate.id, message, this.now());
+          await this.failCandidateImport(runId, candidate.id, leaseToken, message, this.now());
         } catch {
           throw failureError;
         }
@@ -760,22 +815,26 @@ export class EvidenceExternalSearchJobs {
   private async failCandidateImport(
     runId: string,
     candidateId: string,
+    leaseToken: string,
     message: string,
     now: number,
   ): Promise<void> {
     const result = await this.dependencies.db.prepare(
-      `UPDATE evidence_search_candidates SET status='failed',failure_reason=?,updated_at=?
-        WHERE id=? AND run_id=? AND status='importing'
+      `UPDATE evidence_search_candidates
+        SET status='failed',failure_reason=?,lease_token=NULL,lease_expires_at=NULL,updated_at=?
+        WHERE id=? AND run_id=? AND status='importing' AND lease_token=?
           AND EXISTS (SELECT 1 FROM evidence_search_runs WHERE id=? AND status='importing' AND is_stale=0)`,
-    ).bind(message, now, candidateId, runId, runId).run();
+    ).bind(message, now, candidateId, runId, leaseToken, runId).run();
     if (changes(result) === 1) return;
     const after = await this.candidate(candidateId);
-    if (after?.status !== "failed" && after?.status !== "imported") throw new EvidenceConflictError();
+    if (after?.status === "failed" || after?.status === "imported" || after?.leaseToken !== leaseToken) return;
+    throw new EvidenceConflictError();
   }
 
   private async finishCandidateImport(
     runId: string,
     candidateId: string,
+    leaseToken: string,
     source: StoredEvidenceFile,
   ): Promise<void> {
     const current = await this.candidate(candidateId);
@@ -784,11 +843,22 @@ export class EvidenceExternalSearchJobs {
     try {
       const result = await this.dependencies.db.prepare(
         `UPDATE evidence_search_candidates
-          SET status='imported',source_id=?,content_hash=?,failure_reason=NULL,updated_at=?
-          WHERE id=? AND run_id=? AND status='importing'
+          SET status='imported',source_id=?,content_hash=?,failure_reason=NULL,
+            lease_token=NULL,lease_expires_at=NULL,updated_at=?
+          WHERE id=? AND run_id=? AND status='importing' AND lease_token=?
             AND EXISTS (SELECT 1 FROM evidence_sources WHERE id=? AND bundle_id=evidence_search_candidates.bundle_id AND content_hash=?)
             AND EXISTS (SELECT 1 FROM evidence_search_runs WHERE id=? AND status='importing' AND is_stale=0)`,
-      ).bind(source.id, source.contentHash, now, candidateId, runId, source.id, source.contentHash, runId).run();
+      ).bind(
+        source.id,
+        source.contentHash,
+        now,
+        candidateId,
+        runId,
+        leaseToken,
+        source.id,
+        source.contentHash,
+        runId,
+      ).run();
       if (changes(result) === 1) return;
     } catch (error) {
       const after = await this.candidate(candidateId);
@@ -800,18 +870,33 @@ export class EvidenceExternalSearchJobs {
   }
 
   private async finishImportRun(runId: string): Promise<void> {
+    const observedAt = this.now();
     const counts = await this.dependencies.db.prepare(
       `SELECT
         SUM(CASE WHEN status='imported' THEN 1 ELSE 0 END) AS imported,
         SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) AS failed,
-        SUM(CASE WHEN status IN ('selected','importing') THEN 1 ELSE 0 END) AS pending
+        SUM(CASE WHEN status='selected'
+          OR (status='importing' AND lease_expires_at>?) THEN 1 ELSE 0 END) AS active,
+        SUM(CASE WHEN status='importing'
+          AND (lease_expires_at IS NULL OR lease_expires_at<=?) THEN 1 ELSE 0 END) AS recoverable
         FROM evidence_search_candidates WHERE run_id=? AND selected_by IS NOT NULL`,
-    ).bind(runId).first<{ imported: number | null; failed: number | null; pending: number | null }>();
-    if (counts === null || (counts.pending ?? 0) !== 0 || (counts.imported ?? 0) + (counts.failed ?? 0) === 0) return;
+    ).bind(observedAt, observedAt, runId).first<{
+      imported: number | null;
+      failed: number | null;
+      active: number | null;
+      recoverable: number | null;
+    }>();
+    if (
+      counts === null
+      || (counts.active ?? 0) !== 0
+      || (counts.recoverable ?? 0) !== 0
+      || (counts.imported ?? 0) + (counts.failed ?? 0) === 0
+    ) return;
     const now = this.now();
     const status = (counts.imported ?? 0) > 0 ? "completed" : "failed";
     await this.dependencies.db.prepare(
-      `UPDATE evidence_search_runs SET status=?,error_message=?,completed_at=?,updated_at=?
+      `UPDATE evidence_search_runs
+        SET status=?,error_message=?,lease_token=NULL,lease_expires_at=NULL,completed_at=?,updated_at=?
         WHERE id=? AND status='importing' AND is_stale=0`,
     ).bind(
       status,
@@ -858,7 +943,8 @@ export class EvidenceExternalSearchJobs {
     const now = this.now();
     await this.dependencies.db.prepare(
       `UPDATE evidence_search_runs
-        SET status='failed',is_stale=1,error_message='근거 묶음이 갱신되었습니다.',completed_at=?,updated_at=?
+        SET status='failed',is_stale=1,error_message='근거 묶음이 갱신되었습니다.',
+          lease_token=NULL,lease_expires_at=NULL,completed_at=?,updated_at=?
         WHERE id=? AND status IN ('queued','searching') AND is_stale=0
           AND NOT EXISTS (SELECT 1 FROM evidence_bundles WHERE id=? AND version=? AND content_version=?)`,
     ).bind(now, now, runId, bundle.id, bundle.version, bundle.contentVersion).run();
@@ -867,7 +953,8 @@ export class EvidenceExternalSearchJobs {
   private async failQueuedSearch(runId: string): Promise<void> {
     const now = this.now();
     await this.dependencies.db.prepare(
-      `UPDATE evidence_search_runs SET status='failed',error_message=?,completed_at=?,updated_at=?
+      `UPDATE evidence_search_runs
+        SET status='failed',error_message=?,lease_token=NULL,lease_expires_at=NULL,completed_at=?,updated_at=?
         WHERE id=? AND status='queued'`,
     ).bind("외부 출처 검색 작업을 예약하지 못했습니다.", now, now, runId).run();
   }
@@ -911,7 +998,7 @@ export class EvidenceExternalSearchJobs {
     }) && excludedIds.every((id) => candidates.find((value) => value.id === id)?.status === "excluded");
   }
 
-  private async scheduleQueuedSearch(
+  private async scheduleSearchContinuation(
     runId: string,
     bundle: SearchBundleRow,
     directEvidenceSummary: string,
@@ -989,7 +1076,7 @@ export class EvidenceExternalSearchJobs {
   }
 
   private async detail(row: EvidenceSearchRunRow): Promise<EvidenceSearchRunDetail> {
-    return { run: asRun(row), candidates: await this.candidates(row.id) };
+    return { run: asRun(row), candidates: (await this.candidates(row.id)).map(asCandidate) };
   }
 
   private now(): number {
@@ -998,5 +1085,9 @@ export class EvidenceExternalSearchJobs {
 
   private id(): string {
     return this.dependencies.newId?.() ?? crypto.randomUUID();
+  }
+
+  private leaseToken(): string {
+    return crypto.randomUUID();
   }
 }

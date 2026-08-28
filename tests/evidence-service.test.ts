@@ -332,6 +332,48 @@ test("production external registration persists every metadata field and dedupli
   assert.equal(context.database.first<{ count: number }>("SELECT count(*) AS count FROM evidence_sources").count, 1);
 });
 
+test("external registration cannot commit with a replaced candidate lease token", async () => {
+  const context = createContext();
+  const bundle = await context.service.createBundle(bundleInput, admin);
+  context.database.run(
+    `INSERT INTO evidence_search_runs
+      (id,bundle_id,input_version,bundle_version,status,search_model,prompt_version,query_json,is_stale,created_at,updated_at)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+    "lease-run", bundle.id, "lease-input", bundle.version, "importing", "search-model", "search-prompt", "[]", 0, 1, 1,
+  );
+  context.database.run(
+    `INSERT INTO evidence_search_candidates
+      (id,run_id,bundle_id,url,canonical_url,title,publisher,published_at,document_type,quote,relevance,trust_tier,rank,
+        status,selected_by,selected_at,lease_token,lease_expires_at,created_at,updated_at)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+    "leased-candidate", "lease-run", bundle.id, "https://fifa.com/leased", "https://fifa.com/leased",
+    "Leased", "FIFA", "2026-08-20", "web_page", "verified quote", "relevant", 1, 0,
+    "importing", admin.userId, 1, "successor-token", 90_000, 1, 1,
+  );
+
+  await assert.rejects(() => context.fileStore.putValidatedFile({
+    bundleId: bundle.id,
+    name: "leased.txt",
+    type: "text/plain",
+    bytes: new TextEncoder().encode("verified quote"),
+    externalMetadata: {
+      origin: "external_web",
+      canonicalUrl: "https://fifa.com/leased",
+      publisher: "FIFA",
+      publishedAt: "2026-08-20",
+      retrievedAt: 2_000,
+      searchCandidateId: "leased-candidate",
+      searchCandidateLeaseToken: "expired-owner-token",
+    },
+  }));
+
+  assert.equal(context.database.first<{ count: number }>("SELECT count(*) AS count FROM evidence_sources").count, 0);
+  assert.equal(context.bucket.objects.size, 0);
+  assert.deepEqual({ ...context.database.first(
+    "SELECT status,lease_token AS leaseToken FROM evidence_search_candidates WHERE id='leased-candidate'",
+  ) }, { status: "importing", leaseToken: "successor-token" });
+});
+
 test("administrator bundle detail exposes external provenance and deletion keeps the compensated source workflow", async () => {
   const context = createContext();
   const bundle = await context.service.createBundle(bundleInput, admin);
@@ -463,6 +505,52 @@ test("migration 0012 preserves cleanup receipts while removing the historical bu
     entries: { idx: number; tag: string }[];
   };
   assert.equal(journal.entries.filter((entry) => entry.idx === 12 && entry.tag.startsWith("0012_")).length, 1);
+});
+
+test("migration 0013 adds recoverable search leases without rewriting existing work", () => {
+  const migrations = readdirSync("drizzle").filter((value) => /^\d{4}_.*\.sql$/.test(value)).sort();
+  const migrationName = migrations.find((name) => name.startsWith("0013_"));
+  assert.notEqual(migrationName, undefined, "Expected additive migration 0013");
+  const migration = readFileSync(`drizzle/${migrationName}`, "utf8");
+  assert.doesNotMatch(migration, /PRAGMA foreign_keys\s*=\s*OFF/i);
+  const database = databaseThroughMigration("0012_");
+  database.prepare(
+    "INSERT INTO evidence_bundles (id,title,purpose,version,content_version,created_at,updated_at) VALUES (?,?,?,?,?,?,?)",
+  ).run("lease-bundle", "Lease", "Recovery", 1, "v1", 1, 1);
+  database.prepare(
+    `INSERT INTO evidence_search_runs
+      (id,bundle_id,input_version,bundle_version,status,search_model,prompt_version,query_json,is_stale,created_at,updated_at)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+  ).run("lease-run", "lease-bundle", "input-v1", 1, "searching", "model", "prompt", "[]", 0, 1, 2);
+  database.prepare(
+    `INSERT INTO evidence_search_candidates
+      (id,run_id,bundle_id,url,canonical_url,title,publisher,published_at,document_type,quote,relevance,trust_tier,rank,
+        status,selected_by,selected_at,created_at,updated_at)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+  ).run(
+    "lease-candidate", "lease-run", "lease-bundle", "https://fifa.com/lease", "https://fifa.com/lease",
+    "Lease", "FIFA", "2026-08-20", "web_page", "quote", "relevant", 1, 0, "importing", "admin", 1, 1, 2,
+  );
+
+  applyMigrationInTransaction(database, migration);
+
+  assert.deepEqual({ ...database.prepare(
+    "SELECT status,lease_token AS leaseToken,lease_expires_at AS leaseExpiresAt FROM evidence_search_runs WHERE id='lease-run'",
+  ).get()! }, { status: "searching", leaseToken: null, leaseExpiresAt: null });
+  assert.deepEqual({ ...database.prepare(
+    `SELECT status,lease_token AS leaseToken,lease_expires_at AS leaseExpiresAt
+      FROM evidence_search_candidates WHERE id='lease-candidate'`,
+  ).get()! }, { status: "importing", leaseToken: null, leaseExpiresAt: null });
+  const runIndexes = database.prepare("PRAGMA index_list('evidence_search_runs')").all().map((row) => String(row.name));
+  const candidateIndexes = database.prepare("PRAGMA index_list('evidence_search_candidates')").all().map((row) => String(row.name));
+  assert.equal(runIndexes.includes("idx_evidence_search_runs_recovery"), true);
+  assert.equal(candidateIndexes.includes("idx_search_candidate_run_recovery"), true);
+  assert.deepEqual(database.prepare("PRAGMA foreign_key_check").all(), []);
+
+  const journal = JSON.parse(readFileSync("drizzle/meta/_journal.json", "utf8")) as {
+    entries: { idx: number; tag: string }[];
+  };
+  assert.equal(journal.entries.filter((entry) => entry.idx === 13 && entry.tag.startsWith("0013_")).length, 1);
 });
 
 test("production repository keeps cleanup ownership metadata after bundle deletion and reports missing receipts", async () => {

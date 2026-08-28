@@ -439,22 +439,40 @@ export class D1EvidenceServiceRepository implements EvidenceServiceRepository {
     const searchCandidateId = mutation.sourceToInsert?.origin === "external_web"
       ? mutation.sourceToInsert.searchCandidateId ?? null
       : null;
+    const searchCandidateLeaseToken = mutation.sourceToInsert?.origin === "external_web"
+      ? mutation.sourceToInsert.searchCandidateLeaseToken ?? null
+      : null;
     const searchCandidateAuthority = searchCandidateId === null
       ? ""
       : ` AND (
         NOT EXISTS (SELECT 1 FROM evidence_search_candidates WHERE id=?)
-        OR EXISTS (
+        OR (? IS NOT NULL AND EXISTS (
           SELECT 1 FROM evidence_search_candidates AS candidate
           JOIN evidence_search_runs AS run
             ON run.id=candidate.run_id AND run.bundle_id=candidate.bundle_id
           WHERE candidate.id=? AND candidate.bundle_id=?
-            AND candidate.status IN ('importing','imported')
+            AND candidate.status='importing' AND candidate.lease_token=?
             AND run.status='importing' AND run.is_stale=0
+        ))
+        OR EXISTS (
+          SELECT 1 FROM evidence_search_candidates AS candidate
+          WHERE candidate.id=? AND candidate.bundle_id=? AND candidate.status='imported'
+            AND candidate.source_id=? AND candidate.content_hash=?
         )
       )`;
     const searchCandidateAuthorityValues = searchCandidateId === null
       ? []
-      : [searchCandidateId, searchCandidateId, current.id];
+      : [
+          searchCandidateId,
+          searchCandidateLeaseToken,
+          searchCandidateId,
+          current.id,
+          searchCandidateLeaseToken,
+          searchCandidateId,
+          current.id,
+          mutation.sourceToInsert?.id ?? null,
+          mutation.sourceToInsert?.contentHash ?? null,
+        ];
     let dependentGuard = `${guard}${searchCandidateAuthority}`;
     let dependentGuardValues: unknown[] = [...oldState, ...searchCandidateAuthorityValues];
 
@@ -559,7 +577,8 @@ export class D1EvidenceServiceRepository implements EvidenceServiceRepository {
       this.db
         .prepare(
           `UPDATE evidence_search_runs
-          SET is_stale=1,error_message='근거 묶음이 갱신되었습니다.',updated_at=?
+          SET is_stale=1,error_message='근거 묶음이 갱신되었습니다.',
+            lease_token=NULL,lease_expires_at=NULL,updated_at=?
           WHERE bundle_id=? AND bundle_version<>? AND is_stale=0
             AND (? IS NULL OR id NOT IN (
               SELECT run_id FROM evidence_search_candidates WHERE id=? AND bundle_id=?
@@ -628,8 +647,9 @@ export class D1EvidenceServiceRepository implements EvidenceServiceRepository {
             this.db
               .prepare(
                 `UPDATE evidence_search_candidates
-                SET status='imported',source_id=?,content_hash=?,failure_reason=NULL,updated_at=?
-                WHERE id=? AND bundle_id=? AND status='importing'
+                SET status='imported',source_id=?,content_hash=?,failure_reason=NULL,
+                  lease_token=NULL,lease_expires_at=NULL,updated_at=?
+                WHERE id=? AND bundle_id=? AND status='importing' AND lease_token=?
                   AND EXISTS (SELECT 1 FROM evidence_sources WHERE id=? AND bundle_id=? AND content_hash=?)
                   AND ${dependentGuard}`,
               )
@@ -639,6 +659,7 @@ export class D1EvidenceServiceRepository implements EvidenceServiceRepository {
                 next.updatedAt,
                 searchCandidateId,
                 current.id,
+                searchCandidateLeaseToken,
                 mutation.sourceToInsert.id,
                 current.id,
                 mutation.sourceToInsert.contentHash,
@@ -1114,7 +1135,9 @@ export class EvidenceService {
         now,
       ),
     });
-    return s;
+    const stored = { ...s };
+    delete stored.searchCandidateLeaseToken;
+    return stored;
   }
   async describeDeleteImpact(id: string) {
     return this.d.repository.describeDeleteImpact(id);

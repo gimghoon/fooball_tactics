@@ -55,6 +55,8 @@ export type ExternalSourceMetadata = {
   publishedAt: string;
   retrievedAt: number;
   searchCandidateId: string;
+  /** Internal acquisition authority; never persisted with source provenance. */
+  searchCandidateLeaseToken?: string;
 };
 
 export type StoredEvidenceFile = {
@@ -74,6 +76,7 @@ export type StoredEvidenceFile = {
   publishedAt?: string;
   retrievedAt?: number;
   searchCandidateId?: string;
+  searchCandidateLeaseToken?: string;
   externalTextHash?: string;
 };
 
@@ -285,9 +288,12 @@ function normalizedExternalMetadata(value: ExternalSourceMetadata | undefined): 
   if (value.origin !== "external_web") throw new EvidenceValidationError("외부 출처 메타데이터가 올바르지 않습니다.");
   const publisher = value.publisher.trim();
   const searchCandidateId = value.searchCandidateId.trim();
+  const searchCandidateLeaseToken = value.searchCandidateLeaseToken?.trim();
   if (
     publisher === "" || publisher.length > 160
     || searchCandidateId === "" || searchCandidateId.length > 200
+    || (searchCandidateLeaseToken !== undefined
+      && (searchCandidateLeaseToken === "" || searchCandidateLeaseToken.length > 200))
     || !validPublishedAt(value.publishedAt)
     || !Number.isSafeInteger(value.retrievedAt) || value.retrievedAt < 0
   ) {
@@ -306,7 +312,13 @@ function normalizedExternalMetadata(value: ExternalSourceMetadata | undefined): 
     if (error instanceof EvidenceValidationError) throw error;
     throw new EvidenceValidationError("외부 출처 URL이 올바르지 않습니다.");
   }
-  return { ...value, canonicalUrl, publisher, searchCandidateId };
+  return {
+    ...value,
+    canonicalUrl,
+    publisher,
+    searchCandidateId,
+    ...(searchCandidateLeaseToken === undefined ? {} : { searchCandidateLeaseToken }),
+  };
 }
 
 function safeExternalFileName(canonicalUrl: string, mediaType: string): string {

@@ -41,6 +41,7 @@ class SQLiteD1Statement implements EvidenceD1Statement {
     private readonly database: DatabaseSync,
     readonly query: string,
     private readonly executeRun: (statement: SQLiteD1Statement) => Promise<{ meta: { changes: number } }>,
+    private readonly executeFirst: <T>(statement: SQLiteD1Statement) => Promise<T | null>,
   ) {}
 
   bind(...values: unknown[]): EvidenceD1Statement {
@@ -49,7 +50,7 @@ class SQLiteD1Statement implements EvidenceD1Statement {
   }
 
   async first<T>(): Promise<T | null> {
-    return (this.database.prepare(this.query).get(...this.values) as T | undefined) ?? null;
+    return this.executeFirst<T>(this);
   }
 
   async all<T>(): Promise<{ results: T[] }> {
@@ -64,6 +65,10 @@ class SQLiteD1Statement implements EvidenceD1Statement {
     const result = this.database.prepare(this.query).run(...this.values);
     return { meta: { changes: Number(result.changes) } };
   }
+
+  firstValue<T>(): T | null {
+    return (this.database.prepare(this.query).get(...this.values) as T | undefined) ?? null;
+  }
 }
 
 class SQLiteD1Database implements EvidenceD1Database {
@@ -72,6 +77,7 @@ class SQLiteD1Database implements EvidenceD1Database {
   afterNextBatchCommit: (() => void | Promise<void>) | null = null;
   beforeNextRun: { pattern: RegExp; callback: () => void | Promise<void> } | null = null;
   afterNextRunCommit: { pattern: RegExp; callback: () => void | Promise<void> } | null = null;
+  beforeNextFirst: { pattern: RegExp; skip?: number; callback: () => void | Promise<void> } | null = null;
 
   constructor() {
     this.database.exec("PRAGMA foreign_keys = ON");
@@ -81,7 +87,24 @@ class SQLiteD1Database implements EvidenceD1Database {
   }
 
   prepare(query: string): EvidenceD1Statement {
-    return new SQLiteD1Statement(this.database, query, (statement) => this.executeRun(statement));
+    return new SQLiteD1Statement(
+      this.database,
+      query,
+      (statement) => this.executeRun(statement),
+      (statement) => this.executeFirst(statement),
+    );
+  }
+
+  private async executeFirst<T>(statement: SQLiteD1Statement): Promise<T | null> {
+    const before = this.beforeNextFirst;
+    if (before?.pattern.test(statement.query)) {
+      if ((before.skip ?? 0) > 0) before.skip = (before.skip ?? 0) - 1;
+      else {
+        this.beforeNextFirst = null;
+        await before.callback();
+      }
+    }
+    return statement.firstValue<T>();
   }
 
   private async executeRun(statement: SQLiteD1Statement): Promise<{ meta: { changes: number } }> {
@@ -158,11 +181,13 @@ class MemoryR2Bucket implements EvidenceR2Bucket {
 class RecordingProvider implements EvidenceSearchProvider {
   readonly modelId = "search-model-1";
   readonly inputs: { title: string; purpose: string; directEvidenceSummary: string }[] = [];
+  beforeSearch: (() => void | Promise<void>) | null = null;
 
   constructor(private readonly result: { queries: string[]; candidates: SearchCandidateDraft[] }) {}
 
   async search(input: { title: string; purpose: string; directEvidenceSummary: string }) {
     this.inputs.push(input);
+    await this.beforeSearch?.();
     return this.result;
   }
 }
@@ -234,6 +259,7 @@ function seedApprovedWork(database: SQLiteD1Database): void {
 function createContext(
   candidates: SearchCandidateDraft[] = [candidate(1), candidate(2)],
   fetcher: (input: { url: string; expectedType: "web_page" | "pdf"; quote: string }) => Promise<FetchedExternalEvidence> = async (input) => successfulFetch(input),
+  options: { now?: () => number } = {},
 ) {
   const db = new SQLiteD1Database();
   const bucket = new MemoryR2Bucket();
@@ -242,12 +268,13 @@ function createContext(
   let serviceId = 0;
   let jobId = 0;
   let now = 1_000;
+  const currentTime = options.now ?? (() => ++now);
   const runtime = createEvidenceProductionRuntime({
     bindings: { DB: db, EVIDENCE_FILES: bucket },
     admin,
     settings,
     newId: () => `service-${++serviceId}`,
-    now: () => ++now,
+    now: currentTime,
   });
   const jobs = new EvidenceExternalSearchJobs({
     db,
@@ -258,7 +285,7 @@ function createContext(
     fetchExternalEvidence: fetcher,
     schedule: (promise) => scheduled.push(promise),
     newId: () => `search-${++jobId}`,
-    now: () => ++now,
+    now: currentTime,
   });
   return { db, bucket, scheduled, provider, jobs, ...runtime };
 }
@@ -347,7 +374,7 @@ test("bundle mutation before search acquisition terminally stales the queued run
   const context = createContext([candidate(1)]);
   seedBundle(context.db);
   context.db.beforeNextRun = {
-    pattern: /UPDATE evidence_search_runs SET status='searching'/,
+    pattern: /UPDATE evidence_search_runs\s+SET status='searching'/,
     callback: () => context.db.run(
       "UPDATE evidence_bundles SET version=2,content_version='content-2',updated_at=2 WHERE id='bundle-1'",
     ),
@@ -373,7 +400,7 @@ test("post-commit search insertion is reconciled and repeated queued starts repa
     callback: () => { throw new Error("simulated post-commit search insertion transport failure"); },
   };
   context.db.beforeNextRun = {
-    pattern: /UPDATE evidence_search_runs SET status='searching'/,
+    pattern: /UPDATE evidence_search_runs\s+SET status='searching'/,
     callback: async () => {
       acquisitionEntered.resolve();
       await releaseAcquisition.promise;
@@ -390,6 +417,104 @@ test("post-commit search insertion is reconciled and repeated queued starts repa
   await Promise.all(context.scheduled);
   assert.equal(context.provider.inputs.length, 1);
   assert.equal((await context.jobs.getSearch("bundle-1", first.id))?.run.status, "ready");
+});
+
+test("same-millisecond active search lease rejects an ambiguous no-op continuation", async () => {
+  let clock = 100_000;
+  const context = createContext([candidate(1)], undefined, { now: () => clock });
+  seedBundle(context.db);
+  const providerEntered = deferred();
+  const releaseProvider = deferred();
+  let blockFirstProvider = true;
+  context.provider.beforeSearch = async () => {
+    if (!blockFirstProvider) return;
+    blockFirstProvider = false;
+    providerEntered.resolve();
+    await releaseProvider.promise;
+  };
+
+  const firstScheduled = context.scheduled.length;
+  const run = await context.jobs.startSearch("bundle-1", admin);
+  await providerEntered.promise;
+  context.db.afterNextRunCommit = {
+    pattern: /UPDATE evidence_search_runs\s+SET status='searching'/,
+    callback: () => { throw new Error("ambiguous no-op search acquisition"); },
+  };
+
+  const secondScheduled = context.scheduled.length;
+  await context.jobs.startSearch("bundle-1", admin);
+  assert.equal(context.scheduled.length, secondScheduled + 1, "searching work must schedule an explicit repair");
+  await context.scheduled[secondScheduled];
+  assert.equal(context.provider.inputs.length, 1);
+
+  releaseProvider.resolve();
+  await context.scheduled[firstScheduled];
+  assert.deepEqual({ ...context.db.first(
+    "SELECT status,lease_token AS leaseToken,lease_expires_at AS leaseExpiresAt FROM evidence_search_runs WHERE id=?",
+    run.id,
+  ) }, { status: "ready", leaseToken: null, leaseExpiresAt: null });
+  clock += 1;
+});
+
+test("an interrupted search lease is not stolen while active and recovers after expiry", async () => {
+  let clock = 200_000;
+  const context = createContext([candidate(1)], undefined, { now: () => clock });
+  seedBundle(context.db);
+  context.db.afterNextRunCommit = {
+    pattern: /UPDATE evidence_search_runs\s+SET status='searching'/,
+    callback: () => {
+      context.db.beforeNextFirst = {
+        pattern: /FROM evidence_search_runs WHERE id=\?/,
+        skip: 1,
+        callback: () => { throw new Error("process interrupted before lease reconciliation"); },
+      };
+      throw new Error("ambiguous committed search acquisition");
+    },
+  };
+
+  let before = context.scheduled.length;
+  const run = await context.jobs.startSearch("bundle-1", admin);
+  await Promise.allSettled(context.scheduled.slice(before));
+  const stranded = context.db.first<{ status: string; leaseToken: string | null; leaseExpiresAt: number | null }>(
+    "SELECT status,lease_token AS leaseToken,lease_expires_at AS leaseExpiresAt FROM evidence_search_runs WHERE id=?",
+    run.id,
+  );
+  assert.equal(stranded.status, "searching");
+  assert.match(stranded.leaseToken ?? "", /^[0-9a-f-]{36}$/i);
+  assert.equal(stranded.leaseExpiresAt, 260_000);
+  assert.equal(context.provider.inputs.length, 0);
+
+  before = context.scheduled.length;
+  await context.jobs.startSearch("bundle-1", admin);
+  assert.equal(context.scheduled.length, before + 1);
+  await Promise.all(context.scheduled.slice(before));
+  assert.equal(context.provider.inputs.length, 0, "an unexpired lease cannot be stolen");
+
+  clock = stranded.leaseExpiresAt!;
+  before = context.scheduled.length;
+  await context.jobs.startSearch("bundle-1", admin);
+  await Promise.all(context.scheduled.slice(before));
+  assert.equal(context.provider.inputs.length, 1);
+  assert.deepEqual({ ...context.db.first(
+    "SELECT status,lease_token AS leaseToken,lease_expires_at AS leaseExpiresAt FROM evidence_search_runs WHERE id=?",
+    run.id,
+  ) }, { status: "ready", leaseToken: null, leaseExpiresAt: null });
+});
+
+test("a search owner may complete after expiry when no successor replaced its token", async () => {
+  let clock = 500_000;
+  const context = createContext([candidate(1)], undefined, { now: () => clock });
+  seedBundle(context.db);
+  context.provider.beforeSearch = () => { clock = 560_001; };
+
+  const run = await context.jobs.startSearch("bundle-1", admin);
+  await Promise.all(context.scheduled);
+
+  assert.equal(context.provider.inputs.length, 1);
+  assert.deepEqual({ ...context.db.first(
+    "SELECT status,lease_token AS leaseToken,lease_expires_at AS leaseExpiresAt FROM evidence_search_runs WHERE id=?",
+    run.id,
+  ) }, { status: "ready", leaseToken: null, leaseExpiresAt: null });
 });
 
 test("selection uses bundle CAS and never fetches or stores an unselected candidate", async () => {
@@ -567,6 +692,137 @@ test("post-commit candidate acquisition is reconciled without duplicate fetch wo
     ["imported", "imported"],
   );
   assert.equal((await context.jobs.getSearch("bundle-1", detail.run.id))?.run.status, "completed");
+});
+
+test("same-millisecond candidate token rejects an ambiguous no-op acquisition", async () => {
+  const clock = 300_000;
+  const secondAcquisitionBlocked = deferred();
+  const releaseSecondAcquisition = deferred();
+  const firstFetchEntered = deferred();
+  const releaseFirstFetch = deferred();
+  const fetchCalls: string[] = [];
+  const context = createContext([candidate(1)], async (input) => {
+    fetchCalls.push(input.url);
+    if (fetchCalls.length === 1) {
+      context.db.afterNextRunCommit = {
+        pattern: /UPDATE evidence_search_candidates\s+SET status='importing'/,
+        callback: () => { throw new Error("ambiguous no-op candidate acquisition"); },
+      };
+      releaseSecondAcquisition.resolve();
+      firstFetchEntered.resolve();
+      await releaseFirstFetch.promise;
+    }
+    return successfulFetch(input);
+  }, { now: () => clock });
+  seedBundle(context.db);
+  const detail = await runSearch(context);
+  await select(context, detail, [0]);
+
+  context.db.beforeNextRun = {
+    pattern: /UPDATE evidence_search_candidates\s+SET status='importing'/,
+    callback: async () => {
+      context.db.beforeNextRun = {
+        pattern: /UPDATE evidence_search_candidates\s+SET status='importing'/,
+        callback: async () => {
+          secondAcquisitionBlocked.resolve();
+          await releaseSecondAcquisition.promise;
+        },
+      };
+      await context.jobs.startImport("bundle-1", detail.run.id, admin);
+      await secondAcquisitionBlocked.promise;
+    },
+  };
+
+  const before = context.scheduled.length;
+  await context.jobs.startImport("bundle-1", detail.run.id, admin);
+  await firstFetchEntered.promise;
+  await context.scheduled[before + 1];
+  assert.deepEqual(fetchCalls, [detail.candidates[0]!.url]);
+
+  releaseFirstFetch.resolve();
+  await Promise.all(context.scheduled.slice(before));
+  assert.deepEqual({ ...context.db.first(
+    `SELECT status,lease_token AS leaseToken,lease_expires_at AS leaseExpiresAt
+      FROM evidence_search_candidates WHERE id=?`,
+    detail.candidates[0]!.id,
+  ) }, { status: "imported", leaseToken: null, leaseExpiresAt: null });
+  assert.equal(context.db.first<{ count: number }>("SELECT count(*) AS count FROM evidence_sources").count, 1);
+});
+
+test("an interrupted candidate lease stays active, then recovers exactly once after expiry", async () => {
+  let clock = 400_000;
+  const fetchCalls: string[] = [];
+  const context = createContext([candidate(1)], async (input) => {
+    fetchCalls.push(input.url);
+    return successfulFetch(input);
+  }, { now: () => clock });
+  seedBundle(context.db);
+  const detail = await runSearch(context);
+  await select(context, detail, [0]);
+  context.db.afterNextRunCommit = {
+    pattern: /UPDATE evidence_search_candidates\s+SET status='importing'/,
+    callback: () => {
+      context.db.beforeNextFirst = {
+        pattern: /FROM evidence_search_candidates WHERE id=\?/,
+        callback: () => { throw new Error("process interrupted before candidate lease reconciliation"); },
+      };
+      throw new Error("ambiguous committed candidate acquisition");
+    },
+  };
+
+  let before = context.scheduled.length;
+  await context.jobs.startImport("bundle-1", detail.run.id, admin);
+  await Promise.all(context.scheduled.slice(before));
+  const stranded = context.db.first<{ status: string; leaseToken: string | null; leaseExpiresAt: number | null }>(
+    `SELECT status,lease_token AS leaseToken,lease_expires_at AS leaseExpiresAt
+      FROM evidence_search_candidates WHERE id=?`,
+    detail.candidates[0]!.id,
+  );
+  assert.equal(stranded.status, "importing");
+  assert.match(stranded.leaseToken ?? "", /^[0-9a-f-]{36}$/i);
+  assert.equal(stranded.leaseExpiresAt, 460_000);
+  assert.deepEqual(fetchCalls, []);
+
+  before = context.scheduled.length;
+  await context.jobs.startImport("bundle-1", detail.run.id, admin);
+  await Promise.all(context.scheduled.slice(before));
+  assert.deepEqual(fetchCalls, [], "an unexpired candidate lease cannot be stolen");
+  assert.equal((await context.jobs.getSearch("bundle-1", detail.run.id))?.run.status, "importing");
+
+  clock = stranded.leaseExpiresAt!;
+  before = context.scheduled.length;
+  await context.jobs.startImport("bundle-1", detail.run.id, admin);
+  await Promise.all(context.scheduled.slice(before));
+  assert.deepEqual(fetchCalls, [detail.candidates[0]!.url]);
+  assert.equal((await context.jobs.getSearch("bundle-1", detail.run.id))?.run.status, "completed");
+  assert.deepEqual({ ...context.db.first(
+    `SELECT status,lease_token AS leaseToken,lease_expires_at AS leaseExpiresAt
+      FROM evidence_search_candidates WHERE id=?`,
+    detail.candidates[0]!.id,
+  ) }, { status: "imported", leaseToken: null, leaseExpiresAt: null });
+});
+
+test("a candidate owner may register after expiry when no successor replaced its token", async () => {
+  let clock = 600_000;
+  const context = createContext([candidate(1)], async (input) => {
+    clock = 660_001;
+    return successfulFetch(input);
+  }, { now: () => clock });
+  seedBundle(context.db);
+  const detail = await runSearch(context);
+  await select(context, detail, [0]);
+
+  const before = context.scheduled.length;
+  await context.jobs.startImport("bundle-1", detail.run.id, admin);
+  await Promise.all(context.scheduled.slice(before));
+
+  assert.equal(context.db.first<{ count: number }>("SELECT count(*) AS count FROM evidence_sources").count, 1);
+  assert.equal((await context.jobs.getSearch("bundle-1", detail.run.id))?.run.status, "completed");
+  assert.deepEqual({ ...context.db.first(
+    `SELECT status,lease_token AS leaseToken,lease_expires_at AS leaseExpiresAt
+      FROM evidence_search_candidates WHERE id=?`,
+    detail.candidates[0]!.id,
+  ) }, { status: "imported", leaseToken: null, leaseExpiresAt: null });
 });
 
 test("post-commit candidate failure update is reconciled before a sibling succeeds and retry", async () => {

@@ -97,6 +97,8 @@ export const evidenceSearchRuns = sqliteTable("evidence_search_runs", {
   promptVersion: text("prompt_version").notNull(),
   queryJson: text("query_json").notNull(),
   errorMessage: text("error_message"),
+  leaseToken: text("lease_token"),
+  leaseExpiresAt: integer("lease_expires_at", { mode: "timestamp_ms" }),
   isStale: integer("is_stale", { mode: "boolean" }).notNull().default(false),
   startedAt: integer("started_at", { mode: "timestamp_ms" }),
   completedAt: integer("completed_at", { mode: "timestamp_ms" }),
@@ -105,6 +107,7 @@ export const evidenceSearchRuns = sqliteTable("evidence_search_runs", {
 }, (table) => [
   uniqueIndex("idx_evidence_search_runs_input").on(table.bundleId, table.inputVersion),
   uniqueIndex("idx_evidence_search_runs_id_bundle").on(table.id, table.bundleId),
+  index("idx_evidence_search_runs_recovery").on(table.status, table.leaseExpiresAt),
 ]);
 
 export const evidenceSearchCandidates = sqliteTable("evidence_search_candidates", {
@@ -128,6 +131,8 @@ export const evidenceSearchCandidates = sqliteTable("evidence_search_candidates"
   sourceId: text("source_id"),
   contentHash: text("content_hash"),
   failureReason: text("failure_reason"),
+  leaseToken: text("lease_token"),
+  leaseExpiresAt: integer("lease_expires_at", { mode: "timestamp_ms" }),
   createdAt: integer("created_at", { mode: "timestamp_ms" }).notNull(),
   updatedAt: integer("updated_at", { mode: "timestamp_ms" }).notNull(),
 }, (table) => [
@@ -138,6 +143,7 @@ export const evidenceSearchCandidates = sqliteTable("evidence_search_candidates"
   }).onDelete("cascade"),
   uniqueIndex("idx_search_candidate_run_url").on(table.runId, table.canonicalUrl),
   index("idx_search_candidate_bundle_status").on(table.bundleId, table.status),
+  index("idx_search_candidate_run_recovery").on(table.runId, table.status, table.leaseExpiresAt),
 ]);
 
 export const evidenceMutationReceipts = sqliteTable("evidence_mutation_receipts", {
