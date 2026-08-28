@@ -63,9 +63,45 @@ Required server configuration names are:
   evidence workspace.
 - `EVIDENCE_LLM_ENDPOINT`, `EVIDENCE_LLM_API_KEY`, and `EVIDENCE_LLM_MODEL`:
   server-only analyzer configuration. Never expose their values to client code.
+- `EVIDENCE_SEARCH_MODEL` and `EVIDENCE_EXTERNAL_ALLOWED_HOSTS`: server-only
+  configuration for the opt-in external-source search described below.
 - `DB`: the logical D1 binding for workflow state, versions, and audit events.
 - `EVIDENCE_FILES`: the logical R2 binding for original files and extracted
   text.
+
+### External evidence search configuration and operator flow
+
+External search reuses the existing server-only `EVIDENCE_LLM_ENDPOINT` and
+`EVIDENCE_LLM_API_KEY`; it has a separate model setting from
+`EVIDENCE_LLM_MODEL`. Set the following non-secret values in local server
+environment configuration (for example, an ignored `.dev.vars` file):
+
+```dotenv
+EVIDENCE_SEARCH_MODEL=gpt-5-mini
+EVIDENCE_EXTERNAL_ALLOWED_HOSTS=1:official.example,2:coach.example.edu,3:research.example.org
+```
+
+Each allowed-host entry is `trust-tier:hostname`; tier `1` is the highest
+trust tier and the hostname is matched by the server policy. Keep
+`EVIDENCE_LLM_API_KEY` only in local secret environment configuration and
+never commit it. If either external-search setting is absent, only external
+search is unavailable: direct evidence, analysis, and review continue to
+work.
+
+For Sites/Cloudflare, provision `EVIDENCE_SEARCH_MODEL` and
+`EVIDENCE_EXTERNAL_ALLOWED_HOSTS` as server-side environment variables on the
+same deployment that already has `EVIDENCE_LLM_ENDPOINT` and the secret
+`EVIDENCE_LLM_API_KEY`. Do not place any of these values in client-side build
+variables. Apply the D1 migrations before routing traffic to a release that
+reads the external-search tables; retain the existing `DB` and
+`EVIDENCE_FILES` bindings.
+
+An operator follows this explicit flow: open or create a bundle → add direct
+evidence → start an external search deliberately → inspect and select at most
+five candidates → import the selected sources → confirm the final inventory →
+analyze → complete human card review. Search candidates that are not selected
+are never imported or analyzed, and an operator may skip search and use only
+direct evidence.
 
 Evidence files may be PDF, TXT, Markdown, or `.markdown`, with an exact maximum
 of 20 MiB per file. Text must be UTF-8. PDF extraction supports text layers;

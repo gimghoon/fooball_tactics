@@ -428,6 +428,14 @@ test("migration 0009 is D1-transaction safe and legacy approval needs a fresh au
   }]);
   assert.deepEqual(database.prepare("PRAGMA foreign_key_check").all(), []);
 
+  database.exec(`
+    ALTER TABLE evidence_sources ADD origin text DEFAULT 'uploaded' NOT NULL;
+    ALTER TABLE evidence_sources ADD canonical_url text;
+    ALTER TABLE evidence_sources ADD publisher text;
+    ALTER TABLE evidence_sources ADD published_at text;
+    ALTER TABLE evidence_sources ADD retrieved_at integer;
+  `);
+
   const d1 = new SQLiteD1Database(database, false);
   let generatedId = 0;
   let now = 20;
@@ -522,9 +530,141 @@ test("owner edits retain the untouched LLM draft and exact immutable review snap
   assert.equal(database.first<{ count: number }>("SELECT count(*) AS count FROM evidence_audit_events WHERE action='card.reviewed'").count, 1);
 });
 
+test("external-only high owner edits persist one normalized medium representation", async () => {
+  const { database, service } = createContext();
+  seedCard(database);
+  database.run(
+    `UPDATE evidence_sources SET origin='external_web',canonical_url=?,publisher=?,published_at=?,retrieved_at=?
+      WHERE id='source-1'`,
+    "https://uefa.example/pressing", "UEFA", "2026-01-02", 4,
+  );
+  const submitted = card({
+    preferred: [{ action: "pass", reason: "외부 근거", citationIds: ["chunk-1"] }],
+    risky: [],
+    confidence: "high",
+  });
+
+  const reviewed = await service.reviewCard("card-1", {
+    status: "owner_reviewed", content: submitted, expectedUpdatedAt: 100,
+  }, admin);
+
+  const returnedContent = JSON.parse(reviewed.currentContentJson) as TacticCardContent;
+  const storedCard = database.first<{ contentJson: string }>(
+    "SELECT current_content_json AS contentJson FROM tactic_cards WHERE id='card-1'",
+  );
+  const storedReview = database.first<{ contentJson: string; snapshotJson: string }>(
+    `SELECT content_json AS contentJson,citation_snapshot_json AS snapshotJson
+      FROM tactic_card_reviews WHERE card_id='card-1' AND version_kind='owner_edit'`,
+  );
+  assert.equal(returnedContent.confidence, "medium");
+  assert.deepEqual(JSON.parse(storedCard.contentJson), returnedContent);
+  assert.deepEqual(JSON.parse(storedReview.contentJson), returnedContent);
+  assert.deepEqual((JSON.parse(storedReview.snapshotJson) as Array<{ chunkId: string }>).map(({ chunkId }) => chunkId), ["chunk-1"]);
+});
+
+test("held and rejected conflict edits preserve text but persist both suitability flags false", async () => {
+  const conflict = "직접 근거는 중앙 유지, 외부 근거는 즉시 측면 이동을 지시함";
+  for (const status of ["held", "rejected"] as const) {
+    const { database, service } = createContext();
+    seedCard(database);
+
+    const reviewed = await service.reviewCard("card-1", {
+      status,
+      content: card({ conflicts: [conflict], scenarioSuitable: true, animationSuitable: true }),
+      expectedUpdatedAt: 100,
+    }, admin);
+
+    const returnedContent = JSON.parse(reviewed.currentContentJson) as TacticCardContent;
+    const storedReview = JSON.parse(database.first<{ contentJson: string }>(
+      `SELECT content_json AS contentJson FROM tactic_card_reviews
+        WHERE card_id='card-1' AND version_kind='status_change'`,
+    ).contentJson) as TacticCardContent;
+    assert.deepEqual(returnedContent.conflicts, [conflict]);
+    assert.equal(returnedContent.scenarioSuitable, false);
+    assert.equal(returnedContent.animationSuitable, false);
+    assert.deepEqual(storedReview, returnedContent);
+  }
+});
+
+test("mixed external and uploaded citations allow reviewed high confidence", async () => {
+  const { database, service } = createContext();
+  seedCard(database);
+  database.run(
+    `UPDATE evidence_sources SET origin='external_web',canonical_url=?,publisher=?,published_at=?,retrieved_at=?
+      WHERE id='source-1'`,
+    "https://uefa.example/pressing", "UEFA", "2026-01-02", 4,
+  );
+  database.run(
+    `INSERT INTO evidence_sources
+      (id,bundle_id,origin,original_file_name,media_type,byte_size,content_hash,storage_key,extraction_status,created_at,updated_at)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+    "uploaded-source", "bundle-1", "uploaded", "direct.md", "text/markdown", 1, "direct-hash", "direct-key", "completed", 1, 1,
+  );
+  database.run(
+    `INSERT INTO evidence_chunks
+      (id,bundle_id,input_version,source_id,video_clip_id,ordinal,location_label,content,content_hash,created_at)
+      VALUES (?,?,?,?,?,?,?,?,?,?)`,
+    "uploaded-chunk", "bundle-1", "bundle-v1", "uploaded-source", null, 0, "p.2", "직접 근거", "direct-chunk-hash", 1,
+  );
+  database.run(
+    "INSERT INTO tactic_card_citations (id,bundle_id,card_id,chunk_id,created_at) VALUES (?,?,?,?,?)",
+    "uploaded-citation", "bundle-1", "card-1", "uploaded-chunk", 1,
+  );
+  const submitted = card({
+    preferred: [{ action: "pass", reason: "외부 근거", citationIds: ["chunk-1"] }],
+    risky: [{ action: "move", reason: "직접 근거", citationIds: ["uploaded-chunk"] }],
+    confidence: "high",
+  });
+
+  const reviewed = await service.reviewCard("card-1", {
+    status: "owner_reviewed", content: submitted, expectedUpdatedAt: 100,
+  }, admin);
+
+  assert.equal((JSON.parse(reviewed.currentContentJson) as TacticCardContent).confidence, "high");
+});
+
+test("review policy derives origin authority from the exact current citation snapshot", async () => {
+  const { database, service } = createContext();
+  seedCard(database);
+  database.run(
+    `UPDATE evidence_sources SET origin='external_web',canonical_url=?,publisher=?,published_at=?,retrieved_at=?
+      WHERE id='source-1'`,
+    "https://uefa.example/pressing", "UEFA", "2026-01-02", 4,
+  );
+  database.run(
+    `INSERT INTO evidence_sources
+      (id,bundle_id,origin,original_file_name,media_type,byte_size,content_hash,storage_key,extraction_status,created_at,updated_at)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+    "uncited-uploaded-source", "bundle-1", "uploaded", "uncited.md", "text/markdown", 1,
+    "uncited-hash", "uncited-key", "completed", 1, 1,
+  );
+  const submitted = card({
+    preferred: [{ action: "pass", reason: "외부 근거만 인용", citationIds: ["chunk-1"] }],
+    risky: [],
+    confidence: "high",
+  });
+
+  const reviewed = await service.reviewCard("card-1", {
+    status: "held", content: submitted, expectedUpdatedAt: 100,
+  }, admin);
+
+  const normalized = JSON.parse(reviewed.currentContentJson) as TacticCardContent;
+  const snapshot = JSON.parse(database.first<{ snapshotJson: string }>(
+    `SELECT citation_snapshot_json AS snapshotJson FROM tactic_card_reviews
+      WHERE card_id='card-1' AND version_kind='status_change'`,
+  ).snapshotJson) as Array<{ chunkId: string }>;
+  assert.equal(normalized.confidence, "medium");
+  assert.deepEqual(snapshot.map(({ chunkId }) => chunkId), ["chunk-1"]);
+});
+
 test("admin job card listing returns current cards with only current-version citation records", async () => {
   const { database, service } = createContext();
   seedCard(database);
+  database.run(
+    `UPDATE evidence_sources SET origin='external_web',canonical_url=?,publisher=?,published_at=?,retrieved_at=?
+      WHERE id='source-1'`,
+    "https://uefa.example/pressing", "UEFA", "2026-01-02", 4,
+  );
   database.run(
     `INSERT INTO evidence_chunks
       (id,bundle_id,input_version,source_id,video_clip_id,ordinal,location_label,content,content_hash,created_at)
@@ -544,6 +684,20 @@ test("admin job card listing returns current cards with only current-version cit
     { chunkId: "chunk-1", content: "반대편 패스" },
     { chunkId: "chunk-2", content: "중앙 드리블 위험" },
   ]);
+  assert.deepEqual(cards.cards[0]?.citations.map((citation) => ({
+    chunkId: citation.chunkId,
+    origin: citation.origin,
+    canonicalUrl: citation.canonicalUrl,
+    publisher: citation.publisher,
+    publishedAt: citation.publishedAt,
+    retrievedAt: citation.retrievedAt,
+  })), [{
+    chunkId: "chunk-1", origin: "external_web", canonicalUrl: "https://uefa.example/pressing",
+    publisher: "UEFA", publishedAt: "2026-01-02", retrievedAt: 4,
+  }, {
+    chunkId: "chunk-2", origin: "video_observation", canonicalUrl: null,
+    publisher: null, publishedAt: null, retrievedAt: null,
+  }]);
   assert.deepEqual(await service.listCardsForJob("missing-job", admin), { cards: [], totalCount: 0, nextOffset: null });
 });
 

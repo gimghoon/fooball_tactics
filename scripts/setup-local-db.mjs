@@ -44,7 +44,12 @@ const integrity = spawnSync(wrangler, [
   "--config", "wrangler.local.jsonc",
   "--local",
   "--persist-to", persistTo,
-  "--command", "PRAGMA foreign_key_check;",
+  "--command", `
+    PRAGMA foreign_key_check;
+    SELECT name FROM sqlite_master
+    WHERE type='table' AND name IN ('evidence_search_runs', 'evidence_search_candidates')
+    ORDER BY name;
+  `,
   "--json",
 ], { cwd: projectDir, encoding: "utf8" });
 
@@ -54,9 +59,19 @@ if (integrity.status !== 0) {
 }
 
 const integrityResult = JSON.parse(integrity.stdout);
-if (integrityResult.some((entry) => entry.results.length > 0)) {
+const foreignKeyViolations = integrityResult[0]?.results ?? [];
+if (foreignKeyViolations.length > 0) {
   process.stderr.write("로컬 데이터베이스 외래키 검사에 실패했습니다.\n");
   process.exit(1);
 }
 
+const expectedSearchTables = ["evidence_search_candidates", "evidence_search_runs"];
+const actualSearchTables = (integrityResult[1]?.results ?? []).map((row) => row.name);
+if (JSON.stringify(actualSearchTables) !== JSON.stringify(expectedSearchTables)) {
+  process.stderr.write("외부 검색 테이블이 모두 생성되지 않았습니다.\n");
+  process.exit(1);
+}
+
+process.stdout.write(`외부 검색 테이블 확인 (${actualSearchTables.join(", ")})\n`);
+process.stdout.write("외래키 검사 통과\n");
 process.stdout.write(`로컬 데이터베이스 준비 완료 (${migrations.length}개 마이그레이션)\n`);

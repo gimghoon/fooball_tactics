@@ -58,6 +58,7 @@ class SQLiteD1Statement implements EvidenceD1Statement {
 class SQLiteD1Database implements EvidenceD1Database {
   readonly database = new DatabaseSync(":memory:");
   beforeNextBatch: (() => void | Promise<void>) | null = null;
+  afterNextBatchCommit: (() => void | Promise<void>) | null = null;
 
   constructor() {
     this.database.exec("PRAGMA foreign_keys = ON");
@@ -81,6 +82,9 @@ class SQLiteD1Database implements EvidenceD1Database {
         return statement.execute();
       });
       this.database.exec("COMMIT");
+      const afterCommit = this.afterNextBatchCommit;
+      this.afterNextBatchCommit = null;
+      await afterCommit?.();
       return results;
     } catch (error) {
       this.database.exec("ROLLBACK");
@@ -105,10 +109,19 @@ class SQLiteD1Database implements EvidenceD1Database {
 
 class MemoryR2Bucket implements EvidenceR2Bucket {
   readonly objects = new Map<string, Uint8Array | string>();
+  readonly putKeys: string[] = [];
   afterObjectsDeleted: (() => void | Promise<void>) | null = null;
+  afterPutCount: { count: number; callback: () => void | Promise<void> } | null = null;
+  failDelete: ((key: string) => boolean) | null = null;
 
   async put(key: string, value: Uint8Array | string): Promise<void> {
+    this.putKeys.push(key);
     this.objects.set(key, value instanceof Uint8Array ? value.slice() : value);
+    if (this.afterPutCount !== null && this.putKeys.length === this.afterPutCount.count) {
+      const callback = this.afterPutCount.callback;
+      this.afterPutCount = null;
+      await callback();
+    }
   }
 
   async get(key: string): Promise<Uint8Array | string | null> {
@@ -118,6 +131,7 @@ class MemoryR2Bucket implements EvidenceR2Bucket {
   }
 
   async delete(key: string): Promise<void> {
+    if (this.failDelete?.(key)) throw new Error(`permanent delete failure for ${key}`);
     this.objects.delete(key);
     if (this.objects.size === 0 && this.afterObjectsDeleted !== null) {
       const afterObjectsDeleted = this.afterObjectsDeleted;
@@ -141,6 +155,29 @@ function createContext() {
     now: () => ++now,
   });
   return { database, repository, bucket, fileStore, service };
+}
+
+function applyMigrationInTransaction(database: DatabaseSync, migrationSql: string): void {
+  database.exec("BEGIN IMMEDIATE");
+  try {
+    for (const statement of migrationSql.split("--> statement-breakpoint").map((value) => value.trim()).filter(Boolean)) {
+      database.exec(statement);
+    }
+    database.exec("COMMIT");
+  } catch (error) {
+    database.exec("ROLLBACK");
+    throw error;
+  }
+}
+
+function databaseThroughMigration(prefix: string): DatabaseSync {
+  const database = new DatabaseSync(":memory:");
+  database.exec("PRAGMA foreign_keys = ON");
+  const migrations = readdirSync("drizzle").filter((value) => /^\d{4}_.*\.sql$/.test(value)).sort();
+  const targetIndex = migrations.findIndex((name) => name.startsWith(prefix));
+  assert.notEqual(targetIndex, -1, `Expected migration ${prefix}`);
+  for (const name of migrations.slice(0, targetIndex + 1)) database.exec(readFileSync(`drizzle/${name}`, "utf8"));
+  return database;
 }
 
 function sourceFor(bundleId: string): StoredEvidenceFile {
@@ -233,6 +270,438 @@ test("production source upload atomically inserts, versions, invalidates approve
     context.database.all<{ action: string }>("SELECT action FROM evidence_audit_events ORDER BY created_at").map((row) => row.action),
     ["bundle.created", "source.added"],
   );
+});
+
+test("title-only bundle edits advance search CAS without staling analysis content", async () => {
+  const context = createContext();
+  const bundle = await context.service.createBundle(bundleInput, admin);
+  seedApprovedWork(context.database, bundle);
+  context.database.run(
+    `INSERT INTO evidence_search_runs
+      (id,bundle_id,input_version,bundle_version,status,search_model,prompt_version,query_json,is_stale,created_at,updated_at)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+    "title-search", bundle.id, "title-input", bundle.version, "ready", "search-model", "search-prompt", "[]", 0, 1, 1,
+  );
+
+  const updated = await context.service.updateBundle(bundle.id, { title: "새 훈련 제목" }, admin);
+
+  assert.equal(updated.version, bundle.version + 1);
+  assert.equal(updated.contentVersion, bundle.contentVersion);
+  assert.deepEqual({ ...context.database.first(
+    "SELECT bundle_version AS bundleVersion,is_stale AS isStale FROM evidence_search_runs WHERE id='title-search'",
+  ) }, { bundleVersion: bundle.version, isStale: 1 });
+  assert.deepEqual({ ...context.database.first(
+    "SELECT status,is_stale AS isStale FROM evidence_analysis_jobs WHERE id='job-1'",
+  ) }, { status: "queued", isStale: 0 });
+  assert.deepEqual({ ...context.database.first(
+    "SELECT status,is_stale AS isStale FROM tactic_cards WHERE id='card-1'",
+  ) }, { status: "coach_reviewed", isStale: 0 });
+});
+
+test("production external registration persists every metadata field and deduplicates by URL or hash", async () => {
+  const context = createContext();
+  const bundle = await context.service.createBundle(bundleInput, admin);
+  const metadata = {
+    origin: "external_web" as const,
+    canonicalUrl: "https://fifa.com/guidance/width?a=1&z=2",
+    publisher: "FIFA",
+    publishedAt: "2026-08-20",
+    retrievedAt: 1_777_000_000_000,
+    searchCandidateId: "candidate-1",
+  };
+  const bytes = new TextEncoder().encode("Use the wide lane.");
+
+  const source = await context.fileStore.putValidatedFile({
+    bundleId: bundle.id,
+    name: "ignored-user-name.txt",
+    type: "text/plain",
+    bytes,
+    externalMetadata: metadata,
+  });
+  const row = context.database.first<Record<string, unknown>>(
+    `SELECT origin,canonical_url AS canonicalUrl,publisher,published_at AS publishedAt,
+      retrieved_at AS retrievedAt,search_candidate_id AS searchCandidateId,external_text_hash AS externalTextHash
+      FROM evidence_sources WHERE id=?`,
+    source.id,
+  );
+  assert.deepEqual({ ...row }, {
+    origin: "external_web",
+    canonicalUrl: metadata.canonicalUrl,
+    publisher: metadata.publisher,
+    publishedAt: metadata.publishedAt,
+    retrievedAt: metadata.retrievedAt,
+    searchCandidateId: metadata.searchCandidateId,
+    externalTextHash: source.externalTextHash,
+  });
+  assert.match(String(row.externalTextHash), /^[a-f0-9]{64}$/);
+  assert.deepEqual({ ...await context.repository.findSource(source.id) }, source);
+
+  const objectCount = context.bucket.objects.size;
+  const sameUrl = await context.fileStore.putValidatedFile({
+    bundleId: bundle.id,
+    name: "changed.txt",
+    type: "text/plain",
+    bytes: new TextEncoder().encode("Changed upstream body."),
+    externalMetadata: { ...metadata, searchCandidateId: "candidate-2" },
+  });
+  const sameHash = await context.fileStore.putValidatedFile({
+    bundleId: bundle.id,
+    name: "mirror.txt",
+    type: "text/plain",
+    bytes,
+    externalMetadata: { ...metadata, canonicalUrl: "https://fifa.com/guidance/mirror", searchCandidateId: "candidate-3" },
+  });
+
+  assert.equal(sameUrl.id, source.id);
+  assert.equal(sameHash.id, source.id);
+  assert.equal(context.bucket.objects.size, objectCount);
+  assert.equal(context.database.first<{ count: number }>("SELECT count(*) AS count FROM evidence_sources").count, 1);
+});
+
+test("external registration cannot commit with a replaced candidate lease token", async () => {
+  const context = createContext();
+  const bundle = await context.service.createBundle(bundleInput, admin);
+  context.database.run(
+    `INSERT INTO evidence_search_runs
+      (id,bundle_id,input_version,bundle_version,status,search_model,prompt_version,query_json,is_stale,created_at,updated_at)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+    "lease-run", bundle.id, "lease-input", bundle.version, "importing", "search-model", "search-prompt", "[]", 0, 1, 1,
+  );
+  context.database.run(
+    `INSERT INTO evidence_search_candidates
+      (id,run_id,bundle_id,url,canonical_url,title,publisher,published_at,document_type,quote,relevance,trust_tier,rank,
+        status,selected_by,selected_at,lease_token,lease_expires_at,created_at,updated_at)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+    "leased-candidate", "lease-run", bundle.id, "https://fifa.com/leased", "https://fifa.com/leased",
+    "Leased", "FIFA", "2026-08-20", "web_page", "verified quote", "relevant", 1, 0,
+    "importing", admin.userId, 1, "successor-token", 90_000, 1, 1,
+  );
+
+  await assert.rejects(() => context.fileStore.putValidatedFile({
+    bundleId: bundle.id,
+    name: "leased.txt",
+    type: "text/plain",
+    bytes: new TextEncoder().encode("verified quote"),
+    externalMetadata: {
+      origin: "external_web",
+      canonicalUrl: "https://fifa.com/leased",
+      publisher: "FIFA",
+      publishedAt: "2026-08-20",
+      retrievedAt: 2_000,
+      searchCandidateId: "leased-candidate",
+      searchCandidateLeaseToken: "expired-owner-token",
+    },
+  }));
+
+  assert.equal(context.database.first<{ count: number }>("SELECT count(*) AS count FROM evidence_sources").count, 0);
+  assert.equal(context.bucket.objects.size, 0);
+  assert.deepEqual({ ...context.database.first(
+    "SELECT status,lease_token AS leaseToken FROM evidence_search_candidates WHERE id='leased-candidate'",
+  ) }, { status: "importing", leaseToken: "successor-token" });
+});
+
+test("administrator bundle detail exposes external provenance and deletion keeps the compensated source workflow", async () => {
+  const context = createContext();
+  const bundle = await context.service.createBundle(bundleInput, admin);
+  const source = await context.fileStore.putValidatedFile({
+    bundleId: bundle.id,
+    name: "ignored.txt",
+    type: "text/plain",
+    bytes: new TextEncoder().encode("Verified external coaching guidance."),
+    externalMetadata: {
+      origin: "external_web",
+      canonicalUrl: "https://fifa.com/guidance/external",
+      publisher: "FIFA",
+      publishedAt: "2026-08-20",
+      retrievedAt: 1_777_000_000_000,
+      searchCandidateId: "candidate-detail",
+    },
+  });
+
+  const detail = await context.service.getBundleForAdmin(bundle.id, admin);
+  assert.ok(detail);
+  assert.deepEqual(detail.sources.map((item) => ({
+    id: item.id,
+    origin: item.origin,
+    canonicalUrl: item.canonicalUrl,
+    publisher: item.publisher,
+    publishedAt: item.publishedAt,
+    retrievedAt: item.retrievedAt,
+  })), [{
+    id: source.id,
+    origin: "external_web",
+    canonicalUrl: "https://fifa.com/guidance/external",
+    publisher: "FIFA",
+    publishedAt: "2026-08-20",
+    retrievedAt: 1_777_000_000_000,
+  }]);
+
+  await context.service.removeSource(source.id, admin);
+  assert.equal(await context.repository.findSource(source.id), null);
+  assert.equal(context.bucket.objects.size, 0);
+  assert.equal(context.database.first<{ count: number }>(
+    "SELECT count(*) AS count FROM evidence_audit_events WHERE action='source.removed' AND target_id=?",
+    source.id,
+  ).count, 1);
+});
+
+test("a direct evidence mutation stales a pending external search run", async () => {
+  const context = createContext();
+  const bundle = await context.service.createBundle(bundleInput, admin);
+  context.database.run(
+    `INSERT INTO evidence_search_runs
+      (id,bundle_id,input_version,bundle_version,status,search_model,prompt_version,query_json,is_stale,created_at,updated_at)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+    "pending-search", bundle.id, "search-input", bundle.version, "ready", "search-model", "search-prompt", "[]", 0, 1, 1,
+  );
+
+  await uploadText(context, bundle.id);
+
+  assert.deepEqual({ ...context.database.first(
+    "SELECT status,is_stale AS isStale,error_message AS errorMessage FROM evidence_search_runs WHERE id='pending-search'",
+  ) }, {
+    status: "ready",
+    isStale: 1,
+    errorMessage: "근거 묶음이 갱신되었습니다.",
+  });
+});
+
+test("production registration retains committed R2 objects when D1 commits and the transport then throws", async () => {
+  const context = createContext();
+  const bundle = await context.service.createBundle(bundleInput, admin);
+  context.database.afterNextBatchCommit = () => { throw new Error("simulated post-commit transport failure"); };
+
+  const source = await uploadText(context, bundle.id);
+
+  assert.equal((await context.repository.findSource(source.id))?.id, source.id);
+  assert.equal(context.bucket.objects.has(source.storageKey), true);
+  assert.equal(source.extractedTextKey === null ? false : context.bucket.objects.has(source.extractedTextKey), true);
+  assert.equal(context.database.first<{ count: number }>("SELECT count(*) AS count FROM evidence_r2_cleanup_receipts").count, 0);
+});
+
+test("migration 0012 preserves cleanup receipts while removing the historical bundle cascade", () => {
+  const oldMigration = readFileSync("drizzle/0011_evidence_r2_cleanup_receipts.sql", "utf8");
+  assert.match(oldMigration, /FOREIGN KEY \(`bundle_id`\).*ON DELETE cascade/);
+  assert.doesNotMatch(oldMigration, /idx_evidence_r2_cleanup_bundle/);
+
+  const migrations = readdirSync("drizzle").filter((value) => /^\d{4}_.*\.sql$/.test(value)).sort();
+  const migrationName = migrations.find((name) => name.startsWith("0012_"));
+  assert.notEqual(migrationName, undefined, "Expected additive migration 0012");
+  const migration = readFileSync(`drizzle/${migrationName}`, "utf8");
+  assert.doesNotMatch(migration, /PRAGMA foreign_keys\s*=\s*OFF/i, "migration must remain safe inside a D1 transaction");
+  const database = databaseThroughMigration("0011_");
+  database.prepare(
+    "INSERT INTO evidence_bundles (id,title,purpose,version,content_version,created_at,updated_at) VALUES (?,?,?,?,?,?,?)",
+  ).run("cleanup-bundle", "Cleanup", "receipt upgrade", 1, "v1", 1, 2);
+  database.prepare(
+    `INSERT INTO evidence_r2_cleanup_receipts
+      (id,bundle_id,source_id,storage_key,extracted_text_key,status,error_message,created_at,updated_at)
+      VALUES (?,?,?,?,?,?,?,?,?)`,
+  ).run("pending-cleanup", "cleanup-bundle", "source-pending", "original-key", null, "pending", "delete failed", 11, 12);
+  database.prepare(
+    `INSERT INTO evidence_r2_cleanup_receipts
+      (id,bundle_id,source_id,storage_key,extracted_text_key,status,error_message,created_at,updated_at)
+      VALUES (?,?,?,?,?,?,?,?,?)`,
+  ).run("completed-cleanup", "cleanup-bundle", "source-completed", null, null, "completed", null, 13, 14);
+  const receiptQuery = `SELECT id,bundle_id AS bundleId,source_id AS sourceId,storage_key AS storageKey,
+    extracted_text_key AS extractedTextKey,status,error_message AS errorMessage,created_at AS createdAt,
+    updated_at AS updatedAt FROM evidence_r2_cleanup_receipts ORDER BY id`;
+  const before = database.prepare(receiptQuery).all().map((row) => ({ ...row }));
+
+  applyMigrationInTransaction(database, migration);
+  assert.deepEqual(database.prepare(receiptQuery).all().map((row) => ({ ...row })), before);
+  assert.equal(database.prepare("SELECT count(*) AS count FROM evidence_r2_cleanup_receipts").get()?.count, 2);
+  assert.deepEqual(database.prepare("PRAGMA foreign_key_list('evidence_r2_cleanup_receipts')").all(), []);
+  const indexNames = database.prepare("PRAGMA index_list('evidence_r2_cleanup_receipts')").all()
+    .map((row) => String(row.name));
+  assert.equal(indexNames.includes("idx_evidence_r2_cleanup_status"), true);
+  assert.equal(indexNames.includes("idx_evidence_r2_cleanup_bundle"), true);
+  assert.deepEqual(database.prepare("PRAGMA foreign_key_check").all(), []);
+
+  database.prepare("DELETE FROM evidence_bundles WHERE id=?").run("cleanup-bundle");
+  assert.deepEqual(database.prepare(receiptQuery).all().map((row) => ({ ...row })), before);
+  assert.deepEqual(database.prepare("PRAGMA foreign_key_check").all(), []);
+
+  const emptyDatabase = databaseThroughMigration("0011_");
+  applyMigrationInTransaction(emptyDatabase, migration);
+  assert.equal(emptyDatabase.prepare("SELECT count(*) AS count FROM evidence_r2_cleanup_receipts").get()?.count, 0);
+  assert.deepEqual(emptyDatabase.prepare("PRAGMA foreign_key_check").all(), []);
+
+  const journal = JSON.parse(readFileSync("drizzle/meta/_journal.json", "utf8")) as {
+    entries: { idx: number; tag: string }[];
+  };
+  assert.equal(journal.entries.filter((entry) => entry.idx === 12 && entry.tag.startsWith("0012_")).length, 1);
+});
+
+test("migration 0013 adds recoverable search leases without rewriting existing work", () => {
+  const migrations = readdirSync("drizzle").filter((value) => /^\d{4}_.*\.sql$/.test(value)).sort();
+  const migrationName = migrations.find((name) => name.startsWith("0013_"));
+  assert.notEqual(migrationName, undefined, "Expected additive migration 0013");
+  const migration = readFileSync(`drizzle/${migrationName}`, "utf8");
+  assert.doesNotMatch(migration, /PRAGMA foreign_keys\s*=\s*OFF/i);
+  const database = databaseThroughMigration("0012_");
+  database.prepare(
+    "INSERT INTO evidence_bundles (id,title,purpose,version,content_version,created_at,updated_at) VALUES (?,?,?,?,?,?,?)",
+  ).run("lease-bundle", "Lease", "Recovery", 1, "v1", 1, 1);
+  database.prepare(
+    `INSERT INTO evidence_search_runs
+      (id,bundle_id,input_version,bundle_version,status,search_model,prompt_version,query_json,is_stale,created_at,updated_at)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+  ).run("lease-run", "lease-bundle", "input-v1", 1, "searching", "model", "prompt", "[]", 0, 1, 2);
+  database.prepare(
+    `INSERT INTO evidence_search_candidates
+      (id,run_id,bundle_id,url,canonical_url,title,publisher,published_at,document_type,quote,relevance,trust_tier,rank,
+        status,selected_by,selected_at,created_at,updated_at)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+  ).run(
+    "lease-candidate", "lease-run", "lease-bundle", "https://fifa.com/lease", "https://fifa.com/lease",
+    "Lease", "FIFA", "2026-08-20", "web_page", "quote", "relevant", 1, 0, "importing", "admin", 1, 1, 2,
+  );
+
+  applyMigrationInTransaction(database, migration);
+
+  assert.deepEqual({ ...database.prepare(
+    "SELECT status,lease_token AS leaseToken,lease_expires_at AS leaseExpiresAt FROM evidence_search_runs WHERE id='lease-run'",
+  ).get()! }, { status: "searching", leaseToken: null, leaseExpiresAt: null });
+  assert.deepEqual({ ...database.prepare(
+    `SELECT status,lease_token AS leaseToken,lease_expires_at AS leaseExpiresAt
+      FROM evidence_search_candidates WHERE id='lease-candidate'`,
+  ).get()! }, { status: "importing", leaseToken: null, leaseExpiresAt: null });
+  const runIndexes = database.prepare("PRAGMA index_list('evidence_search_runs')").all().map((row) => String(row.name));
+  const candidateIndexes = database.prepare("PRAGMA index_list('evidence_search_candidates')").all().map((row) => String(row.name));
+  assert.equal(runIndexes.includes("idx_evidence_search_runs_recovery"), true);
+  assert.equal(candidateIndexes.includes("idx_search_candidate_run_recovery"), true);
+  assert.deepEqual(database.prepare("PRAGMA foreign_key_check").all(), []);
+
+  const journal = JSON.parse(readFileSync("drizzle/meta/_journal.json", "utf8")) as {
+    entries: { idx: number; tag: string }[];
+  };
+  assert.equal(journal.entries.filter((entry) => entry.idx === 13 && entry.tag.startsWith("0013_")).length, 1);
+});
+
+test("production repository keeps cleanup ownership metadata after bundle deletion and reports missing receipts", async () => {
+  const context = createContext();
+  const bundle = await context.service.createBundle(bundleInput, admin);
+  await context.repository.createR2CleanupReceipt({
+    id: "cleanup-1",
+    bundleId: bundle.id,
+    sourceId: "unowned-source",
+    storageKey: "unowned-original",
+    extractedTextKey: "unowned-extracted",
+    createdAt: 2_000,
+  });
+  assert.deepEqual({ ...context.database.first("SELECT status,error_message AS errorMessage FROM evidence_r2_cleanup_receipts WHERE id='cleanup-1'") }, {
+    status: "pending",
+    errorMessage: null,
+  });
+
+  context.database.run("DELETE FROM evidence_bundles WHERE id=?", bundle.id);
+  assert.equal(context.database.first<{ count: number }>("SELECT count(*) AS count FROM evidence_r2_cleanup_receipts WHERE id='cleanup-1'").count, 1);
+
+  await context.repository.finishR2CleanupReceipt("cleanup-1", {
+    storageKey: "unowned-original",
+    extractedTextKey: null,
+    error: "delete failure",
+  }, 2_001);
+  assert.deepEqual({ ...context.database.first("SELECT bundle_id AS bundleId,storage_key AS storageKey,extracted_text_key AS extractedTextKey,status,error_message AS errorMessage,updated_at AS updatedAt FROM evidence_r2_cleanup_receipts WHERE id='cleanup-1'") }, {
+    bundleId: bundle.id,
+    storageKey: "unowned-original",
+    extractedTextKey: null,
+    status: "pending",
+    errorMessage: "delete failure",
+    updatedAt: 2_001,
+  });
+
+  await context.repository.finishR2CleanupReceipt("cleanup-1", {
+    storageKey: null,
+    extractedTextKey: null,
+    error: null,
+  }, 2_002);
+  assert.deepEqual({ ...context.database.first("SELECT storage_key AS storageKey,extracted_text_key AS extractedTextKey,status,error_message AS errorMessage,updated_at AS updatedAt FROM evidence_r2_cleanup_receipts WHERE id='cleanup-1'") }, {
+    storageKey: null,
+    extractedTextKey: null,
+    status: "completed",
+    errorMessage: null,
+    updatedAt: 2_002,
+  });
+
+  await assert.rejects(
+    () => context.repository.finishR2CleanupReceipt("missing-cleanup", {
+      storageKey: "still-unowned",
+      extractedTextKey: null,
+      error: "delete failure",
+    }, 2_003),
+    /정리 영수증.*찾을 수 없습니다/,
+  );
+});
+
+test("missing-bundle registration leaves a durable pending receipt with only the undeleted R2 key", async () => {
+  const context = createContext();
+  context.bucket.failDelete = (key) => key === context.bucket.putKeys[0];
+
+  await assert.rejects(() => uploadText(context, "missing-bundle"), /정리/);
+
+  assert.equal(context.database.first<{ count: number }>("SELECT count(*) AS count FROM evidence_bundles").count, 0);
+  assert.equal(context.bucket.objects.has(context.bucket.putKeys[0]!), true);
+  assert.equal(context.bucket.objects.has(context.bucket.putKeys[1]!), false);
+  assert.deepEqual({ ...context.database.first(
+    "SELECT bundle_id AS bundleId,storage_key AS storageKey,extracted_text_key AS extractedTextKey,status,error_message AS errorMessage FROM evidence_r2_cleanup_receipts",
+  ) }, {
+    bundleId: "missing-bundle",
+    storageKey: context.bucket.putKeys[0],
+    extractedTextKey: null,
+    status: "pending",
+    errorMessage: `permanent delete failure for ${context.bucket.putKeys[0]}`,
+  });
+});
+
+test("production URL-race cleanup never restores a deleted loser object and leaves a pending receipt on failure", async () => {
+  const context = createContext();
+  const bundle = await context.service.createBundle(bundleInput, admin);
+  const canonicalUrl = "https://fifa.com/guidance/race";
+  context.bucket.afterPutCount = {
+    count: 2,
+    callback: () => context.database.run(
+      `INSERT INTO evidence_sources
+        (id,bundle_id,origin,original_file_name,media_type,byte_size,content_hash,storage_key,canonical_url,
+          publisher,published_at,retrieved_at,search_candidate_id,external_text_hash,extracted_text_key,
+          extraction_status,extraction_error,created_at,updated_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      "winner-source", bundle.id, "external_web", "winner.txt", "text/plain", 6, "winner-hash", "winner-original",
+      canonicalUrl, "FIFA", "2026-08-20", 1_777_000_000_000, "winner-candidate", "winner-text-hash",
+      "winner-extracted", "completed", null, 2_000, 2_000,
+    ),
+  };
+  context.bucket.failDelete = (key) => key === context.bucket.putKeys[0];
+
+  await assert.rejects(() => context.fileStore.putValidatedFile({
+    bundleId: bundle.id,
+    name: "loser.txt",
+    type: "text/plain",
+    bytes: new TextEncoder().encode("loser body"),
+    externalMetadata: {
+      origin: "external_web",
+      canonicalUrl,
+      publisher: "FIFA",
+      publishedAt: "2026-08-20",
+      retrievedAt: 1_777_000_000_001,
+      searchCandidateId: "loser-candidate",
+    },
+  }), /정리/);
+
+  assert.equal(context.database.first<{ count: number }>("SELECT count(*) AS count FROM evidence_sources").count, 1);
+  assert.equal((await context.repository.findSourceByHash(bundle.id, "unmatched", canonicalUrl))?.id, "winner-source");
+  assert.equal(context.bucket.objects.has(context.bucket.putKeys[0]!), true);
+  assert.equal(context.bucket.objects.has(context.bucket.putKeys[1]!), false);
+  assert.equal(context.bucket.putKeys.length, 2, "loser cleanup must not restore the deleted extracted object");
+  assert.deepEqual({ ...context.database.first(
+    "SELECT storage_key AS storageKey,extracted_text_key AS extractedTextKey,status,error_message AS errorMessage FROM evidence_r2_cleanup_receipts",
+  ) }, {
+    storageKey: context.bucket.putKeys[0],
+    extractedTextKey: null,
+    status: "pending",
+    errorMessage: `permanent delete failure for ${context.bucket.putKeys[0]}`,
+  });
 });
 
 test("a lost bundle CAS changes none of the guarded source, work, or audit rows", async () => {

@@ -15,6 +15,8 @@ import {
 } from "../domain/evidence.ts";
 import type { EvidenceAdmin } from "./evidence-auth.ts";
 import type {
+  EvidenceCleanupReceiptCompletion,
+  EvidenceCleanupReceiptInput,
   EvidenceFileStore,
   StoredEvidenceFile,
 } from "./evidence-storage.ts";
@@ -24,6 +26,10 @@ import {
   EvidenceRequestValidationError,
   EvidenceUnavailableError,
 } from "./evidence-errors.ts";
+import {
+  enforceExternalEvidenceRules,
+  type EvidenceChunkOrigin,
+} from "./evidence-analyzer.ts";
 export { EvidenceConflictError } from "./evidence-errors.ts";
 
 export type EvidenceAnalysisSettings = {
@@ -89,8 +95,19 @@ export type EvidenceCitationSnapshot = {
   content: string;
   contentHash: string;
 };
+type EvidenceCitationAuthority = EvidenceCitationSnapshot & {
+  inputVersion: string;
+  origin: EvidenceChunkOrigin;
+};
+export type EvidenceAdminCitation = EvidenceCitationSnapshot & {
+  origin: "uploaded" | "external_web" | "video_observation";
+  canonicalUrl: string | null;
+  publisher: string | null;
+  publishedAt: string | null;
+  retrievedAt: number | null;
+};
 export type EvidenceCardAdminDetail = EvidenceCardRecord & {
-  citations: EvidenceCitationSnapshot[];
+  citations: EvidenceAdminCitation[];
   citationCount: number;
 };
 export type EvidenceCardsPage = { cards: EvidenceCardAdminDetail[]; totalCount: number; nextOffset: number | null };
@@ -187,7 +204,10 @@ export type EvidenceServiceRepository = {
   findSourceByHash(
     bundleId: string,
     hash: string,
+    canonicalUrl?: string,
   ): Promise<StoredEvidenceFile | null>;
+  createR2CleanupReceipt(receipt: EvidenceCleanupReceiptInput & { id: string; createdAt: number }): Promise<void>;
+  finishR2CleanupReceipt(receiptId: string, completion: EvidenceCleanupReceiptCompletion, updatedAt: number): Promise<void>;
   describeDeleteImpact(sourceId: string): Promise<EvidenceDeleteImpact>;
   createBundle(
     bundle: EvidenceBundleRecord,
@@ -199,9 +219,9 @@ export type EvidenceServiceRepository = {
   findCard(cardId: string): Promise<EvidenceCardRecord | null>;
   listCardCitations(
     cardId: string,
-  ): Promise<(EvidenceCitationSnapshot & { inputVersion: string })[]>;
+  ): Promise<EvidenceCitationAuthority[]>;
   countCardCitations(cardId: string, inputVersion: string): Promise<number>;
-  listCardCitationsForAdmin(cardId: string, inputVersion: string, limit: number): Promise<EvidenceCitationSnapshot[]>;
+  listCardCitationsForAdmin(cardId: string, inputVersion: string, limit: number): Promise<EvidenceAdminCitation[]>;
   findCardReview(
     reviewId: string,
     cardId: string,
@@ -246,7 +266,7 @@ function cardCitationIds(content: TacticCardContent): string[] {
 
 function exactCitationSnapshot(
   content: TacticCardContent,
-  citations: (EvidenceCitationSnapshot & { inputVersion: string })[],
+  citations: EvidenceCitationAuthority[],
   bundleVersion: string,
 ): EvidenceCitationSnapshot[] {
   const current = new Map(
@@ -270,6 +290,25 @@ function exactCitationSnapshot(
       contentHash: citation.contentHash,
     };
   });
+}
+
+function exactCitationOrigins(
+  content: TacticCardContent,
+  citations: EvidenceCitationAuthority[],
+  bundleVersion: string,
+): ReadonlyMap<string, EvidenceChunkOrigin> {
+  const current = new Map(
+    citations
+      .filter((citation) => citation.inputVersion === bundleVersion)
+      .map((citation) => [citation.chunkId, citation]),
+  );
+  const ids = cardCitationIds(content);
+  if (ids.some((id) => !current.has(id))) {
+    throw new EvidenceConflictError(
+      "현재 카드의 유효한 근거를 확인할 수 없어 검수할 수 없습니다.",
+    );
+  }
+  return new Map(ids.map((id) => [id, current.get(id)!.origin]));
 }
 
 function expectedTimestamp(value: number): number {
@@ -323,7 +362,7 @@ export class D1EvidenceServiceRepository implements EvidenceServiceRepository {
     return (
       await this.db
         .prepare(
-          "SELECT id,bundle_id AS bundleId,original_file_name AS originalFileName,media_type AS mediaType,byte_size AS byteSize,content_hash AS contentHash,storage_key AS storageKey,extracted_text_key AS extractedTextKey,extraction_status AS extractionStatus,extraction_error AS extractionError FROM evidence_sources WHERE bundle_id=?",
+          "SELECT id,bundle_id AS bundleId,origin,original_file_name AS originalFileName,media_type AS mediaType,byte_size AS byteSize,content_hash AS contentHash,storage_key AS storageKey,canonical_url AS canonicalUrl,publisher,published_at AS publishedAt,retrieved_at AS retrievedAt,search_candidate_id AS searchCandidateId,external_text_hash AS externalTextHash,extracted_text_key AS extractedTextKey,extraction_status AS extractionStatus,extraction_error AS extractionError FROM evidence_sources WHERE bundle_id=?",
         )
         .bind(bundleId)
         .all<StoredEvidenceFile>()
@@ -332,7 +371,7 @@ export class D1EvidenceServiceRepository implements EvidenceServiceRepository {
   async findSource(id: string) {
     return this.db
       .prepare(
-        "SELECT id,bundle_id AS bundleId,original_file_name AS originalFileName,media_type AS mediaType,byte_size AS byteSize,content_hash AS contentHash,storage_key AS storageKey,extracted_text_key AS extractedTextKey,extraction_status AS extractionStatus,extraction_error AS extractionError FROM evidence_sources WHERE id=?",
+        "SELECT id,bundle_id AS bundleId,origin,original_file_name AS originalFileName,media_type AS mediaType,byte_size AS byteSize,content_hash AS contentHash,storage_key AS storageKey,canonical_url AS canonicalUrl,publisher,published_at AS publishedAt,retrieved_at AS retrievedAt,search_candidate_id AS searchCandidateId,external_text_hash AS externalTextHash,extracted_text_key AS extractedTextKey,extraction_status AS extractionStatus,extraction_error AS extractionError FROM evidence_sources WHERE id=?",
       )
       .bind(id)
       .first<StoredEvidenceFile>();
@@ -347,13 +386,43 @@ export class D1EvidenceServiceRepository implements EvidenceServiceRepository {
         .all<EvidenceVideoClipRecord>()
     ).results;
   }
-  async findSourceByHash(bundleId: string, hash: string) {
+  async findSourceByHash(bundleId: string, hash: string, canonicalUrl?: string) {
     return this.db
       .prepare(
-        "SELECT id,bundle_id AS bundleId,original_file_name AS originalFileName,media_type AS mediaType,byte_size AS byteSize,content_hash AS contentHash,storage_key AS storageKey,extracted_text_key AS extractedTextKey,extraction_status AS extractionStatus,extraction_error AS extractionError FROM evidence_sources WHERE bundle_id=? AND content_hash=?",
+        "SELECT id,bundle_id AS bundleId,origin,original_file_name AS originalFileName,media_type AS mediaType,byte_size AS byteSize,content_hash AS contentHash,storage_key AS storageKey,canonical_url AS canonicalUrl,publisher,published_at AS publishedAt,retrieved_at AS retrievedAt,search_candidate_id AS searchCandidateId,external_text_hash AS externalTextHash,extracted_text_key AS extractedTextKey,extraction_status AS extractionStatus,extraction_error AS extractionError FROM evidence_sources WHERE bundle_id=? AND (content_hash=? OR canonical_url=?) LIMIT 1",
       )
-      .bind(bundleId, hash)
+      .bind(bundleId, hash, canonicalUrl ?? null)
       .first<StoredEvidenceFile>();
+  }
+  async createR2CleanupReceipt(receipt: EvidenceCleanupReceiptInput & { id: string; createdAt: number }) {
+    await this.db.prepare(
+      `INSERT INTO evidence_r2_cleanup_receipts
+        (id,bundle_id,source_id,storage_key,extracted_text_key,status,error_message,created_at,updated_at)
+        VALUES (?,?,?,?,?,'pending',NULL,?,?)`,
+    ).bind(
+      receipt.id,
+      receipt.bundleId,
+      receipt.sourceId,
+      receipt.storageKey,
+      receipt.extractedTextKey,
+      receipt.createdAt,
+      receipt.createdAt,
+    ).run();
+  }
+  async finishR2CleanupReceipt(receiptId: string, completion: EvidenceCleanupReceiptCompletion, updatedAt: number) {
+    const result = await this.db.prepare(
+      "UPDATE evidence_r2_cleanup_receipts SET storage_key=?,extracted_text_key=?,status=?,error_message=?,updated_at=? WHERE id=?",
+    ).bind(
+      completion.storageKey,
+      completion.extractedTextKey,
+      completion.error === null ? "completed" : "pending",
+      completion.error,
+      updatedAt,
+      receiptId,
+    ).run();
+    if ((result.meta?.changes ?? 0) !== 1) {
+      throw new Error("근거 객체 정리 영수증을 찾을 수 없습니다.");
+    }
   }
   async describeDeleteImpact(sourceId: string) {
     const [cards, scenarios] = await Promise.all([
@@ -401,8 +470,45 @@ export class D1EvidenceServiceRepository implements EvidenceServiceRepository {
     const next = mutation.next;
     const oldState = [current.id, current.version, current.contentVersion];
     const statements: EvidenceD1Statement[] = [];
-    let dependentGuard = guard;
-    let dependentGuardValues: unknown[] = oldState;
+    const searchCandidateId = mutation.sourceToInsert?.origin === "external_web"
+      ? mutation.sourceToInsert.searchCandidateId ?? null
+      : null;
+    const searchCandidateLeaseToken = mutation.sourceToInsert?.origin === "external_web"
+      ? mutation.sourceToInsert.searchCandidateLeaseToken ?? null
+      : null;
+    const searchCandidateAuthority = searchCandidateId === null
+      ? ""
+      : ` AND (
+        NOT EXISTS (SELECT 1 FROM evidence_search_candidates WHERE id=?)
+        OR (? IS NOT NULL AND EXISTS (
+          SELECT 1 FROM evidence_search_candidates AS candidate
+          JOIN evidence_search_runs AS run
+            ON run.id=candidate.run_id AND run.bundle_id=candidate.bundle_id
+          WHERE candidate.id=? AND candidate.bundle_id=?
+            AND candidate.status='importing' AND candidate.lease_token=?
+            AND run.status='importing' AND run.is_stale=0
+        ))
+        OR EXISTS (
+          SELECT 1 FROM evidence_search_candidates AS candidate
+          WHERE candidate.id=? AND candidate.bundle_id=? AND candidate.status='imported'
+            AND candidate.source_id=? AND candidate.content_hash=?
+        )
+      )`;
+    const searchCandidateAuthorityValues = searchCandidateId === null
+      ? []
+      : [
+          searchCandidateId,
+          searchCandidateLeaseToken,
+          searchCandidateId,
+          current.id,
+          searchCandidateLeaseToken,
+          searchCandidateId,
+          current.id,
+          mutation.sourceToInsert?.id ?? null,
+          mutation.sourceToInsert?.contentHash ?? null,
+        ];
+    let dependentGuard = `${guard}${searchCandidateAuthority}`;
+    let dependentGuardValues: unknown[] = [...oldState, ...searchCandidateAuthorityValues];
 
     if (mutation.sourceToDelete) {
       // D1 does not fail a batch when a required DELETE affects zero rows. This
@@ -443,23 +549,30 @@ export class D1EvidenceServiceRepository implements EvidenceServiceRepository {
       statements.push(
         this.db
           .prepare(
-            `INSERT INTO evidence_sources (id,bundle_id,original_file_name,media_type,byte_size,content_hash,storage_key,extracted_text_key,extraction_status,extraction_error,created_at,updated_at)
-          SELECT ?,?,?,?,?,?,?,?,?,?,?,? WHERE ${guard}`,
+            `INSERT INTO evidence_sources (id,bundle_id,origin,original_file_name,media_type,byte_size,content_hash,storage_key,canonical_url,publisher,published_at,retrieved_at,search_candidate_id,external_text_hash,extracted_text_key,extraction_status,extraction_error,created_at,updated_at)
+          SELECT ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,? WHERE ${dependentGuard}`,
           )
           .bind(
             source.id,
             source.bundleId,
+            source.origin ?? "uploaded",
             source.originalFileName,
             source.mediaType,
             source.byteSize,
             source.contentHash,
             source.storageKey,
+            source.canonicalUrl ?? null,
+            source.publisher ?? null,
+            source.publishedAt ?? null,
+            source.retrievedAt ?? null,
+            source.searchCandidateId ?? null,
+            source.externalTextHash ?? null,
             source.extractedTextKey,
             source.extractionStatus,
             source.extractionError,
             next.updatedAt,
             next.updatedAt,
-            ...oldState,
+            ...dependentGuardValues,
           ),
       );
     }
@@ -497,6 +610,26 @@ export class D1EvidenceServiceRepository implements EvidenceServiceRepository {
     statements.push(
       this.db
         .prepare(
+          `UPDATE evidence_search_runs
+          SET is_stale=1,error_message='근거 묶음이 갱신되었습니다.',
+            lease_token=NULL,lease_expires_at=NULL,updated_at=?
+          WHERE bundle_id=? AND bundle_version<>? AND is_stale=0
+            AND (? IS NULL OR id NOT IN (
+              SELECT run_id FROM evidence_search_candidates WHERE id=? AND bundle_id=?
+            ))
+            AND ${dependentGuard}`,
+        )
+        .bind(
+          next.updatedAt,
+          current.id,
+          next.version,
+          searchCandidateId,
+          searchCandidateId,
+          current.id,
+          ...dependentGuardValues,
+        ),
+      this.db
+        .prepare(
           `UPDATE evidence_analysis_jobs
           SET is_stale=1,
             status=CASE WHEN status IN ('queued','running','review_ready') THEN 'failed' ELSE status END,
@@ -525,6 +658,48 @@ export class D1EvidenceServiceRepository implements EvidenceServiceRepository {
           ...dependentGuardValues,
         ),
       this.audit(mutation.audit, dependentGuard, dependentGuardValues),
+      ...(searchCandidateId === null || mutation.sourceToInsert === undefined
+        ? []
+        : [
+            this.db
+              .prepare(
+                `UPDATE evidence_search_runs
+                SET bundle_version=?,updated_at=?
+                WHERE id=(SELECT run_id FROM evidence_search_candidates WHERE id=? AND bundle_id=?)
+                  AND bundle_id=? AND status='importing' AND is_stale=0 AND bundle_version=?
+                  AND ${dependentGuard}`,
+              )
+              .bind(
+                next.version,
+                next.updatedAt,
+                searchCandidateId,
+                current.id,
+                current.id,
+                current.version,
+                ...dependentGuardValues,
+              ),
+            this.db
+              .prepare(
+                `UPDATE evidence_search_candidates
+                SET status='imported',source_id=?,content_hash=?,failure_reason=NULL,
+                  lease_token=NULL,lease_expires_at=NULL,updated_at=?
+                WHERE id=? AND bundle_id=? AND status='importing' AND lease_token=?
+                  AND EXISTS (SELECT 1 FROM evidence_sources WHERE id=? AND bundle_id=? AND content_hash=?)
+                  AND ${dependentGuard}`,
+              )
+              .bind(
+                mutation.sourceToInsert.id,
+                mutation.sourceToInsert.contentHash,
+                next.updatedAt,
+                searchCandidateId,
+                current.id,
+                searchCandidateLeaseToken,
+                mutation.sourceToInsert.id,
+                current.id,
+                mutation.sourceToInsert.contentHash,
+                ...dependentGuardValues,
+              ),
+          ]),
       // D1 batch statements execute sequentially. The CAS must remain last so
       // every dependent old-state guard is true on success and false on a miss.
       this.db
@@ -538,7 +713,7 @@ export class D1EvidenceServiceRepository implements EvidenceServiceRepository {
             WHERE id=? AND bundle_id=? AND source_id=?
           )`
               : ""
-          }`,
+          }${searchCandidateAuthority}`,
         )
         .bind(
           next.title,
@@ -550,6 +725,7 @@ export class D1EvidenceServiceRepository implements EvidenceServiceRepository {
           ...(mutation.sourceToDelete
             ? [mutation.audit.id, current.id, mutation.sourceToDelete]
             : []),
+          ...searchCandidateAuthorityValues,
         ),
     );
 
@@ -597,18 +773,20 @@ export class D1EvidenceServiceRepository implements EvidenceServiceRepository {
   }
   async listCardCitations(
     cardId: string,
-  ): Promise<(EvidenceCitationSnapshot & { inputVersion: string })[]> {
+  ): Promise<EvidenceCitationAuthority[]> {
     return (
       await this.db
         .prepare(
           `SELECT chunk.id AS chunkId,chunk.source_id AS sourceId,chunk.video_clip_id AS videoClipId,
-        chunk.location_label AS locationLabel,chunk.content,chunk.content_hash AS contentHash,chunk.input_version AS inputVersion
+        chunk.location_label AS locationLabel,chunk.content,chunk.content_hash AS contentHash,chunk.input_version AS inputVersion,
+        CASE WHEN chunk.video_clip_id IS NOT NULL THEN 'video_observation' ELSE source.origin END AS origin
         FROM tactic_card_citations AS citation
         JOIN evidence_chunks AS chunk ON chunk.id=citation.chunk_id AND chunk.bundle_id=citation.bundle_id
+        LEFT JOIN evidence_sources AS source ON source.id=chunk.source_id AND source.bundle_id=chunk.bundle_id
         WHERE citation.card_id=? ORDER BY chunk.id`,
         )
         .bind(cardId)
-        .all<EvidenceCitationSnapshot & { inputVersion: string }>()
+        .all<EvidenceCitationAuthority>()
     ).results;
   }
   async countCardCitations(cardId: string, inputVersion: string): Promise<number> {
@@ -617,13 +795,19 @@ export class D1EvidenceServiceRepository implements EvidenceServiceRepository {
       WHERE citation.card_id=? AND chunk.input_version=?`).bind(cardId, inputVersion).first<{count:number}>();
     return row?.count ?? 0;
   }
-  async listCardCitationsForAdmin(cardId: string, inputVersion: string, limit: number): Promise<EvidenceCitationSnapshot[]> {
+  async listCardCitationsForAdmin(cardId: string, inputVersion: string, limit: number): Promise<EvidenceAdminCitation[]> {
     return (await this.db.prepare(`SELECT chunk.id AS chunkId,chunk.source_id AS sourceId,chunk.video_clip_id AS videoClipId,
-      chunk.location_label AS locationLabel,chunk.content,chunk.content_hash AS contentHash
+      chunk.location_label AS locationLabel,chunk.content,chunk.content_hash AS contentHash,
+      CASE WHEN chunk.video_clip_id IS NOT NULL THEN 'video_observation' ELSE source.origin END AS origin,
+      CASE WHEN source.origin='external_web' THEN source.canonical_url ELSE NULL END AS canonicalUrl,
+      CASE WHEN source.origin='external_web' THEN source.publisher ELSE NULL END AS publisher,
+      CASE WHEN source.origin='external_web' THEN source.published_at ELSE NULL END AS publishedAt,
+      CASE WHEN source.origin='external_web' THEN source.retrieved_at ELSE NULL END AS retrievedAt
       FROM tactic_card_citations AS citation
       JOIN evidence_chunks AS chunk ON chunk.id=citation.chunk_id AND chunk.bundle_id=citation.bundle_id
+      LEFT JOIN evidence_sources AS source ON source.id=chunk.source_id AND source.bundle_id=chunk.bundle_id
       WHERE citation.card_id=? AND chunk.input_version=? ORDER BY chunk.id LIMIT ?`)
-      .bind(cardId, inputVersion, limit).all<EvidenceCitationSnapshot>()).results;
+      .bind(cardId, inputVersion, limit).all<EvidenceAdminCitation>()).results;
   }
   async findCardReview(
     reviewId: string,
@@ -894,12 +1078,13 @@ export class EvidenceService {
         title: u.title ?? c.title,
         purpose: u.purpose ?? c.purpose,
       }),
-      changed = x.purpose !== c.purpose,
+      purposeChanged = x.purpose !== c.purpose,
+      searchInputChanged = x.title !== c.title || purposeChanged,
       n = {
         ...c,
         ...x,
-        version: changed ? c.version + 1 : c.version,
-        contentVersion: changed
+        version: searchInputChanged ? c.version + 1 : c.version,
+        contentVersion: purposeChanged
           ? await this.hash(
               x.purpose,
               await this.d.repository.listSources(id),
@@ -917,7 +1102,7 @@ export class EvidenceService {
         "bundle.updated",
         "bundle",
         id,
-        { contentChanged: changed },
+        { contentChanged: purposeChanged },
         n.updatedAt,
       ),
     });
@@ -953,9 +1138,17 @@ export class EvidenceService {
   }
   sourceRegistration(a: EvidenceAdmin) {
     return {
-      findExisting: (b: string, h: string) =>
-        this.d.repository.findSourceByHash(b, h),
+      findExisting: (b: string, h: string, canonicalUrl?: string) =>
+        this.d.repository.findSourceByHash(b, h, canonicalUrl),
+      findById: (sourceId: string) => this.d.repository.findSource(sourceId),
       register: (s: StoredEvidenceFile) => this.addSource(s, a),
+      startCleanup: async (input: EvidenceCleanupReceiptInput) => {
+        const id = this.id();
+        await this.d.repository.createR2CleanupReceipt({ ...input, id, createdAt: this.now() });
+        return id;
+      },
+      finishCleanup: (receiptId: string, completion: EvidenceCleanupReceiptCompletion) =>
+        this.d.repository.finishR2CleanupReceipt(receiptId, completion, this.now()),
     };
   }
   async addSource(s: StoredEvidenceFile, a: EvidenceAdmin) {
@@ -985,7 +1178,9 @@ export class EvidenceService {
         now,
       ),
     });
-    return s;
+    const stored = { ...s };
+    delete stored.searchCandidateLeaseToken;
+    return stored;
   }
   async describeDeleteImpact(id: string) {
     return this.d.repository.describeDeleteImpact(id);
@@ -1058,8 +1253,12 @@ export class EvidenceService {
     if (card.updatedAt !== expectedUpdatedAt) throw new EvidenceConflictError();
     this.assertCurrentCard(card);
 
-    const content = parseTacticCardContent(command.content);
+    const submittedContent = parseTacticCardContent(command.content);
     const citations = await this.d.repository.listCardCitations(card.id);
+    const content = enforceExternalEvidenceRules(
+      submittedContent,
+      exactCitationOrigins(submittedContent, citations, card.bundleVersion),
+    );
     const snapshot = exactCitationSnapshot(
       content,
       citations,

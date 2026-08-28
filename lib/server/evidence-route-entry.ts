@@ -5,8 +5,11 @@ import { createEvidenceProductionRouteRuntime } from "./evidence-route-runtime.t
 import { bindEvidenceSchedule, runEvidenceAdminRoute, type EvidenceRouteRuntime } from "./evidence-routes.ts";
 import type { EvidenceProductionBindings } from "./evidence-runtime.ts";
 import type { EvidenceAnalyzerEnvironment } from "./openai-evidence-analyzer.ts";
+import type { EvidenceSearchEnvironment } from "./openai-evidence-search.ts";
 
-type EvidenceWorkerEnvironment = Partial<EvidenceProductionBindings & EvidenceAnalyzerEnvironment>;
+type EvidenceWorkerEnvironment = Partial<
+  EvidenceProductionBindings & EvidenceAnalyzerEnvironment & EvidenceSearchEnvironment
+>;
 
 function workerEnvironment(): EvidenceWorkerEnvironment {
   return env as unknown as EvidenceWorkerEnvironment;
@@ -32,6 +35,10 @@ export function runEvidenceProductionRoute(
           EVIDENCE_LLM_ENDPOINT: bindings.EVIDENCE_LLM_ENDPOINT ?? process.env.EVIDENCE_LLM_ENDPOINT,
           EVIDENCE_LLM_API_KEY: bindings.EVIDENCE_LLM_API_KEY ?? process.env.EVIDENCE_LLM_API_KEY,
           EVIDENCE_LLM_MODEL: bindings.EVIDENCE_LLM_MODEL ?? process.env.EVIDENCE_LLM_MODEL,
+        },
+        searchEnvironment: {
+          EVIDENCE_SEARCH_MODEL: bindings.EVIDENCE_SEARCH_MODEL ?? process.env.EVIDENCE_SEARCH_MODEL,
+          EVIDENCE_EXTERNAL_ALLOWED_HOSTS: bindings.EVIDENCE_EXTERNAL_ALLOWED_HOSTS ?? process.env.EVIDENCE_EXTERNAL_ALLOWED_HOSTS,
         },
         schedule: bindEvidenceSchedule(waitUntil),
       });

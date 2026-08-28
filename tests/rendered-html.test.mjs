@@ -45,6 +45,13 @@ async function renderedClientAssets() {
   return Promise.all(assets.map((entry) => readFile(join(entry.parentPath, entry.name), "utf8")));
 }
 
+async function renderedStyles() {
+  const clientRoot = new URL("../dist/client/", import.meta.url);
+  const entries = await readdir(clientRoot, { recursive: true, withFileTypes: true });
+  const styles = entries.filter((entry) => entry.isFile() && entry.name.endsWith(".css"));
+  return Promise.all(styles.map((entry) => readFile(join(entry.parentPath, entry.name), "utf8")));
+}
+
 test("renders the mobile futsal training product shell", async () => {
   const response = await render();
   assert.equal(response.status, 200);
@@ -78,4 +85,30 @@ test("renders the three-stage reviewed explanation controls in the client bundle
   assert.match(assets, /reduced-motion-arrow/);
   assert.match(assets, /path-endpoint/);
   assert.match(assets, /playback-keyframe-seek/);
+});
+
+test("renders the five-step evidence search controls with accessible external links", async () => {
+  const assets = (await renderedClientAssets()).join("\n");
+
+  assert.match(assets, /외부 출처 찾기/);
+  assert.match(assets, /선택 출처 가져오기/);
+  assert.match(assets, /실패한 출처 다시 시도/);
+  assert.match(assets, /외부 출처 없이 분석 확인/);
+  assert.match(assets, /최대 5개/);
+  assert.match(assets, /noreferrer noopener/);
+  assert.match(assets, /candidate-list/);
+  assert.match(assets, /min-height:44px/);
+  assert.match(assets, /영상 관찰만 분석한다는/);
+});
+
+test("keeps responsive Coach Desk candidate styling and 44px candidate actions", async () => {
+  const css = (await renderedStyles()).join("\n");
+
+  const candidateListRule = css.match(/\.candidate-list\{([^}]*)\}/)?.[1];
+  assert.ok(candidateListRule, "candidate list CSS rule is emitted");
+  assert.match(candidateListRule, /display:grid/);
+  assert.match(candidateListRule, /grid-template-columns:1fr/);
+  assert.match(css, /@media ?\(min-width:768px\)\{\.candidate-list\{grid-template-columns:repeat\(2,minmax\(0,1fr\)\)\}\}/);
+  assert.match(css, /\.candidate-card \.quote-toggle,\.candidate-card \.candidate-exclude,\.candidate-card \.candidate-retry\{[^}]*min-height:44px/);
+  assert.match(css, /\.candidate-card a\{overflow-wrap:anywhere\}/);
 });

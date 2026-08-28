@@ -1,7 +1,9 @@
 import { EvidenceValidationError } from "../domain/evidence.ts";
+import { EvidenceSearchValidationError } from "../domain/evidence-search.ts";
 import { EvidenceAnalyzerError } from "./evidence-analyzer.ts";
 import type { EvidenceAdmin } from "./evidence-auth.ts";
 import {
+  EvidenceConflictError,
   EvidencePayloadTooLargeError,
   EvidencePublicError,
   EvidenceRequestValidationError,
@@ -11,6 +13,13 @@ import type {
   EvidenceAnalysisJobRecord,
   EvidenceAnalysisJobs,
 } from "./evidence-jobs.ts";
+import type {
+  EvidenceExternalSearchJobs,
+  EvidenceSearchCandidateRecord,
+  EvidenceSearchRunDetail,
+  EvidenceSearchRunRecord,
+} from "./evidence-search-jobs.ts";
+import { EvidenceSearchError } from "./openai-evidence-search.ts";
 import {
   type EvidenceBundleDetail,
   type EvidenceBundleRecord,
@@ -30,6 +39,8 @@ const JOB_CARD_PAGE_SIZE = 20;
 const JOB_CARD_CITATION_LIMIT = 20;
 const JOB_EXCERPT_MAX_BYTES = 2_000;
 const JOB_AGGREGATE_EXCERPT_MAX_BYTES = 32 * 1024;
+const EXTERNAL_CITATION_URL_MAX_BYTES = 4 * 1024;
+const EXTERNAL_CITATION_PUBLISHER_MAX_LENGTH = 160;
 
 type RouteContext<T extends Record<string, string>> = { params: Promise<T> };
 
@@ -52,6 +63,10 @@ export type EvidenceRouteRuntime = {
   jobs: Pick<
     EvidenceAnalysisJobs,
     "startAnalysis" | "retryAnalysis" | "getAnalysisStatus" | "getLatestAnalysisStatusForBundle"
+  >;
+  searchJobs: Pick<
+    EvidenceExternalSearchJobs,
+    "startSearch" | "getLatestSearch" | "getSearch" | "saveSelection" | "startImport"
   >;
 };
 
@@ -98,9 +113,13 @@ function routeFailure(error: unknown): Response {
   }
   if (error instanceof EvidenceValidationError)
     return jsonError("근거 자료 요청이 올바르지 않습니다.", 400);
+  if (error instanceof EvidenceSearchValidationError)
+    return jsonError("근거 자료 요청이 올바르지 않습니다.", 400);
   if (error instanceof EvidenceAnalyzerError) {
     return jsonError("근거 분석 서비스를 사용할 수 없습니다.", 503);
   }
+  if (error instanceof EvidenceSearchError)
+    return jsonError("외부 출처 검색 서비스를 사용할 수 없습니다.", 503);
   if (error instanceof AggregateError)
     return jsonError("근거 파일 저장소를 사용할 수 없습니다.", 503);
   return jsonError("근거 자료 요청을 처리하지 못했습니다.", 500);
@@ -115,7 +134,7 @@ async function parseJson(request: Request): Promise<unknown> {
 }
 
 function safeSource(source: StoredEvidenceFile) {
-  return {
+  const safe = {
     id: source.id,
     bundleId: source.bundleId,
     originalFileName: source.originalFileName,
@@ -127,6 +146,17 @@ function safeSource(source: StoredEvidenceFile) {
       source.extractionError === null
         ? null
         : "근거 텍스트를 준비하지 못했습니다.",
+  };
+  if (source.origin !== "external_web" || !source.canonicalUrl || !source.publisher || !source.publishedAt || !Number.isSafeInteger(source.retrievedAt) || source.retrievedAt < 0) {
+    return { ...safe, origin: "uploaded" as const };
+  }
+  return {
+    ...safe,
+    origin: "external_web" as const,
+    canonicalUrl: source.canonicalUrl,
+    publisher: source.publisher,
+    publishedAt: source.publishedAt,
+    retrievedAt: source.retrievedAt,
   };
 }
 
@@ -170,6 +200,67 @@ function safeJob(job: EvidenceAnalysisJobRecord) {
   };
 }
 
+function safeSearchRun(run: EvidenceSearchRunRecord) {
+  return {
+    id: run.id,
+    bundleId: run.bundleId,
+    bundleVersion: run.bundleVersion,
+    status: run.status,
+    errorMessage:
+      run.errorMessage === null
+        ? null
+        : "외부 출처 검색을 완료하지 못했습니다.",
+    isStale: run.isStale,
+    startedAt: run.startedAt,
+    completedAt: run.completedAt,
+    createdAt: run.createdAt,
+    updatedAt: run.updatedAt,
+  };
+}
+
+function safeSearchStart(run: EvidenceSearchRunRecord) {
+  return {
+    id: run.id,
+    bundleId: run.bundleId,
+    status: run.status,
+  };
+}
+
+function safeSearchCandidate(candidate: EvidenceSearchCandidateRecord) {
+  return {
+    id: candidate.id,
+    title: candidate.title,
+    publisher: candidate.publisher,
+    publishedAt: candidate.publishedAt,
+    canonicalUrl: candidate.canonicalUrl,
+    documentType: candidate.documentType,
+    quote: candidate.quote,
+    relevance: candidate.relevance,
+    trustTier: candidate.trustTier,
+    rank: candidate.rank,
+    status: candidate.status,
+    failureReason:
+      candidate.failureReason === null
+        ? null
+        : "외부 문서를 가져오지 못했습니다.",
+  };
+}
+
+function safeSearchDetail(detail: EvidenceSearchRunDetail) {
+  return {
+    run: safeSearchRun(detail.run),
+    candidates: detail.candidates.map(safeSearchCandidate),
+  };
+}
+
+async function requireSearchBundle(
+  bundleId: string,
+  runtime: EvidenceRouteRuntime,
+): Promise<Response | undefined> {
+  const bundle = await runtime.service.getBundleForAdmin(bundleId, runtime.admin);
+  if (bundle === null) return jsonError("근거 묶음을 찾을 수 없습니다.", 404);
+}
+
 function safeCard(card: EvidenceCardRecord) {
   let content: unknown;
   try {
@@ -199,6 +290,31 @@ function truncateUtf8(value: string, maximumBytes: number): string {
   return value.slice(0, read);
 }
 
+function safeExternalCitationMetadata(citation: EvidenceCardAdminDetail["citations"][number]) {
+  if (citation.origin !== "external_web") return { origin: citation.origin };
+  if (typeof citation.canonicalUrl !== "string" || typeof citation.publisher !== "string"
+    || typeof citation.publishedAt !== "string" || typeof citation.retrievedAt !== "number"
+    || citation.publisher.trim() === "" || citation.publisher.length > EXTERNAL_CITATION_PUBLISHER_MAX_LENGTH
+    || !/^\d{4}-\d{2}-\d{2}$/.test(citation.publishedAt)
+    || !Number.isSafeInteger(citation.retrievedAt) || citation.retrievedAt < 0
+    || new TextEncoder().encode(citation.canonicalUrl).byteLength > EXTERNAL_CITATION_URL_MAX_BYTES) {
+    return { origin: citation.origin };
+  }
+  try {
+    const url = new URL(citation.canonicalUrl);
+    if (url.protocol !== "https:" || url.username || url.password) return { origin: citation.origin };
+  } catch {
+    return { origin: citation.origin };
+  }
+  return {
+    origin: citation.origin,
+    canonicalUrl: citation.canonicalUrl,
+    publisher: citation.publisher,
+    publishedAt: citation.publishedAt,
+    retrievedAt: citation.retrievedAt,
+  };
+}
+
 function safeCardDetail(card: EvidenceCardAdminDetail, budget: { remaining: number }) {
   return {
     ...safeCard(card),
@@ -207,7 +323,7 @@ function safeCardDetail(card: EvidenceCardAdminDetail, budget: { remaining: numb
       const excerpt = truncateUtf8(citation.content, Math.min(JOB_EXCERPT_MAX_BYTES, budget.remaining));
       budget.remaining -= new TextEncoder().encode(excerpt).byteLength;
       return { chunkId: citation.chunkId, sourceId: citation.sourceId, videoClipId: citation.videoClipId,
-        locationLabel: citation.locationLabel, excerpt };
+        locationLabel: citation.locationLabel, excerpt, ...safeExternalCitationMetadata(citation) };
     }),
   };
 }
@@ -602,6 +718,97 @@ export async function handleEvidenceAnalyzeStart(
     const { bundleId } = await context.params;
     const job = await runtime.jobs.startAnalysis(bundleId, runtime.admin);
     return adminJson({ job: safeJob(job) }, { status: 202 });
+  } catch (error) {
+    return routeFailure(error);
+  }
+}
+
+export async function handleEvidenceSearchStart(
+  context: RouteContext<{ bundleId: string }>,
+  runtime: EvidenceRouteRuntime,
+): Promise<Response> {
+  try {
+    const { bundleId } = await context.params;
+    const missing = await requireSearchBundle(bundleId, runtime);
+    if (missing) return missing;
+    const search = await runtime.searchJobs.startSearch(bundleId, runtime.admin);
+    if (search.status !== "queued" && search.status !== "searching" && search.status !== "ready") {
+      throw new EvidenceConflictError();
+    }
+    const status = search.status === "ready" ? 200 : 202;
+    return adminJson({ search: safeSearchStart(search) }, { status });
+  } catch (error) {
+    return routeFailure(error);
+  }
+}
+
+export async function handleEvidenceSearchLatest(
+  context: RouteContext<{ bundleId: string }>,
+  runtime: EvidenceRouteRuntime,
+): Promise<Response> {
+  try {
+    const { bundleId } = await context.params;
+    const missing = await requireSearchBundle(bundleId, runtime);
+    if (missing) return missing;
+    const search = await runtime.searchJobs.getLatestSearch(bundleId);
+    return adminJson({
+      search: search === null ? null : safeSearchDetail(search),
+    });
+  } catch (error) {
+    return routeFailure(error);
+  }
+}
+
+export async function handleEvidenceSearchGet(
+  context: RouteContext<{ bundleId: string; runId: string }>,
+  runtime: EvidenceRouteRuntime,
+): Promise<Response> {
+  try {
+    const { bundleId, runId } = await context.params;
+    const missing = await requireSearchBundle(bundleId, runtime);
+    if (missing) return missing;
+    const search = await runtime.searchJobs.getSearch(bundleId, runId);
+    if (search === null)
+      return jsonError("외부 출처 검색 작업을 찾을 수 없습니다.", 404);
+    return adminJson({ search: safeSearchDetail(search) });
+  } catch (error) {
+    return routeFailure(error);
+  }
+}
+
+export async function handleEvidenceSearchSelection(
+  request: Request,
+  context: RouteContext<{ bundleId: string; runId: string }>,
+  runtime: EvidenceRouteRuntime,
+): Promise<Response> {
+  try {
+    const { bundleId, runId } = await context.params;
+    const input = await parseJson(request);
+    const missing = await requireSearchBundle(bundleId, runtime);
+    if (missing) return missing;
+    const search = await runtime.searchJobs.saveSelection(
+      bundleId,
+      runId,
+      input,
+      runtime.admin,
+    );
+    return adminJson({ search: safeSearchDetail(search) });
+  } catch (error) {
+    return routeFailure(error);
+  }
+}
+
+export async function handleEvidenceSearchImport(
+  context: RouteContext<{ bundleId: string; runId: string }>,
+  runtime: EvidenceRouteRuntime,
+): Promise<Response> {
+  try {
+    const { bundleId, runId } = await context.params;
+    const missing = await requireSearchBundle(bundleId, runtime);
+    if (missing) return missing;
+    const search = await runtime.searchJobs.startImport(bundleId, runId, runtime.admin);
+    if (search.status !== "importing") throw new EvidenceConflictError();
+    return adminJson({ search: safeSearchStart(search) }, { status: 202 });
   } catch (error) {
     return routeFailure(error);
   }

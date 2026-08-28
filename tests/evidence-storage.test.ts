@@ -4,6 +4,8 @@ import { deflateSync } from "node:zlib";
 
 import {
   EvidenceFileStore,
+  type EvidenceSourceRegistrationPort,
+  type StoredEvidenceFile,
   validateEvidenceFile,
 } from "../lib/server/evidence-storage.ts";
 import { extractEvidenceText } from "../lib/server/evidence-text-extractor.ts";
@@ -355,13 +357,30 @@ type SourceRow = {
   id: string;
   bundleId: string;
   originalFileName: string;
-  mediaType: string;
+  mediaType: StoredEvidenceFile["mediaType"];
   byteSize: number;
   contentHash: string;
   storageKey: string;
   extractedTextKey: string | null;
   extractionStatus: "pending" | "completed" | "failed";
   extractionError: string | null;
+  origin?: "uploaded" | "external_web";
+  canonicalUrl?: string;
+  publisher?: string;
+  publishedAt?: string;
+  retrievedAt?: number;
+  searchCandidateId?: string;
+  externalTextHash?: string;
+};
+
+type CleanupReceipt = {
+  id: string;
+  bundleId: string;
+  sourceId: string;
+  storageKey: string | null;
+  extractedTextKey: string | null;
+  status: "pending" | "completed";
+  error: string | null;
 };
 
 class FakeR2 {
@@ -369,6 +388,7 @@ class FakeR2 {
   readonly putKeys: string[] = [];
   readonly deleteAttempts = new Map<string, number>();
   readonly deleteFailures = new Map<string, number>();
+  failFirstPutDeletes = false;
 
   async put(key: string, value: unknown): Promise<void> {
     this.putKeys.push(key);
@@ -382,6 +402,7 @@ class FakeR2 {
   async delete(key: string): Promise<void> {
     this.deleteAttempts.set(key, (this.deleteAttempts.get(key) ?? 0) + 1);
     const failures = this.deleteFailures.get(key) ?? 0;
+    if (this.failFirstPutDeletes && key === this.putKeys[0]) throw new Error(`injected permanent delete failure for ${key}`);
     if (failures > 0) {
       this.deleteFailures.set(key, failures - 1);
       throw new Error(`injected delete failure for ${key}`);
@@ -411,7 +432,7 @@ class FakeD1Statement {
   async run(): Promise<void> {
     assert.match(this.sql, /^\s*INSERT INTO evidence_sources/);
     const [id, bundleId, originalFileName, mediaType, byteSize, contentHash, storageKey, extractedTextKey, extractionStatus, extractionError] = this.values as [
-      string, string, string, string, number, string, string, string | null, SourceRow["extractionStatus"], string | null,
+      string, string, string, StoredEvidenceFile["mediaType"], number, string, string, string | null, SourceRow["extractionStatus"], string | null,
     ];
     const source = { id, bundleId, originalFileName, mediaType, byteSize, contentHash, storageKey, extractedTextKey, extractionStatus, extractionError };
     if (this.database.nextUniqueConflict !== null) {
@@ -423,19 +444,47 @@ class FakeD1Statement {
   }
 }
 
-class FakeD1 {
+class FakeD1 implements EvidenceSourceRegistrationPort {
   readonly rows: SourceRow[] = [];
+  readonly cleanupReceipts: CleanupReceipt[] = [];
   nextUniqueConflict: SourceRow | null = null;
+  commitThenThrow = false;
 
   prepare(sql: string): FakeD1Statement {
     return new FakeD1Statement(sql, this);
   }
 
-  async findExisting(bundleId: string, contentHash: string): Promise<SourceRow | null> {
-    return this.rows.find((row) => row.bundleId === bundleId && row.contentHash === contentHash) ?? null;
+  async findExisting(bundleId: string, contentHash: string, canonicalUrl?: string): Promise<SourceRow | null> {
+    return this.rows.find((row) => row.bundleId === bundleId && (
+      row.contentHash === contentHash || (canonicalUrl !== undefined && row.canonicalUrl === canonicalUrl)
+    )) ?? null;
+  }
+
+  async findById(sourceId: string): Promise<SourceRow | null> {
+    return this.rows.find((row) => row.id === sourceId) ?? null;
+  }
+
+  async startCleanup(input: Omit<CleanupReceipt, "id" | "status" | "error">): Promise<string> {
+    const id = `cleanup-${this.cleanupReceipts.length + 1}`;
+    this.cleanupReceipts.push({ id, ...input, status: "pending", error: null });
+    return id;
+  }
+
+  async finishCleanup(id: string, completion: { storageKey: string | null; extractedTextKey: string | null; error: string | null }): Promise<void> {
+    const receipt = this.cleanupReceipts.find((value) => value.id === id);
+    assert.ok(receipt);
+    receipt.storageKey = completion.storageKey;
+    receipt.extractedTextKey = completion.extractedTextKey;
+    receipt.status = completion.error === null ? "completed" : "pending";
+    receipt.error = completion.error;
   }
 
   async register(source: SourceRow): Promise<SourceRow> {
+    if (this.commitThenThrow) {
+      this.rows.push(source);
+      this.commitThenThrow = false;
+      throw new Error("transport failed after commit");
+    }
     if (this.nextUniqueConflict !== null) {
       this.rows.push(this.nextUniqueConflict);
       this.nextUniqueConflict = null;
@@ -472,6 +521,238 @@ test("persists one opaque original and extracted pair, then reuses a duplicate s
   await store.deleteFilePair(first.storageKey, first.extractedTextKey);
   assert.equal(await store.getFile(first.storageKey), null);
   assert.equal(await store.getFile(first.extractedTextKey ?? "missing"), null);
+});
+
+test("rejects incomplete registration capabilities before any R2 write", async () => {
+  const bucket = new FakeR2();
+  const registration = {
+    async findExisting() { return null; },
+    async register(source: SourceRow) { return source; },
+  } as unknown as EvidenceSourceRegistrationPort;
+
+  await assert.rejects(() => new EvidenceFileStore({ bucket, registration }).putValidatedFile({
+    bundleId: "bundle-1",
+    name: "notes.txt",
+    type: "text/plain",
+    bytes: new TextEncoder().encode("valid text"),
+  }), /등록 정리 서비스가 구성되지 않았습니다/);
+
+  assert.equal(bucket.putKeys.length, 0);
+  assert.equal(bucket.objects.size, 0);
+});
+
+test("normalizes and forwards external source metadata while keeping both R2 keys opaque", async () => {
+  const bucket = new FakeR2();
+  const database = new FakeD1();
+  const source = await new EvidenceFileStore({ bucket, registration: database }).putValidatedFile({
+    bundleId: "bundle-external",
+    name: "public-guidance.txt",
+    type: "text/plain",
+    bytes: new TextEncoder().encode("Use the wide lane."),
+    externalMetadata: {
+      origin: "external_web",
+      canonicalUrl: "https://FIFA.com/guidance/?z=2&a=1#section",
+      publisher: "FIFA",
+      publishedAt: "2026-08-20",
+      retrievedAt: 1_777_000_000_000,
+      searchCandidateId: "candidate-1",
+    },
+  });
+
+  assert.equal(source.origin, "external_web");
+  assert.equal(source.canonicalUrl, "https://fifa.com/guidance/?a=1&z=2");
+  assert.equal(source.publisher, "FIFA");
+  assert.equal(source.publishedAt, "2026-08-20");
+  assert.equal(source.retrievedAt, 1_777_000_000_000);
+  assert.equal(source.searchCandidateId, "candidate-1");
+  assert.equal(database.rows.length, 1);
+  for (const key of bucket.putKeys) {
+    assert.equal(key.includes("fifa.com"), false);
+    assert.equal(key.includes("public-guidance"), false);
+  }
+});
+
+test("returns an existing external source for either canonical URL or content hash without new R2 writes", async () => {
+  const bucket = new FakeR2();
+  const database = new FakeD1();
+  const store = new EvidenceFileStore({ bucket, registration: database });
+  const metadata = {
+    origin: "external_web" as const,
+    canonicalUrl: "https://fifa.com/guidance/width",
+    publisher: "FIFA",
+    publishedAt: "2026-08-20",
+    retrievedAt: 1_777_000_000_000,
+    searchCandidateId: "candidate-1",
+  };
+  const first = await store.putValidatedFile({
+    bundleId: "bundle-external",
+    name: "width.txt",
+    type: "text/plain",
+    bytes: new TextEncoder().encode("first body"),
+    externalMetadata: metadata,
+  });
+  const writesAfterFirst = bucket.putKeys.length;
+  const sameUrl = await store.putValidatedFile({
+    bundleId: "bundle-external",
+    name: "changed.txt",
+    type: "text/plain",
+    bytes: new TextEncoder().encode("changed body"),
+    externalMetadata: { ...metadata, searchCandidateId: "candidate-2" },
+  });
+  const sameHash = await store.putValidatedFile({
+    bundleId: "bundle-external",
+    name: "mirror.txt",
+    type: "text/plain",
+    bytes: new TextEncoder().encode("first body"),
+    externalMetadata: { ...metadata, canonicalUrl: "https://fifa.com/guidance/mirror", searchCandidateId: "candidate-3" },
+  });
+
+  assert.equal(sameUrl.id, first.id);
+  assert.equal(sameHash.id, first.id);
+  assert.equal(bucket.putKeys.length, writesAfterFirst);
+  assert.equal(database.rows.length, 1);
+});
+
+test("rejects invalid external metadata before any R2 or D1 write", async () => {
+  for (const externalMetadata of [
+    { origin: "external_web", canonicalUrl: "http://fifa.com/a", publisher: "FIFA", publishedAt: "2026-08-20", retrievedAt: 1, searchCandidateId: "candidate-1" },
+    { origin: "external_web", canonicalUrl: "https://fifa.com/a", publisher: "", publishedAt: "2026-08-20", retrievedAt: 1, searchCandidateId: "candidate-1" },
+    { origin: "external_web", canonicalUrl: "https://fifa.com/a", publisher: "FIFA", publishedAt: "not-a-date", retrievedAt: 1, searchCandidateId: "candidate-1" },
+  ]) {
+    const bucket = new FakeR2();
+    const database = new FakeD1();
+    await assert.rejects(() => new EvidenceFileStore({ bucket, registration: database }).putValidatedFile({
+      bundleId: "bundle-external",
+      name: "width.txt",
+      type: "text/plain",
+      bytes: new TextEncoder().encode("body"),
+      externalMetadata: externalMetadata as never,
+    }));
+    assert.equal(bucket.putKeys.length, 0);
+    assert.equal(database.rows.length, 0);
+  }
+});
+
+test("rejects canonical URLs over the UTF-8 byte limit before and after normalization with zero writes", async () => {
+  for (const canonicalUrl of [
+    `https://fifa.com/guidance?q=${"a".repeat(5_000)}`,
+    `https://fifa.com/guidance?q=${"é".repeat(1_000)}`,
+  ]) {
+    const bucket = new FakeR2();
+    const database = new FakeD1();
+    await assert.rejects(() => new EvidenceFileStore({ bucket, registration: database }).putValidatedFile({
+      bundleId: "bundle-external",
+      name: "width.txt",
+      type: "text/plain",
+      bytes: new TextEncoder().encode("body"),
+      externalMetadata: {
+        origin: "external_web",
+        canonicalUrl,
+        publisher: "FIFA",
+        publishedAt: "2026-08-20",
+        retrievedAt: 1,
+        searchCandidateId: "candidate-1",
+      },
+    }), /URL.*크기|크기.*URL/);
+    assert.equal(bucket.putKeys.length, 0);
+    assert.equal(database.rows.length, 0);
+  }
+});
+
+test("deletes a canonical-URL race loser and returns the registered winner", async () => {
+  const bucket = new FakeR2();
+  const database = new FakeD1();
+  const winner: SourceRow = {
+    id: "winner-by-url",
+    bundleId: "bundle-external",
+    originalFileName: "winner.txt",
+    mediaType: "text/plain",
+    byteSize: 6,
+    contentHash: "different-hash",
+    storageKey: "bundles/bundle-external/winner/original",
+    extractedTextKey: "bundles/bundle-external/winner/extracted",
+    extractionStatus: "completed",
+    extractionError: null,
+    origin: "external_web",
+    canonicalUrl: "https://fifa.com/guidance/width",
+    publisher: "FIFA",
+    publishedAt: "2026-08-20",
+    retrievedAt: 1_777_000_000_000,
+    searchCandidateId: "winner-candidate",
+  };
+  database.nextUniqueConflict = winner;
+
+  const source = await new EvidenceFileStore({ bucket, registration: database }).putValidatedFile({
+    bundleId: "bundle-external",
+    name: "loser.txt",
+    type: "text/plain",
+    bytes: new TextEncoder().encode("loser body"),
+    externalMetadata: {
+      origin: "external_web",
+      canonicalUrl: winner.canonicalUrl!,
+      publisher: "FIFA",
+      publishedAt: "2026-08-20",
+      retrievedAt: 1_777_000_000_001,
+      searchCandidateId: "loser-candidate",
+    },
+  });
+
+  assert.equal(source.id, winner.id);
+  assert.equal(bucket.objects.size, 0);
+  assert.deepEqual(database.cleanupReceipts.map(({ status, error }) => ({ status, error })), [
+    { status: "completed", error: null },
+  ]);
+});
+
+test("retains the exact committed source objects when registration commits and then throws", async () => {
+  const bucket = new FakeR2();
+  const database = new FakeD1();
+  database.commitThenThrow = true;
+
+  const source = await new EvidenceFileStore({ bucket, registration: database }).putValidatedFile({
+    bundleId: "bundle-1",
+    name: "commit.md",
+    type: "text/markdown",
+    bytes: new TextEncoder().encode("committed body"),
+  });
+
+  assert.equal(database.rows[0]?.id, source.id);
+  assert.equal(bucket.objects.has(source.storageKey), true);
+  assert.equal(source.extractedTextKey === null ? false : bucket.objects.has(source.extractedTextKey), true);
+  assert.equal(database.cleanupReceipts.length, 0);
+  assert.equal(bucket.deleteAttempts.size, 0);
+});
+
+test("does not restore unowned loser objects when cleanup deletion fails and leaves a durable pending receipt", async () => {
+  const bucket = new FakeR2();
+  bucket.failFirstPutDeletes = true;
+  const database = new FakeD1();
+  database.nextUniqueConflict = {
+    id: "winner",
+    bundleId: "bundle-1",
+    originalFileName: "winner.md",
+    mediaType: "text/markdown",
+    byteSize: 6,
+    contentHash: "winner-hash",
+    storageKey: "winner-original",
+    extractedTextKey: "winner-extracted",
+    extractionStatus: "completed",
+    extractionError: null,
+  };
+
+  await assert.rejects(() => new EvidenceFileStore({ bucket, registration: database }).putValidatedFile({
+    bundleId: "bundle-1",
+    name: "loser.md",
+    type: "text/markdown",
+    bytes: new TextEncoder().encode("loser body"),
+  }), /정리/);
+
+  assert.equal(bucket.objects.has(bucket.putKeys[0]!), true);
+  assert.equal(bucket.objects.has(bucket.putKeys[1]!), false);
+  assert.equal(bucket.putKeys.length, 2, "unowned cleanup must never restore a deleted object");
+  assert.equal(database.cleanupReceipts.length, 1);
+  assert.equal(database.cleanupReceipts[0]?.status, "pending");
+  assert.match(database.cleanupReceipts[0]?.error ?? "", /delete failure/);
 });
 
 test("reconciles both R2 keys after a one-sided pair deletion failure", async () => {

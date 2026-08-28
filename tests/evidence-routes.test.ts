@@ -4,9 +4,22 @@ import test from "node:test";
 import { EvidenceValidationError } from "../lib/domain/evidence.ts";
 import { serializePublicTrainingScenario } from "../lib/domain/content.ts";
 import type { EvidenceAdmin } from "../lib/server/evidence-auth.ts";
-import { EvidenceConflictError } from "../lib/server/evidence-service.ts";
-import { EvidenceFileStore, type StoredEvidenceFile } from "../lib/server/evidence-storage.ts";
-import { EvidenceJobConfigurationConflictError, EvidenceNotFoundError, EvidenceRequestValidationError, EvidenceUnavailableError } from "../lib/server/evidence-errors.ts";
+import {
+  EvidenceConflictError,
+  EvidenceService,
+  type EvidenceBundleRecord,
+  type EvidenceServiceRepository,
+} from "../lib/server/evidence-service.ts";
+import {
+  EvidenceFileStore,
+  type StoredEvidenceFile,
+} from "../lib/server/evidence-storage.ts";
+import {
+  EvidenceJobConfigurationConflictError,
+  EvidenceNotFoundError,
+  EvidenceRequestValidationError,
+  EvidenceUnavailableError,
+} from "../lib/server/evidence-errors.ts";
 import {
   bindEvidenceSchedule,
   handleEvidenceAnalyzeStart,
@@ -22,6 +35,11 @@ import {
   handleEvidenceFileUpload,
   handleEvidenceJobRetry,
   handleEvidenceJobStatus,
+  handleEvidenceSearchGet,
+  handleEvidenceSearchImport,
+  handleEvidenceSearchLatest,
+  handleEvidenceSearchSelection,
+  handleEvidenceSearchStart,
   handleEvidenceScenarioDraft,
   runEvidenceAdminRoute,
   type EvidenceRouteRuntime,
@@ -70,7 +88,7 @@ const bundle = {
 const source = {
   id: "source-1",
   bundleId: bundle.id,
-  originalFileName: "코치\"자료\r\n.txt",
+  originalFileName: '코치"자료\r\n.txt',
   mediaType: "text/plain" as const,
   byteSize: 6,
   contentHash: "content-hash",
@@ -80,31 +98,72 @@ const source = {
   extractionError: null,
 };
 
-function runtime(overrides: Partial<EvidenceRouteRuntime> = {}): EvidenceRouteRuntime {
+function cleanupRegistrationCapabilities() {
+  return {
+    async findById() {
+      return null;
+    },
+    async startCleanup() {
+      return "cleanup-receipt";
+    },
+    async finishCleanup() {},
+  };
+}
+
+function runtime(
+  overrides: Partial<EvidenceRouteRuntime> = {},
+): EvidenceRouteRuntime {
   return {
     admin,
     service: {
       listBundlesForAdmin: async () => [bundle],
       createBundle: async () => bundle,
-      getBundleForAdmin: async (id) => id === bundle.id
-        ? { ...bundle, sources: [source], videoClips: [] }
-        : null,
+      getBundleForAdmin: async (id) =>
+        id === bundle.id
+          ? { ...bundle, sources: [source], videoClips: [] }
+          : null,
       updateBundle: async () => bundle,
       addVideoClip: async () => bundle,
-      describeDeleteImpact: async (id) => ({ sourceId: id, cardIds: [], scenarioDraftIds: [] }),
+      describeDeleteImpact: async (id) => ({
+        sourceId: id,
+        cardIds: [],
+        scenarioDraftIds: [],
+      }),
       removeSource: async () => bundle,
       reviewCard: async () => ({
-        id: "card-1", bundleId: bundle.id, jobId: "job-1", bundleVersion: bundle.contentVersion,
-        currentBundleVersion: bundle.contentVersion, currentReviewId: "review-1", producerModel: "secret-model",
-        status: "owner_reviewed", draftContentJson: "{\"llm\":true}", currentContentJson: "{\"situation\":\"현재\"}",
-        isStale: false, createdAt: 1, updatedAt: 3,
+        id: "card-1",
+        bundleId: bundle.id,
+        jobId: "job-1",
+        bundleVersion: bundle.contentVersion,
+        currentBundleVersion: bundle.contentVersion,
+        currentReviewId: "review-1",
+        producerModel: "secret-model",
+        status: "owner_reviewed",
+        draftContentJson: '{"llm":true}',
+        currentContentJson: '{"situation":"현재"}',
+        isStale: false,
+        createdAt: 1,
+        updatedAt: 3,
       }),
       createScenarioDraft: async () => ({
-        id: "scenario-1", campaignId: "campaign-1", role: "ala", principle: "width",
-        prompt: "prompt", hint: "hint", explanation: "explanation", pitchJson: "{\"secret\":true}",
-        answerJson: "{\"secret\":true}", contentJson: "{\"draftContentJson\":true}", reviewStatus: "draft", orderIndex: 1,
+        id: "scenario-1",
+        campaignId: "campaign-1",
+        role: "ala",
+        principle: "width",
+        prompt: "prompt",
+        hint: "hint",
+        explanation: "explanation",
+        pitchJson: '{"secret":true}',
+        answerJson: '{"secret":true}',
+        contentJson: '{"draftContentJson":true}',
+        reviewStatus: "draft",
+        orderIndex: 1,
       }),
-      listCardsForJob: async () => ({ cards: [], totalCount: 0, nextOffset: null }),
+      listCardsForJob: async () => ({
+        cards: [],
+        totalCount: 0,
+        nextOffset: null,
+      }),
     },
     fileStore: {
       putValidatedFile: async () => source,
@@ -113,8 +172,19 @@ function runtime(overrides: Partial<EvidenceRouteRuntime> = {}): EvidenceRouteRu
     jobs: {
       startAnalysis: async () => jobRecord(),
       retryAnalysis: async () => jobRecord(),
-      getAnalysisStatus: async (id) => id === "missing" ? null : jobRecord(),
+      getAnalysisStatus: async (id) => (id === "missing" ? null : jobRecord()),
       getLatestAnalysisStatusForBundle: async () => jobRecord(),
+    },
+    searchJobs: {
+      startSearch: async () => searchRunRecord(),
+      getLatestSearch: async () => searchDetail(),
+      getSearch: async (_bundleId, runId) =>
+        runId === "missing" ? null : searchDetail(),
+      saveSelection: async () => searchDetail(),
+      startImport: async () => ({
+        ...searchRunRecord(),
+        status: "importing" as const,
+      }),
     },
     ...overrides,
   };
@@ -122,12 +192,98 @@ function runtime(overrides: Partial<EvidenceRouteRuntime> = {}): EvidenceRouteRu
 
 function jobRecord() {
   return {
-    id: "job-1", bundleId: bundle.id, inputVersion: bundle.contentVersion,
-    status: "queued" as const, analyzerModel: "secret-model", promptVersion: "secret-prompt", schemaVersion: "secret-schema",
-    stage: "validate_sources" as const, leaseOwner: "secret-runner", leaseToken: "secret-token", leaseExpiresAt: 99,
-    errorMessage: null, startedAt: null, completedAt: null, attemptCount: 0,
-    extractedEvidenceJson: "{\"extractedText\":\"secret\"}", generatedCardsJson: "{\"llm\":\"secret\"}",
-    isStale: false, createdAt: 1, updatedAt: 2,
+    id: "job-1",
+    bundleId: bundle.id,
+    inputVersion: bundle.contentVersion,
+    status: "queued" as const,
+    analyzerModel: "secret-model",
+    promptVersion: "secret-prompt",
+    schemaVersion: "secret-schema",
+    stage: "validate_sources" as const,
+    leaseOwner: "secret-runner",
+    leaseToken: "secret-token",
+    leaseExpiresAt: 99,
+    errorMessage: null,
+    startedAt: null,
+    completedAt: null,
+    attemptCount: 0,
+    extractedEvidenceJson: '{"extractedText":"secret"}',
+    generatedCardsJson: '{"llm":"secret"}',
+    isStale: false,
+    createdAt: 1,
+    updatedAt: 2,
+  };
+}
+
+function searchRunRecord(
+  status:
+    | "queued"
+    | "searching"
+    | "ready"
+    | "importing"
+    | "completed"
+    | "failed" = "queued",
+) {
+  return {
+    id: "search-1",
+    bundleId: bundle.id,
+    inputVersion: "secret-input-version",
+    bundleVersion: bundle.version,
+    status,
+    searchModel: "secret-search-model",
+    promptVersion: "secret-search-prompt",
+    queries: ["secret generated query"],
+    errorMessage: status === "failed" ? "socket error sk-test" : null,
+    isStale: false,
+    startedAt: 3,
+    completedAt: null,
+    createdAt: 2,
+    updatedAt: 3,
+    queryJson: '["secret generated query"]',
+    rawProviderBody: "sk-test provider body",
+    leaseToken: "search-lease-token",
+  };
+}
+
+function searchDetail(
+  status:
+    | "queued"
+    | "searching"
+    | "ready"
+    | "importing"
+    | "completed"
+    | "failed" = "ready",
+) {
+  return {
+    run: searchRunRecord(status),
+    candidates: [
+      {
+        id: "candidate-1",
+        runId: "search-1",
+        bundleId: bundle.id,
+        url: "https://uefa.example/private-original",
+        canonicalUrl: "https://uefa.example/pressing",
+        title: "Pressing",
+        publisher: "UEFA",
+        publishedAt: "2026-01-02",
+        retrievedAt: 4,
+        documentType: "web_page" as const,
+        quote: "Press together",
+        relevance: "압박 원칙",
+        trustTier: 1 as const,
+        rank: 1,
+        status: "candidate" as const,
+        selectedBy: "selector-user-secret",
+        selectedAt: 5,
+        sourceId: "source-secret",
+        contentHash: "content-hash-secret",
+        failureReason: "socket error sk-test",
+        storageKey: "bundles/private/imported-key",
+        leaseToken: "candidate-lease-token",
+        createdAt: 3,
+        updatedAt: 4,
+      },
+    ],
   };
 }
 
@@ -150,7 +306,8 @@ function streamingRequest(
   signal?: AbortSignal,
 ) {
   const headers = new Headers({ "content-type": contentType });
-  if (contentLength !== undefined) headers.set("content-length", String(contentLength));
+  if (contentLength !== undefined)
+    headers.set("content-length", String(contentLength));
   return new Request("http://localhost/api/admin/evidence/bundle-1/files", {
     method: "POST",
     headers,
@@ -176,37 +333,115 @@ function onePagePdf(stream: string, filter = ""): Uint8Array {
   }
   const xref = document.length;
   document += `xref\n0 ${objects.length + 1}\n0000000000 65535 f \n`;
-  document += offsets.slice(1).map((offset) => `${offset.toString().padStart(10, "0")} 00000 n \n`).join("");
+  document += offsets
+    .slice(1)
+    .map((offset) => `${offset.toString().padStart(10, "0")} 00000 n \n`)
+    .join("");
   document += `trailer\n<< /Size ${objects.length + 1} /Root 1 0 R >>\nstartxref\n${xref}\n%%EOF`;
   return new TextEncoder().encode(document);
 }
 
 async function body(response: Response): Promise<Record<string, unknown>> {
-  return await response.json() as Record<string, unknown>;
+  return (await response.json()) as Record<string, unknown>;
 }
 
 test("every evidence endpoint authorizes before parsing or creating runtime resources", async () => {
   const request = jsonRequest("/api/admin/evidence", "{broken");
   Object.defineProperties(request, {
-    json: { value: () => { throw new Error("body parsed before authorization"); } },
-    formData: { value: () => { throw new Error("form parsed before authorization"); } },
-    arrayBuffer: { value: () => { throw new Error("bytes read before authorization"); } },
+    json: {
+      value: () => {
+        throw new Error("body parsed before authorization");
+      },
+    },
+    formData: {
+      value: () => {
+        throw new Error("form parsed before authorization");
+      },
+    },
+    arrayBuffer: {
+      value: () => {
+        throw new Error("bytes read before authorization");
+      },
+    },
   });
   const endpoints = [
     () => handleEvidenceCollectionList(runtime()),
     () => handleEvidenceCollectionCreate(request, runtime()),
     () => handleEvidenceBundleGet(context({ bundleId: "missing" }), runtime()),
-    () => handleEvidenceBundleUpdate(request, context({ bundleId: "missing" }), runtime()),
-    () => handleEvidenceFileUpload(request, context({ bundleId: "missing" }), runtime()),
-    () => handleEvidenceFileDownload(context({ bundleId: "missing", sourceId: "missing" }), runtime()),
-    () => handleEvidenceFileImpact(context({ bundleId: "missing", sourceId: "missing" }), runtime()),
-    () => handleEvidenceFileDelete(context({ bundleId: "missing", sourceId: "missing" }), runtime()),
-    () => handleEvidenceClipCreate(request, context({ bundleId: "missing" }), runtime()),
-    () => handleEvidenceAnalyzeStart(context({ bundleId: "missing" }), runtime()),
-    () => handleEvidenceJobStatus(new Request("http://test/"), context({ jobId: "missing" }), runtime()),
+    () =>
+      handleEvidenceBundleUpdate(
+        request,
+        context({ bundleId: "missing" }),
+        runtime(),
+      ),
+    () =>
+      handleEvidenceFileUpload(
+        request,
+        context({ bundleId: "missing" }),
+        runtime(),
+      ),
+    () =>
+      handleEvidenceFileDownload(
+        context({ bundleId: "missing", sourceId: "missing" }),
+        runtime(),
+      ),
+    () =>
+      handleEvidenceFileImpact(
+        context({ bundleId: "missing", sourceId: "missing" }),
+        runtime(),
+      ),
+    () =>
+      handleEvidenceFileDelete(
+        context({ bundleId: "missing", sourceId: "missing" }),
+        runtime(),
+      ),
+    () =>
+      handleEvidenceClipCreate(
+        request,
+        context({ bundleId: "missing" }),
+        runtime(),
+      ),
+    () =>
+      handleEvidenceAnalyzeStart(context({ bundleId: "missing" }), runtime()),
+    () =>
+      handleEvidenceJobStatus(
+        new Request("http://test/"),
+        context({ jobId: "missing" }),
+        runtime(),
+      ),
     () => handleEvidenceJobRetry(context({ jobId: "missing" }), runtime()),
-    () => handleEvidenceCardReview(request, context({ cardId: "missing" }), runtime()),
-    () => handleEvidenceScenarioDraft(request, context({ cardId: "missing" }), runtime()),
+    () =>
+      handleEvidenceSearchStart(context({ bundleId: "missing" }), runtime()),
+    () =>
+      handleEvidenceSearchLatest(context({ bundleId: "missing" }), runtime()),
+    () =>
+      handleEvidenceSearchGet(
+        context({ bundleId: "missing", runId: "missing" }),
+        runtime(),
+      ),
+    () =>
+      handleEvidenceSearchSelection(
+        request,
+        context({ bundleId: "missing", runId: "missing" }),
+        runtime(),
+      ),
+    () =>
+      handleEvidenceSearchImport(
+        context({ bundleId: "missing", runId: "missing" }),
+        runtime(),
+      ),
+    () =>
+      handleEvidenceCardReview(
+        request,
+        context({ cardId: "missing" }),
+        runtime(),
+      ),
+    () =>
+      handleEvidenceScenarioDraft(
+        request,
+        context({ cardId: "missing" }),
+        runtime(),
+      ),
   ];
 
   for (const status of [401, 403] as const) {
@@ -232,77 +467,266 @@ test("list, create, get, and update expose safe bundle projections", async () =>
   assert.equal(list.status, 200);
   assert.deepEqual(await body(list), { bundles: [bundle] });
 
-  const created = await handleEvidenceCollectionCreate(jsonRequest("/api/admin/evidence", {
-    title: bundle.title, purpose: bundle.purpose,
-  }), runtime());
+  const created = await handleEvidenceCollectionCreate(
+    jsonRequest("/api/admin/evidence", {
+      title: bundle.title,
+      purpose: bundle.purpose,
+    }),
+    runtime(),
+  );
   assert.equal(created.status, 201);
 
-  const detail = await handleEvidenceBundleGet(context({ bundleId: bundle.id }), runtime());
+  const detail = await handleEvidenceBundleGet(
+    context({ bundleId: bundle.id }),
+    runtime(),
+  );
   assert.equal(detail.status, 200);
-  const detailBody = await body(detail) as { latestJob?: { id: string; analyzerModel?: string } };
+  const detailBody = (await body(detail)) as {
+    latestJob?: { id: string; analyzerModel?: string };
+  };
   assert.equal(detailBody.latestJob?.id, "job-1");
   const serialized = JSON.stringify(detailBody);
-  for (const secret of [source.storageKey, source.extractedTextKey, "storageKey", "extractedTextKey"]) {
+  for (const secret of [
+    source.storageKey,
+    source.extractedTextKey,
+    "storageKey",
+    "extractedTextKey",
+  ]) {
     assert.equal(serialized.includes(secret), false);
   }
 
-  const updated = await handleEvidenceBundleUpdate(jsonRequest("/", { title: "변경", purpose: "변경" }, "PATCH"), context({ bundleId: bundle.id }), runtime());
+  const updated = await handleEvidenceBundleUpdate(
+    jsonRequest("/", { title: "변경", purpose: "변경" }, "PATCH"),
+    context({ bundleId: bundle.id }),
+    runtime(),
+  );
   assert.equal(updated.status, 200);
 });
 
-test("source projections redact arbitrary extraction provider errors", async () => {
-  const response = await handleEvidenceBundleGet(context({ bundleId: bundle.id }), runtime({
-    service: {
-      ...runtime().service,
-      getBundleForAdmin: async () => ({
-        ...bundle,
-        sources: [{ ...source, extractionStatus: "failed", extractionError: `R2 ${source.storageKey} provider-secret` }],
-        videoClips: [],
-      }),
+test("title-only route edits stale old-run selection and import with 409 while preserving content version", async () => {
+  let current: EvidenceBundleRecord = { ...bundle };
+  const oldSearchVersion = current.version;
+  const repository: EvidenceServiceRepository = {
+    campaignExists: async () => true,
+    getBundle: async (id) => id === current.id ? current : null,
+    listBundles: async () => [current],
+    listSources: async () => [],
+    findSource: async () => null,
+    listVideoClips: async () => [],
+    findSourceByHash: async () => null,
+    createR2CleanupReceipt: async () => undefined,
+    finishR2CleanupReceipt: async () => undefined,
+    describeDeleteImpact: async (sourceId) => ({ sourceId, cardIds: [], scenarioDraftIds: [] }),
+    createBundle: async () => undefined,
+    applyMutation: async (mutation) => {
+      if (mutation.current.version !== current.version || mutation.current.contentVersion !== current.contentVersion) return false;
+      current = mutation.next;
+      return true;
     },
-  }));
+    listCardsForJob: async () => [],
+    countCardsForJob: async () => 0,
+    findCard: async () => null,
+    listCardCitations: async () => [],
+    countCardCitations: async () => 0,
+    listCardCitationsForAdmin: async () => [],
+    findCardReview: async () => null,
+    applyCardReview: async () => false,
+    findScenarioDraftByReview: async () => null,
+    createScenarioDraft: async () => "conflict",
+  };
+  const service = new EvidenceService({
+    repository,
+    settings: { analyzerModel: "model", promptVersion: "prompt", schemaVersion: "schema" },
+    now: () => current.updatedAt + 1,
+    newId: () => "audit-title-update",
+  });
+  const titleRuntime = runtime({
+    service,
+    searchJobs: {
+      ...runtime().searchJobs,
+      saveSelection: async () => {
+        if (current.version !== oldSearchVersion) throw new EvidenceConflictError();
+        return searchDetail();
+      },
+      startImport: async () => {
+        if (current.version !== oldSearchVersion) throw new EvidenceConflictError();
+        return searchRunRecord("importing");
+      },
+    },
+  });
+
+  const updated = await handleEvidenceBundleUpdate(
+    jsonRequest("/", { title: "새 라우트 제목" }, "PATCH"),
+    context({ bundleId: bundle.id }),
+    titleRuntime,
+  );
+  assert.equal(updated.status, 200);
+  const updatedBundle = (await body(updated)).bundle as { version: number; contentVersion: string };
+  assert.equal(updatedBundle.version, oldSearchVersion + 1);
+  assert.equal(updatedBundle.contentVersion, bundle.contentVersion);
+
+  const selection = await handleEvidenceSearchSelection(
+    jsonRequest("/", {
+      expectedBundleVersion: oldSearchVersion + 1,
+      selectedIds: ["candidate-1"],
+      excludedIds: [],
+    }, "PATCH"),
+    context({ bundleId: bundle.id, runId: "search-1" }),
+    titleRuntime,
+  );
+  const imported = await handleEvidenceSearchImport(
+    context({ bundleId: bundle.id, runId: "search-1" }),
+    titleRuntime,
+  );
+  assert.equal(selection.status, 409);
+  assert.equal(imported.status, 409);
+});
+
+test("source projections redact arbitrary extraction provider errors", async () => {
+  const response = await handleEvidenceBundleGet(
+    context({ bundleId: bundle.id }),
+    runtime({
+      service: {
+        ...runtime().service,
+        getBundleForAdmin: async () => ({
+          ...bundle,
+          sources: [
+            {
+              ...source,
+              extractionStatus: "failed",
+              extractionError: `R2 ${source.storageKey} provider-secret`,
+            },
+          ],
+          videoClips: [],
+        }),
+      },
+    }),
+  );
   const serialized = JSON.stringify(await body(response));
   assert.equal(serialized.includes(source.storageKey), false);
   assert.equal(serialized.includes("provider-secret"), false);
 });
 
+test("administrator bundle source projection retains safe external provenance only", async () => {
+  const externalSource = {
+    ...source,
+    id: "external-source-1",
+    origin: "external_web" as const,
+    canonicalUrl: "https://uefa.example/pressing",
+    publisher: "UEFA",
+    publishedAt: "2026-01-02",
+    retrievedAt: 1_700_000_000_000,
+    searchCandidateId: "internal-candidate",
+    searchCandidateLeaseToken: "internal-lease",
+  };
+  const response = await handleEvidenceBundleGet(
+    context({ bundleId: bundle.id }),
+    runtime({
+      service: {
+        ...runtime().service,
+        getBundleForAdmin: async () => ({
+          ...bundle,
+          sources: [externalSource],
+          videoClips: [],
+        }),
+      },
+    }),
+  );
+  const value = (await body(response)) as {
+    bundle: { sources: Array<Record<string, unknown>> };
+  };
+  assert.deepEqual(value.bundle.sources[0], {
+    id: externalSource.id,
+    bundleId: bundle.id,
+    originalFileName: source.originalFileName,
+    mediaType: source.mediaType,
+    byteSize: source.byteSize,
+    contentHash: source.contentHash,
+    extractionStatus: source.extractionStatus,
+    extractionError: null,
+    origin: "external_web",
+    canonicalUrl: externalSource.canonicalUrl,
+    publisher: externalSource.publisher,
+    publishedAt: externalSource.publishedAt,
+    retrievedAt: externalSource.retrievedAt,
+  });
+  assert.doesNotMatch(
+    JSON.stringify(value),
+    /internal-candidate|internal-lease|storageKey/,
+  );
+});
+
 test("malformed JSON is 400, authorized missing resources are 404, and CAS failures are 409", async () => {
-  const malformed = await handleEvidenceCollectionCreate(jsonRequest("/", "{broken"), runtime());
+  const malformed = await handleEvidenceCollectionCreate(
+    jsonRequest("/", "{broken"),
+    runtime(),
+  );
   assert.equal(malformed.status, 400);
 
-  const missing = await handleEvidenceBundleGet(context({ bundleId: "missing" }), runtime());
+  const missing = await handleEvidenceBundleGet(
+    context({ bundleId: "missing" }),
+    runtime(),
+  );
   assert.equal(missing.status, 404);
 
   const conflictRuntime = runtime({
     service: {
       ...runtime().service,
-      updateBundle: async () => { throw new EvidenceConflictError(); },
+      updateBundle: async () => {
+        throw new EvidenceConflictError();
+      },
     },
   });
-  const conflict = await handleEvidenceBundleUpdate(jsonRequest("/", { title: "변경" }, "PATCH"), context({ bundleId: bundle.id }), conflictRuntime);
+  const conflict = await handleEvidenceBundleUpdate(
+    jsonRequest("/", { title: "변경" }, "PATCH"),
+    context({ bundleId: bundle.id }),
+    conflictRuntime,
+  );
   assert.equal(conflict.status, 409);
 });
 
 test("multipart upload returns 413 for oversize, 415 for mismatch, and never returns storage keys", async () => {
   const oversized = new FormData();
-  oversized.set("file", new File([new Uint8Array(20 * 1024 * 1024 + 1)], "large.txt", { type: "text/plain" }));
-  const tooLarge = await handleEvidenceFileUpload(new Request("http://localhost", { method: "POST", body: oversized }), context({ bundleId: bundle.id }), runtime());
+  oversized.set(
+    "file",
+    new File([new Uint8Array(20 * 1024 * 1024 + 1)], "large.txt", {
+      type: "text/plain",
+    }),
+  );
+  const tooLarge = await handleEvidenceFileUpload(
+    new Request("http://localhost", { method: "POST", body: oversized }),
+    context({ bundleId: bundle.id }),
+    runtime(),
+  );
   assert.equal(tooLarge.status, 413);
 
   const mismatched = new FormData();
-  mismatched.set("file", new File(["not a pdf"], "notes.pdf", { type: "application/pdf" }));
+  mismatched.set(
+    "file",
+    new File(["not a pdf"], "notes.pdf", { type: "application/pdf" }),
+  );
   const mismatchRuntime = runtime({
     fileStore: {
       ...runtime().fileStore,
-      putValidatedFile: async () => { throw new EvidenceValidationError("파일 형식이 올바르지 않습니다."); },
+      putValidatedFile: async () => {
+        throw new EvidenceValidationError("파일 형식이 올바르지 않습니다.");
+      },
     },
   });
-  const unsupported = await handleEvidenceFileUpload(new Request("http://localhost", { method: "POST", body: mismatched }), context({ bundleId: bundle.id }), mismatchRuntime);
+  const unsupported = await handleEvidenceFileUpload(
+    new Request("http://localhost", { method: "POST", body: mismatched }),
+    context({ bundleId: bundle.id }),
+    mismatchRuntime,
+  );
   assert.equal(unsupported.status, 415);
 
   const valid = new FormData();
   valid.set("file", new File(["근거"], "notes.txt", { type: "text/plain" }));
-  const uploaded = await handleEvidenceFileUpload(new Request("http://localhost", { method: "POST", body: valid }), context({ bundleId: bundle.id }), runtime());
+  const uploaded = await handleEvidenceFileUpload(
+    new Request("http://localhost", { method: "POST", body: valid }),
+    context({ bundleId: bundle.id }),
+    runtime(),
+  );
   assert.equal(uploaded.status, 201);
   const serialized = JSON.stringify(await body(uploaded));
   assert.equal(serialized.includes("storageKey"), false);
@@ -314,19 +738,28 @@ test("multipart upload caps the whole envelope before parsing extra parts", asyn
   const boundary = "envelope-boundary";
   let phase = 0;
   let cancelled = false;
-  const stream = new ReadableStream<Uint8Array>({
-    pull(controller) {
-      if (cancelled) return;
-      if (phase === 0) {
+  const stream = new ReadableStream<Uint8Array>(
+    {
+      pull(controller) {
+        if (cancelled) return;
+        if (phase === 0) {
+          phase += 1;
+          controller.enqueue(
+            encoder.encode(
+              `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="small.txt"\r\nContent-Type: text/plain\r\n\r\nx\r\n--${boundary}\r\nContent-Disposition: form-data; name="junk"\r\n\r\n`,
+            ),
+          );
+          return;
+        }
         phase += 1;
-        controller.enqueue(encoder.encode(`--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="small.txt"\r\nContent-Type: text/plain\r\n\r\nx\r\n--${boundary}\r\nContent-Disposition: form-data; name="junk"\r\n\r\n`));
-        return;
-      }
-      phase += 1;
-      controller.enqueue(new Uint8Array(1024 * 1024).fill(0x61));
+        controller.enqueue(new Uint8Array(1024 * 1024).fill(0x61));
+      },
+      cancel() {
+        cancelled = true;
+      },
     },
-    cancel() { cancelled = true; },
-  }, { highWaterMark: 0 });
+    { highWaterMark: 0 },
+  );
 
   const response = await handleEvidenceFileUpload(
     streamingRequest(stream, `multipart/form-data; boundary=${boundary}`),
@@ -341,40 +774,60 @@ test("chunked multipart overflow is 413 without a Content-Length header", async 
   const encoder = new TextEncoder();
   const boundary = "chunked-boundary";
   let phase = 0;
-  const request = streamingRequest(new ReadableStream<Uint8Array>({
-    pull(controller) {
-      if (phase === 0) {
-        phase += 1;
-        controller.enqueue(encoder.encode(
-          `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="large.txt"\r\nContent-Type: text/plain\r\n\r\n`,
-        ));
-        return;
-      }
-      if (phase <= 21) {
-        phase += 1;
-        controller.enqueue(new Uint8Array(1024 * 1024).fill(0x61));
-        return;
-      }
-      controller.enqueue(encoder.encode(`\r\n--${boundary}--\r\n`));
-      controller.close();
-    },
-  }), `multipart/form-data; boundary=${boundary}`);
+  const request = streamingRequest(
+    new ReadableStream<Uint8Array>({
+      pull(controller) {
+        if (phase === 0) {
+          phase += 1;
+          controller.enqueue(
+            encoder.encode(
+              `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="large.txt"\r\nContent-Type: text/plain\r\n\r\n`,
+            ),
+          );
+          return;
+        }
+        if (phase <= 21) {
+          phase += 1;
+          controller.enqueue(new Uint8Array(1024 * 1024).fill(0x61));
+          return;
+        }
+        controller.enqueue(encoder.encode(`\r\n--${boundary}--\r\n`));
+        controller.close();
+      },
+    }),
+    `multipart/form-data; boundary=${boundary}`,
+  );
 
-  const response = await handleEvidenceFileUpload(request, context({ bundleId: bundle.id }), runtime());
+  const response = await handleEvidenceFileUpload(
+    request,
+    context({ bundleId: bundle.id }),
+    runtime(),
+  );
 
   assert.equal(response.status, 413);
 });
 
 test("Content-Length rejects an oversized multipart request without reading its stream", async () => {
   let reads = 0;
-  const request = streamingRequest(new ReadableStream<Uint8Array>({
-    pull(controller) {
-      reads += 1;
-      controller.close();
-    },
-  }, { highWaterMark: 0 }), "multipart/form-data; boundary=unused", 21 * 1024 * 1024);
+  const request = streamingRequest(
+    new ReadableStream<Uint8Array>(
+      {
+        pull(controller) {
+          reads += 1;
+          controller.close();
+        },
+      },
+      { highWaterMark: 0 },
+    ),
+    "multipart/form-data; boundary=unused",
+    21 * 1024 * 1024,
+  );
 
-  const response = await handleEvidenceFileUpload(request, context({ bundleId: bundle.id }), runtime());
+  const response = await handleEvidenceFileUpload(
+    request,
+    context({ bundleId: bundle.id }),
+    runtime(),
+  );
 
   assert.equal(response.status, 413);
   assert.equal(reads, 0);
@@ -382,8 +835,14 @@ test("Content-Length rejects an oversized multipart request without reading its 
 
 test("multipart upload rejects duplicate file and unexpected form parts", async () => {
   const duplicate = new FormData();
-  duplicate.append("file", new File(["one"], "one.txt", { type: "text/plain" }));
-  duplicate.append("file", new File(["two"], "two.txt", { type: "text/plain" }));
+  duplicate.append(
+    "file",
+    new File(["one"], "one.txt", { type: "text/plain" }),
+  );
+  duplicate.append(
+    "file",
+    new File(["two"], "two.txt", { type: "text/plain" }),
+  );
   const duplicateResponse = await handleEvidenceFileUpload(
     new Request("http://localhost", { method: "POST", body: duplicate }),
     context({ bundleId: bundle.id }),
@@ -392,7 +851,10 @@ test("multipart upload rejects duplicate file and unexpected form parts", async 
   assert.equal(duplicateResponse.status, 400);
 
   const unexpected = new FormData();
-  unexpected.append("file", new File(["one"], "one.txt", { type: "text/plain" }));
+  unexpected.append(
+    "file",
+    new File(["one"], "one.txt", { type: "text/plain" }),
+  );
   unexpected.append("notes", "unexpected");
   const unexpectedResponse = await handleEvidenceFileUpload(
     new Request("http://localhost", { method: "POST", body: unexpected }),
@@ -407,13 +869,25 @@ test("PDF preflight rejects corrupt content and preserves valid scan/text behavi
   const rows: StoredEvidenceFile[] = [];
   const store = new EvidenceFileStore({
     bucket: {
-      async put(key, value) { objects.set(key, value); },
-      async get(key) { return objects.get(key) ?? null; },
-      async delete(key) { objects.delete(key); },
+      async put(key, value) {
+        objects.set(key, value);
+      },
+      async get(key) {
+        return objects.get(key) ?? null;
+      },
+      async delete(key) {
+        objects.delete(key);
+      },
     },
     registration: {
-      async findExisting() { return null; },
-      async register(value) { rows.push(value); return value; },
+      ...cleanupRegistrationCapabilities(),
+      async findExisting() {
+        return null;
+      },
+      async register(value) {
+        rows.push(value);
+        return value;
+      },
     },
   });
   async function upload(bytes: Uint8Array, name: string) {
@@ -439,11 +913,17 @@ test("PDF preflight rejects corrupt content and preserves valid scan/text behavi
 
   const scan = await upload(onePagePdf(""), "scan.pdf");
   assert.equal(scan.status, 201);
-  assert.equal(((await body(scan)).source as Record<string, unknown>).extractionStatus, "failed");
+  assert.equal(
+    ((await body(scan)).source as Record<string, unknown>).extractionStatus,
+    "failed",
+  );
   assert.equal(rows[0]?.extractionStatus, "failed");
   assert.equal(objects.size, 1);
 
-  const text = await upload(onePagePdf("BT /F1 12 Tf 72 720 Td (Press forward) Tj ET"), "text.pdf");
+  const text = await upload(
+    onePagePdf("BT /F1 12 Tf 72 720 Td (Press forward) Tj ET"),
+    "text.pdf",
+  );
   assert.equal(text.status, 201);
   assert.equal(rows[1]?.extractionStatus, "completed");
   assert.equal(objects.size, 3);
@@ -453,20 +933,40 @@ test("recovered PDF stream errors return 415 and pre-aborted uploads return 400 
   for (const [name, bytes, aborted] of [
     ["invalid-predictor.pdf", invalidPredictorPdf(), false],
     ["unsupported-filter.pdf", unsupportedFilterPdf(), false],
-    ["tolerated-object-header.pdf", downstreamToleratedObjectHeaderPdf(), false],
-    ["aborted.pdf", onePagePdf("BT /F1 12 Tf 72 720 Td (Press forward) Tj ET"), true],
+    [
+      "tolerated-object-header.pdf",
+      downstreamToleratedObjectHeaderPdf(),
+      false,
+    ],
+    [
+      "aborted.pdf",
+      onePagePdf("BT /F1 12 Tf 72 720 Td (Press forward) Tj ET"),
+      true,
+    ],
   ] as const) {
     const objects = new Map<string, unknown>();
     const rows: StoredEvidenceFile[] = [];
     const store = new EvidenceFileStore({
       bucket: {
-        async put(key, value) { objects.set(key, value); },
-        async get(key) { return objects.get(key) ?? null; },
-        async delete(key) { objects.delete(key); },
+        async put(key, value) {
+          objects.set(key, value);
+        },
+        async get(key) {
+          return objects.get(key) ?? null;
+        },
+        async delete(key) {
+          objects.delete(key);
+        },
       },
       registration: {
-        async findExisting() { return null; },
-        async register(value) { rows.push(value); return value; },
+        ...cleanupRegistrationCapabilities(),
+        async findExisting() {
+          return null;
+        },
+        async register(value) {
+          rows.push(value);
+          return value;
+        },
       },
     });
     const form = new FormData();
@@ -474,7 +974,11 @@ test("recovered PDF stream errors return 415 and pre-aborted uploads return 400 
     const controller = new AbortController();
     if (aborted) controller.abort();
     const response = await handleEvidenceFileUpload(
-      new Request("http://localhost", { method: "POST", body: form, signal: controller.signal }),
+      new Request("http://localhost", {
+        method: "POST",
+        body: form,
+        signal: controller.signal,
+      }),
       context({ bundleId: bundle.id }),
       runtime({ fileStore: store }),
     );
@@ -499,13 +1003,25 @@ test("real upload route rejects indirect, LZW, and later-stage stream failures w
     const rows: StoredEvidenceFile[] = [];
     const store = new EvidenceFileStore({
       bucket: {
-        async put(key, value) { objects.set(key, value); },
-        async get(key) { return objects.get(key) ?? null; },
-        async delete(key) { objects.delete(key); },
+        async put(key, value) {
+          objects.set(key, value);
+        },
+        async get(key) {
+          return objects.get(key) ?? null;
+        },
+        async delete(key) {
+          objects.delete(key);
+        },
       },
       registration: {
-        async findExisting() { return null; },
-        async register(value) { rows.push(value); return value; },
+        ...cleanupRegistrationCapabilities(),
+        async findExisting() {
+          return null;
+        },
+        async register(value) {
+          rows.push(value);
+          return value;
+        },
       },
     });
     const form = new FormData();
@@ -528,8 +1044,16 @@ test("real upload route preserves image scans, commented lengths, and validated 
     ["image-scan.pdf", imageBackedScanPdf(), "failed"],
     ["jpeg-image-scan.pdf", jpegImageScanPdf(), "failed"],
     ["shared-jpeg-two-page-scan.pdf", sharedJpegTwoPageScanPdf(), "failed"],
-    ["commented-indirect-length.pdf", commentedIndirectLengthTextPdf(), "completed"],
-    ["compressed-object-indirect.pdf", compressedObjectIndirectTextPdf(), "completed"],
+    [
+      "commented-indirect-length.pdf",
+      commentedIndirectLengthTextPdf(),
+      "completed",
+    ],
+    [
+      "compressed-object-indirect.pdf",
+      compressedObjectIndirectTextPdf(),
+      "completed",
+    ],
     ["asciihex-flate.pdf", multiFilterTextPdf(), "completed"],
     ["ascii85-flate.pdf", ascii85FlateTextPdf(), "completed"],
     ["runlength-flate.pdf", runLengthFlateTextPdf(), "completed"],
@@ -541,13 +1065,25 @@ test("real upload route preserves image scans, commented lengths, and validated 
     const rows: StoredEvidenceFile[] = [];
     const store = new EvidenceFileStore({
       bucket: {
-        async put(key, value) { objects.set(key, value); },
-        async get(key) { return objects.get(key) ?? null; },
-        async delete(key) { objects.delete(key); },
+        async put(key, value) {
+          objects.set(key, value);
+        },
+        async get(key) {
+          return objects.get(key) ?? null;
+        },
+        async delete(key) {
+          objects.delete(key);
+        },
       },
       registration: {
-        async findExisting() { return null; },
-        async register(value) { rows.push(value); return value; },
+        ...cleanupRegistrationCapabilities(),
+        async findExisting() {
+          return null;
+        },
+        async register(value) {
+          rows.push(value);
+          return value;
+        },
       },
     });
     const form = new FormData();
@@ -560,7 +1096,12 @@ test("real upload route preserves image scans, commented lengths, and validated 
     );
 
     assert.equal(response.status, 201, name);
-    assert.equal(((await body(response)).source as Record<string, unknown>).extractionStatus, expectedStatus, name);
+    assert.equal(
+      ((await body(response)).source as Record<string, unknown>)
+        .extractionStatus,
+      expectedStatus,
+      name,
+    );
     assert.equal(rows.length, 1, name);
     assert.equal(objects.size, expectedStatus === "failed" ? 1 : 2, name);
   }
@@ -572,37 +1113,63 @@ test("request abort during stalled multipart parsing cancels input and persists 
   let pulls = 0;
   let cancelCalls = 0;
   let secondPull!: () => void;
-  const secondPullStarted = new Promise<void>((resolve) => { secondPull = resolve; });
-  const source = new ReadableStream<Uint8Array>({
-    pull(controller) {
-      pulls += 1;
-      if (pulls === 1) {
-        controller.enqueue(encoder.encode(
-          `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="notes.txt"\r\nContent-Type: text/plain\r\n\r\npartial`,
-        ));
-        return;
-      }
-      secondPull();
-      return new Promise<void>(() => undefined);
+  const secondPullStarted = new Promise<void>((resolve) => {
+    secondPull = resolve;
+  });
+  const source = new ReadableStream<Uint8Array>(
+    {
+      pull(controller) {
+        pulls += 1;
+        if (pulls === 1) {
+          controller.enqueue(
+            encoder.encode(
+              `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="notes.txt"\r\nContent-Type: text/plain\r\n\r\npartial`,
+            ),
+          );
+          return;
+        }
+        secondPull();
+        return new Promise<void>(() => undefined);
+      },
+      cancel() {
+        cancelCalls += 1;
+      },
     },
-    cancel() { cancelCalls += 1; },
-  }, { highWaterMark: 0 });
+    { highWaterMark: 0 },
+  );
   const objects = new Map<string, unknown>();
   const rows: StoredEvidenceFile[] = [];
   const store = new EvidenceFileStore({
     bucket: {
-      async put(key, value) { objects.set(key, value); },
-      async get(key) { return objects.get(key) ?? null; },
-      async delete(key) { objects.delete(key); },
+      async put(key, value) {
+        objects.set(key, value);
+      },
+      async get(key) {
+        return objects.get(key) ?? null;
+      },
+      async delete(key) {
+        objects.delete(key);
+      },
     },
     registration: {
-      async findExisting() { return null; },
-      async register(value) { rows.push(value); return value; },
+      ...cleanupRegistrationCapabilities(),
+      async findExisting() {
+        return null;
+      },
+      async register(value) {
+        rows.push(value);
+        return value;
+      },
     },
   });
   const controller = new AbortController();
   const responsePromise = handleEvidenceFileUpload(
-    streamingRequest(source, `multipart/form-data; boundary=${boundary}`, undefined, controller.signal),
+    streamingRequest(
+      source,
+      `multipart/form-data; boundary=${boundary}`,
+      undefined,
+      controller.signal,
+    ),
     context({ bundleId: bundle.id }),
     runtime({ fileStore: store }),
   );
@@ -611,10 +1178,13 @@ test("request abort during stalled multipart parsing cancels input and persists 
 
   const response = await Promise.race([
     responsePromise,
-    new Promise<never>((_, reject) => setTimeout(
-      () => reject(new Error("multipart upload cancellation was not observed")),
-      100,
-    )),
+    new Promise<never>((_, reject) =>
+      setTimeout(
+        () =>
+          reject(new Error("multipart upload cancellation was not observed")),
+        100,
+      ),
+    ),
   ]);
 
   assert.equal(response.status, 400);
@@ -626,15 +1196,17 @@ test("request abort during stalled multipart parsing cancels input and persists 
 test("request abort after body EOF but before multipart resolution persists nothing", async () => {
   const encoder = new TextEncoder();
   const boundary = "abort-after-eof-boundary";
-  const multipart = encoder.encode([
-    `--${boundary}`,
-    'Content-Disposition: form-data; name="file"; filename="notes.txt"',
-    "Content-Type: text/plain",
-    "",
-    "Press forward",
-    `--${boundary}--`,
-    "",
-  ].join("\r\n"));
+  const multipart = encoder.encode(
+    [
+      `--${boundary}`,
+      'Content-Disposition: form-data; name="file"; filename="notes.txt"',
+      "Content-Type: text/plain",
+      "",
+      "Press forward",
+      `--${boundary}--`,
+      "",
+    ].join("\r\n"),
+  );
   const abortController = new AbortController();
   let pulls = 0;
   const bodyStream = new ReadableStream<Uint8Array>({
@@ -675,7 +1247,9 @@ test("request abort after body EOF but before multipart resolution persists noth
 
   assert.equal(abortController.signal.aborted, true);
   assert.equal(response.status, 400);
-  assert.deepEqual(await body(response), { error: "파일 업로드가 중단되었습니다." });
+  assert.deepEqual(await body(response), {
+    error: "파일 업로드가 중단되었습니다.",
+  });
   assert.equal(putCalls, 0);
 });
 
@@ -687,13 +1261,24 @@ test("upload preserves typed registration conflicts/not-found after cleanup with
     const objects = new Map<string, unknown>();
     const store = new EvidenceFileStore({
       bucket: {
-        async put(key, value) { objects.set(key, value); },
-        async get(key) { return objects.get(key) ?? null; },
-        async delete(key) { objects.delete(key); },
+        async put(key, value) {
+          objects.set(key, value);
+        },
+        async get(key) {
+          return objects.get(key) ?? null;
+        },
+        async delete(key) {
+          objects.delete(key);
+        },
       },
       registration: {
-        async findExisting() { return null; },
-        async register() { throw error; },
+        ...cleanupRegistrationCapabilities(),
+        async findExisting() {
+          return null;
+        },
+        async register() {
+          throw error;
+        },
       },
     });
     const form = new FormData();
@@ -712,19 +1297,30 @@ test("upload preserves typed registration conflicts/not-found after cleanup with
 
 test("upload authorization completes before the counting stream reads any byte", async () => {
   let reads = 0;
-  const request = streamingRequest(new ReadableStream<Uint8Array>({
-    pull(controller) {
-      reads += 1;
-      controller.enqueue(new Uint8Array([1]));
-      controller.close();
-    },
-  }, { highWaterMark: 0 }), "multipart/form-data; boundary=auth-first");
+  const request = streamingRequest(
+    new ReadableStream<Uint8Array>(
+      {
+        pull(controller) {
+          reads += 1;
+          controller.enqueue(new Uint8Array([1]));
+          controller.close();
+        },
+      },
+      { highWaterMark: 0 },
+    ),
+    "multipart/form-data; boundary=auth-first",
+  );
 
   const response = await runEvidenceAdminRoute(
     request,
     async () => Response.json({ error: "denied" }, { status: 401 }),
     async () => runtime(),
-    (authorized) => handleEvidenceFileUpload(request, context({ bundleId: bundle.id }), authorized),
+    (authorized) =>
+      handleEvidenceFileUpload(
+        request,
+        context({ bundleId: bundle.id }),
+        authorized,
+      ),
   );
 
   assert.equal(response.status, 401);
@@ -732,24 +1328,44 @@ test("upload authorization completes before the counting stream reads any byte",
 });
 
 test("clip validation is 400 and a missing authorized bundle is 404", async () => {
-  const invalid = await handleEvidenceClipCreate(jsonRequest("/", {
-    url: "http://example.test/video", startMs: 10, endMs: 5, observation: "관찰",
-  }), context({ bundleId: bundle.id }), runtime({
-    service: {
-      ...runtime().service,
-      addVideoClip: async () => { throw new EvidenceValidationError("영상 시간 범위가 올바르지 않습니다."); },
-    },
-  }));
+  const invalid = await handleEvidenceClipCreate(
+    jsonRequest("/", {
+      url: "http://example.test/video",
+      startMs: 10,
+      endMs: 5,
+      observation: "관찰",
+    }),
+    context({ bundleId: bundle.id }),
+    runtime({
+      service: {
+        ...runtime().service,
+        addVideoClip: async () => {
+          throw new EvidenceValidationError(
+            "영상 시간 범위가 올바르지 않습니다.",
+          );
+        },
+      },
+    }),
+  );
   assert.equal(invalid.status, 400);
 
-  const missing = await handleEvidenceClipCreate(jsonRequest("/", {
-    url: "https://example.test/video", startMs: 0, endMs: 5, observation: "관찰",
-  }), context({ bundleId: "missing" }), runtime({
-    service: {
-      ...runtime().service,
-      addVideoClip: async () => { throw new EvidenceNotFoundError("근거 묶음을 찾을 수 없습니다."); },
-    },
-  }));
+  const missing = await handleEvidenceClipCreate(
+    jsonRequest("/", {
+      url: "https://example.test/video",
+      startMs: 0,
+      endMs: 5,
+      observation: "관찰",
+    }),
+    context({ bundleId: "missing" }),
+    runtime({
+      service: {
+        ...runtime().service,
+        addVideoClip: async () => {
+          throw new EvidenceNotFoundError("근거 묶음을 찾을 수 없습니다.");
+        },
+      },
+    }),
+  );
   assert.equal(missing.status, 404);
 });
 
@@ -757,37 +1373,83 @@ test("analysis start and retry expose safe status while GET polling remains read
   const calls: string[] = [];
   const jobRuntime = runtime({
     jobs: {
-      startAnalysis: async () => { calls.push("start"); return jobRecord(); },
-      retryAnalysis: async () => { calls.push("retry"); return jobRecord(); },
-      getAnalysisStatus: async () => { calls.push("get"); return jobRecord(); },
+      startAnalysis: async () => {
+        calls.push("start");
+        return jobRecord();
+      },
+      retryAnalysis: async () => {
+        calls.push("retry");
+        return jobRecord();
+      },
+      getAnalysisStatus: async () => {
+        calls.push("get");
+        return jobRecord();
+      },
     },
   });
-  const started = await handleEvidenceAnalyzeStart(context({ bundleId: bundle.id }), jobRuntime);
-  const polled = await handleEvidenceJobStatus(new Request("http://test/"), context({ jobId: "job-1" }), jobRuntime);
-  const retried = await handleEvidenceJobRetry(context({ jobId: "job-1" }), jobRuntime);
+  const started = await handleEvidenceAnalyzeStart(
+    context({ bundleId: bundle.id }),
+    jobRuntime,
+  );
+  const polled = await handleEvidenceJobStatus(
+    new Request("http://test/"),
+    context({ jobId: "job-1" }),
+    jobRuntime,
+  );
+  const retried = await handleEvidenceJobRetry(
+    context({ jobId: "job-1" }),
+    jobRuntime,
+  );
   assert.equal(started.status, 202);
   assert.equal(polled.status, 200);
   assert.equal(retried.status, 202);
   assert.deepEqual(calls, ["start", "get", "retry"]);
   for (const response of [started, polled, retried]) {
     const serialized = JSON.stringify(await body(response));
-    for (const secret of ["analyzerModel", "secret-model", "promptVersion", "schemaVersion", "leaseToken", "leaseOwner", "extractedEvidenceJson", "generatedCardsJson", "extractedText", "llm"]) {
+    for (const secret of [
+      "analyzerModel",
+      "secret-model",
+      "promptVersion",
+      "schemaVersion",
+      "leaseToken",
+      "leaseOwner",
+      "extractedEvidenceJson",
+      "generatedCardsJson",
+      "extractedText",
+      "llm",
+    ]) {
       assert.equal(serialized.includes(secret), false);
     }
   }
-  const incompatible = await handleEvidenceJobRetry(context({ jobId: "job-1" }), runtime({
-    jobs: { ...runtime().jobs, retryAnalysis: async () => { throw new EvidenceJobConfigurationConflictError(); } },
-  }));
+  const incompatible = await handleEvidenceJobRetry(
+    context({ jobId: "job-1" }),
+    runtime({
+      jobs: {
+        ...runtime().jobs,
+        retryAnalysis: async () => {
+          throw new EvidenceJobConfigurationConflictError();
+        },
+      },
+    }),
+  );
   assert.equal(incompatible.status, 409);
 });
 
 test("job polling replaces any persisted provider error with a stable public message", async () => {
-  const response = await handleEvidenceJobStatus(new Request("http://test/"), context({ jobId: "job-1" }), runtime({
-    jobs: {
-      ...runtime().jobs,
-      getAnalysisStatus: async () => ({ ...jobRecord(), status: "failed", errorMessage: "HTTP 500 provider-secret-key" }),
-    },
-  }));
+  const response = await handleEvidenceJobStatus(
+    new Request("http://test/"),
+    context({ jobId: "job-1" }),
+    runtime({
+      jobs: {
+        ...runtime().jobs,
+        getAnalysisStatus: async () => ({
+          ...jobRecord(),
+          status: "failed",
+          errorMessage: "HTTP 500 provider-secret-key",
+        }),
+      },
+    }),
+  );
   assert.equal(response.status, 200);
   const serialized = JSON.stringify(await body(response));
   assert.equal(serialized.includes("provider-secret-key"), false);
@@ -796,26 +1458,60 @@ test("job polling replaces any persisted provider error with a stable public mes
 
 test("review-ready job polling returns discoverable cards and bounded citation excerpts", async () => {
   const longExcerpt = `근거-${"가".repeat(3_000)}`;
-  const response = await handleEvidenceJobStatus(new Request("http://test/"), context({ jobId: "job-1" }), runtime({
-    jobs: {
-      ...runtime().jobs,
-      getAnalysisStatus: async () => ({ ...jobRecord(), status: "review_ready" }),
-    },
-    service: {
-      ...runtime().service,
-      listCardsForJob: async () => ({ cards: [{
-        id: "card-1", bundleId: bundle.id, jobId: "job-1", bundleVersion: bundle.contentVersion,
-        currentBundleVersion: bundle.contentVersion, currentReviewId: null, producerModel: "secret-model",
-        status: "analysis_draft", draftContentJson: "{\"llm\":true}",
-        currentContentJson: "{\"situation\":\"측면 압박\"}", isStale: false, createdAt: 1, updatedAt: 2,
-        citationCount: 1,
-        citations: [{
-          chunkId: "chunk-1", sourceId: source.id, videoClipId: null, locationLabel: "문서 1쪽",
-          content: longExcerpt, contentHash: "secret-hash",
-        }],
-      }], totalCount: 1, nextOffset: null }),
-    },
-  }));
+  const response = await handleEvidenceJobStatus(
+    new Request("http://test/"),
+    context({ jobId: "job-1" }),
+    runtime({
+      jobs: {
+        ...runtime().jobs,
+        getAnalysisStatus: async () => ({
+          ...jobRecord(),
+          status: "review_ready",
+        }),
+      },
+      service: {
+        ...runtime().service,
+        listCardsForJob: async () => ({
+          cards: [
+            {
+              id: "card-1",
+              bundleId: bundle.id,
+              jobId: "job-1",
+              bundleVersion: bundle.contentVersion,
+              currentBundleVersion: bundle.contentVersion,
+              currentReviewId: null,
+              producerModel: "secret-model",
+              status: "analysis_draft",
+              draftContentJson: '{"llm":true}',
+              currentContentJson: '{"situation":"측면 압박"}',
+              isStale: false,
+              createdAt: 1,
+              updatedAt: 2,
+              citationCount: 1,
+              citations: [
+                {
+                  chunkId: "chunk-1",
+                  sourceId: source.id,
+                  videoClipId: null,
+                  locationLabel: "문서 1쪽",
+                  content: longExcerpt,
+                  contentHash: "secret-hash",
+                  origin: "external_web",
+                  canonicalUrl: "https://uefa.example/pressing",
+                  publisher: "UEFA",
+                  publishedAt: "2026-01-02",
+                  retrievedAt: 4,
+                  searchCandidateId: "must-not-leak",
+                },
+              ],
+            },
+          ],
+          totalCount: 1,
+          nextOffset: null,
+        }),
+      },
+    }),
+  );
   assert.equal(response.status, 200);
   const responseBody = await body(response);
   const cards = responseBody.cards as Array<Record<string, unknown>>;
@@ -823,9 +1519,30 @@ test("review-ready job polling returns discoverable cards and bounded citation e
   assert.deepEqual(cards[0]?.content, { situation: "측면 압박" });
   const citations = cards[0]?.citations as Array<Record<string, unknown>>;
   assert.equal(citations[0]?.chunkId, "chunk-1");
+  assert.deepEqual(citations[0], {
+    chunkId: "chunk-1",
+    sourceId: source.id,
+    videoClipId: null,
+    locationLabel: "문서 1쪽",
+    excerpt: citations[0]?.excerpt,
+    origin: "external_web",
+    canonicalUrl: "https://uefa.example/pressing",
+    publisher: "UEFA",
+    publishedAt: "2026-01-02",
+    retrievedAt: 4,
+  });
   assert.equal((citations[0]?.excerpt as string).length <= 2_001, true);
   const serialized = JSON.stringify(responseBody);
-  for (const secret of ["producerModel", "secret-model", "draftContentJson", "currentContentJson", "contentHash", "secret-hash"]) {
+  for (const secret of [
+    "producerModel",
+    "secret-model",
+    "draftContentJson",
+    "currentContentJson",
+    "contentHash",
+    "secret-hash",
+    "searchCandidateId",
+    "must-not-leak",
+  ]) {
     assert.equal(serialized.includes(secret), false);
   }
 });
@@ -833,81 +1550,173 @@ test("review-ready job polling returns discoverable cards and bounded citation e
 test("job polling caps cards, citations, and aggregate UTF-8 excerpts with continuation metadata", async () => {
   let requestedOffset = -1;
   const card = {
-    id: "card", bundleId: bundle.id, jobId: "job-1", bundleVersion: bundle.contentVersion,
-    currentBundleVersion: bundle.contentVersion, currentReviewId: null, producerModel: "model",
-    status: "analysis_draft" as const, draftContentJson: "{}", currentContentJson: "{}",
-    isStale: false, createdAt: 1, updatedAt: 2, citationCount: 30,
+    id: "card",
+    bundleId: bundle.id,
+    jobId: "job-1",
+    bundleVersion: bundle.contentVersion,
+    currentBundleVersion: bundle.contentVersion,
+    currentReviewId: null,
+    producerModel: "model",
+    status: "analysis_draft" as const,
+    draftContentJson: "{}",
+    currentContentJson: "{}",
+    isStale: false,
+    createdAt: 1,
+    updatedAt: 2,
+    citationCount: 30,
     citations: Array.from({ length: 30 }, (_, index) => ({
-      chunkId: `chunk-${index}`, sourceId: source.id, videoClipId: null,
-      locationLabel: `page:${index}`, content: "가".repeat(4_000), contentHash: "hash",
+      chunkId: `chunk-${index}`,
+      sourceId: source.id,
+      videoClipId: null,
+      locationLabel: `page:${index}`,
+      content: "가".repeat(4_000),
+      contentHash: "hash",
+      origin: "uploaded" as const,
+      canonicalUrl: null,
+      publisher: null,
+      publishedAt: null,
+      retrievedAt: null,
     })),
   };
   const response = await handleEvidenceJobStatus(
-    new Request("http://test/?cursor=20"), context({ jobId: "job-1" }), runtime({
-      jobs: { ...runtime().jobs, getAnalysisStatus: async () => ({ ...jobRecord(), status: "review_ready" }) },
+    new Request("http://test/?cursor=20"),
+    context({ jobId: "job-1" }),
+    runtime({
+      jobs: {
+        ...runtime().jobs,
+        getAnalysisStatus: async () => ({
+          ...jobRecord(),
+          status: "review_ready",
+        }),
+      },
       service: {
         ...runtime().service,
         listCardsForJob: async (_jobId, _admin, options) => {
           requestedOffset = options?.offset ?? -1;
-          return { cards: Array.from({ length: 50 }, (_, index) => ({ ...card, id: `card-${index}` })), totalCount: 70, nextOffset: 40 };
+          return {
+            cards: Array.from({ length: 50 }, (_, index) => ({
+              ...card,
+              id: `card-${index}`,
+            })),
+            totalCount: 70,
+            nextOffset: 40,
+          };
         },
       },
     }),
   );
   const value = await body(response);
   const cards = value.cards as Array<{ citations: Array<{ excerpt: string }> }>;
-  const excerptBytes = cards.flatMap((item) => item.citations)
-    .reduce((sum, citation) => sum + new TextEncoder().encode(citation.excerpt).byteLength, 0);
+  const excerptBytes = cards
+    .flatMap((item) => item.citations)
+    .reduce(
+      (sum, citation) =>
+        sum + new TextEncoder().encode(citation.excerpt).byteLength,
+      0,
+    );
 
   assert.equal(requestedOffset, 20);
   assert.equal(cards.length, 20);
-  assert.equal(cards.every((item) => item.citations.length <= 20), true);
+  assert.equal(
+    cards.every((item) => item.citations.length <= 20),
+    true,
+  );
   assert.equal(excerptBytes <= 32 * 1024, true);
   assert.equal(JSON.stringify(value).includes("가".repeat(4_000)), false);
-  assert.deepEqual(value.pagination, { count: 20, totalCount: 70, nextCursor: "40" });
+  assert.deepEqual(value.pagination, {
+    count: 20,
+    totalCount: 70,
+    nextCursor: "40",
+  });
 });
 
 test("admin JSON responses are private no-store and malicious upstream messages are never routed or leaked", async () => {
   const success = await handleEvidenceCollectionList(runtime());
-  const detail = await handleEvidenceBundleGet(context({ bundleId: bundle.id }), runtime());
-  const status = await handleEvidenceJobStatus(new Request("http://test/"), context({ jobId: "job-1" }), runtime());
-  const impact = await handleEvidenceFileImpact(context({ bundleId: bundle.id, sourceId: source.id }), runtime());
-  const knownError = await handleEvidenceCollectionCreate(new Request("http://test/", { method: "POST", body: "{" }), runtime());
+  const detail = await handleEvidenceBundleGet(
+    context({ bundleId: bundle.id }),
+    runtime(),
+  );
+  const status = await handleEvidenceJobStatus(
+    new Request("http://test/"),
+    context({ jobId: "job-1" }),
+    runtime(),
+  );
+  const impact = await handleEvidenceFileImpact(
+    context({ bundleId: bundle.id, sourceId: source.id }),
+    runtime(),
+  );
+  const knownError = await handleEvidenceCollectionCreate(
+    new Request("http://test/", { method: "POST", body: "{" }),
+    runtime(),
+  );
   const unknown = await handleEvidenceClipCreate(
-    jsonRequest("/", {}), context({ bundleId: bundle.id }), runtime({
-      service: { ...runtime().service, addVideoClip: async () => {
-        throw new Error("찾을 수 없습니다 필요합니다 구성되지 않았습니다 SECRET_TOKEN");
-      } },
+    jsonRequest("/", {}),
+    context({ bundleId: bundle.id }),
+    runtime({
+      service: {
+        ...runtime().service,
+        addVideoClip: async () => {
+          throw new Error(
+            "찾을 수 없습니다 필요합니다 구성되지 않았습니다 SECRET_TOKEN",
+          );
+        },
+      },
     }),
   );
   const typedMalicious = await handleEvidenceClipCreate(
-    jsonRequest("/", {}), context({ bundleId: bundle.id }), runtime({
-      service: { ...runtime().service, addVideoClip: async () => {
-        throw new EvidenceConflictError("SECRET_TYPED");
-      } },
+    jsonRequest("/", {}),
+    context({ bundleId: bundle.id }),
+    runtime({
+      service: {
+        ...runtime().service,
+        addVideoClip: async () => {
+          throw new EvidenceConflictError("SECRET_TYPED");
+        },
+      },
     }),
   );
   const guarded = await runEvidenceAdminRoute(
     new Request("http://test/"),
-    async () => Response.json({ error: "denied" }, { status: 403, headers: { "access-control-allow-origin": "*" } }),
+    async () =>
+      Response.json(
+        { error: "denied" },
+        { status: 403, headers: { "access-control-allow-origin": "*" } },
+      ),
     async () => runtime(),
     async () => Response.json({ unreachable: true }),
   );
 
-  for (const response of [success, detail, status, impact, knownError, unknown, typedMalicious, guarded]) {
+  for (const response of [
+    success,
+    detail,
+    status,
+    impact,
+    knownError,
+    unknown,
+    typedMalicious,
+    guarded,
+  ]) {
     assert.equal(response.headers.get("cache-control"), "private, no-store");
     assert.equal(response.headers.has("access-control-allow-origin"), false);
   }
   assert.equal(unknown.status, 500);
-  assert.equal(JSON.stringify(await body(unknown)).includes("SECRET_TOKEN"), false);
+  assert.equal(
+    JSON.stringify(await body(unknown)).includes("SECRET_TOKEN"),
+    false,
+  );
   assert.equal(typedMalicious.status, 409);
-  assert.equal(JSON.stringify(await body(typedMalicious)).includes("SECRET_TYPED"), false);
+  assert.equal(
+    JSON.stringify(await body(typedMalicious)).includes("SECRET_TYPED"),
+    false,
+  );
 });
 
 test("production schedule adapter forwards the exact continuation to waitUntil", async () => {
   const continuation = Promise.resolve("continued");
   let scheduled: Promise<unknown> | null = null;
-  bindEvidenceSchedule((promise) => { scheduled = promise; })(continuation);
+  bindEvidenceSchedule((promise) => {
+    scheduled = promise;
+  })(continuation);
   assert.equal(scheduled, continuation);
 });
 
@@ -915,7 +1724,9 @@ test("unavailable analysis configuration is 503 without leaking provider details
   const response = await runEvidenceAdminRoute(
     new Request("http://localhost"),
     async () => admin,
-    () => { throw new Error("EVIDENCE_LLM_API_KEY=provider-secret"); },
+    () => {
+      throw new Error("EVIDENCE_LLM_API_KEY=provider-secret");
+    },
     async () => Response.json({ unreachable: true }),
   );
   assert.equal(response.status, 503);
@@ -924,73 +1735,377 @@ test("unavailable analysis configuration is 503 without leaking provider details
   assert.equal(serialized.includes("EVIDENCE_LLM_API_KEY"), false);
 });
 
+test("search routes expose safe scoped workflow responses with accepted start semantics", async () => {
+  const started = await handleEvidenceSearchStart(
+    context({ bundleId: bundle.id }),
+    runtime(),
+  );
+  assert.equal(started.status, 202);
+  assert.deepEqual(await body(started), {
+    search: {
+      id: "search-1",
+      bundleId: bundle.id,
+      status: "queued",
+    },
+  });
+
+  const deduplicated = await handleEvidenceSearchStart(
+    context({ bundleId: bundle.id }),
+    runtime({
+      searchJobs: {
+        ...runtime().searchJobs,
+        startSearch: async () => searchRunRecord("ready"),
+      },
+    }),
+  );
+  assert.equal(deduplicated.status, 200);
+  assert.deepEqual(await body(deduplicated), {
+    search: { id: "search-1", bundleId: bundle.id, status: "ready" },
+  });
+
+  const latest = await handleEvidenceSearchLatest(
+    context({ bundleId: bundle.id }),
+    runtime(),
+  );
+  const detail = await handleEvidenceSearchGet(
+    context({ bundleId: bundle.id, runId: "search-1" }),
+    runtime(),
+  );
+  const selected = await handleEvidenceSearchSelection(
+    jsonRequest(
+      "/",
+      {
+        expectedBundleVersion: 2,
+        selectedIds: ["candidate-1"],
+        excludedIds: [],
+      },
+      "PATCH",
+    ),
+    context({ bundleId: bundle.id, runId: "search-1" }),
+    runtime(),
+  );
+  const imported = await handleEvidenceSearchImport(
+    context({ bundleId: bundle.id, runId: "search-1" }),
+    runtime(),
+  );
+  assert.equal(latest.status, 200);
+  assert.equal(detail.status, 200);
+  assert.equal(selected.status, 200);
+  assert.equal(imported.status, 202);
+  assert.deepEqual(await body(imported), {
+    search: { id: "search-1", bundleId: bundle.id, status: "importing" },
+  });
+
+  for (const response of [
+    started,
+    deduplicated,
+    latest,
+    detail,
+    selected,
+    imported,
+  ]) {
+    assert.equal(response.headers.get("cache-control"), "private, no-store");
+    assert.equal(response.headers.has("access-control-allow-origin"), false);
+  }
+});
+
+test("starter POSTs reject terminal no-ops while GET polling exposes terminal detail", async () => {
+  for (const terminal of ["completed", "failed"] as const) {
+    const terminalRuntime = runtime({
+      searchJobs: {
+        ...runtime().searchJobs,
+        startSearch: async () => searchRunRecord(terminal),
+        startImport: async () => searchRunRecord(terminal),
+        getSearch: async () => searchDetail(terminal),
+      },
+    });
+    const searchPost = await handleEvidenceSearchStart(
+      context({ bundleId: bundle.id }),
+      terminalRuntime,
+    );
+    const importPost = await handleEvidenceSearchImport(
+      context({ bundleId: bundle.id, runId: "search-1" }),
+      terminalRuntime,
+    );
+    const get = await handleEvidenceSearchGet(
+      context({ bundleId: bundle.id, runId: "search-1" }),
+      terminalRuntime,
+    );
+
+    for (const response of [searchPost, importPost]) {
+      assert.equal(response.status, 409);
+      assert.equal(response.headers.get("cache-control"), "private, no-store");
+      assert.equal(response.headers.has("access-control-allow-origin"), false);
+      assert.doesNotMatch(
+        JSON.stringify(await body(response)),
+        /completed|failed/,
+      );
+    }
+    assert.equal(get.status, 200);
+    assert.equal(
+      ((await body(get)).search as { run: { status: string } }).run.status,
+      terminal,
+    );
+  }
+});
+
+test("safe search responses omit prompts, provider bodies, selectors, storage keys, and internal failures", async () => {
+  const response = await handleEvidenceSearchGet(
+    context({ bundleId: bundle.id, runId: "search-1" }),
+    runtime(),
+  );
+  const value = (await body(response)) as {
+    search: { candidates: Array<Record<string, unknown>> };
+  };
+  assert.deepEqual(value.search.candidates[0], {
+    id: "candidate-1",
+    title: "Pressing",
+    publisher: "UEFA",
+    publishedAt: "2026-01-02",
+    canonicalUrl: "https://uefa.example/pressing",
+    documentType: "web_page",
+    quote: "Press together",
+    relevance: "압박 원칙",
+    trustTier: 1,
+    rank: 1,
+    status: "candidate",
+    failureReason: "외부 문서를 가져오지 못했습니다.",
+  });
+  const json = JSON.stringify(value);
+  for (const secret of [
+    "queryJson",
+    "queries",
+    "secret generated query",
+    "rawProviderBody",
+    "provider body",
+    "searchModel",
+    "promptVersion",
+    "secret-search-model",
+    "secret-search-prompt",
+    "selectedBy",
+    "selector-user-secret",
+    "sourceId",
+    "source-secret",
+    "storageKey",
+    "bundles/private",
+    "contentHash",
+    "content-hash-secret",
+    "leaseToken",
+    "socket error",
+    "sk-test",
+  ])
+    assert.doesNotMatch(json, new RegExp(secret));
+});
+
+test("search selection maps malformed, stale, oversized, missing, and unavailable cases", async () => {
+  const malformed = await handleEvidenceSearchSelection(
+    jsonRequest("/", "{broken", "PATCH"),
+    context({ bundleId: bundle.id, runId: "search-1" }),
+    runtime(),
+  );
+  assert.equal(malformed.status, 400);
+
+  const stale = await handleEvidenceSearchSelection(
+    jsonRequest(
+      "/",
+      { expectedBundleVersion: 1, selectedIds: ["stale"], excludedIds: [] },
+      "PATCH",
+    ),
+    context({ bundleId: bundle.id, runId: "search-1" }),
+    runtime({
+      searchJobs: {
+        ...runtime().searchJobs,
+        saveSelection: async () => {
+          throw new EvidenceConflictError("SECRET_STALE");
+        },
+      },
+    }),
+  );
+  assert.equal(stale.status, 409);
+
+  const sixIds = Array.from({ length: 6 }, (_, index) => `candidate-${index}`);
+  const oversized = await handleEvidenceSearchSelection(
+    jsonRequest(
+      "/",
+      { expectedBundleVersion: 2, selectedIds: sixIds, excludedIds: [] },
+      "PATCH",
+    ),
+    context({ bundleId: bundle.id, runId: "search-1" }),
+    runtime({
+      searchJobs: {
+        ...runtime().searchJobs,
+        saveSelection: async () => {
+          throw new EvidenceRequestValidationError();
+        },
+      },
+    }),
+  );
+  assert.equal(oversized.status, 400);
+
+  const missing = await handleEvidenceSearchGet(
+    context({ bundleId: bundle.id, runId: "missing" }),
+    runtime(),
+  );
+  assert.equal(missing.status, 404);
+
+  const unavailable = await handleEvidenceSearchStart(
+    context({ bundleId: bundle.id }),
+    runtime({
+      searchJobs: {
+        ...runtime().searchJobs,
+        startSearch: async () => {
+          throw new EvidenceUnavailableError("EVIDENCE_SEARCH_MODEL sk-test");
+        },
+      },
+    }),
+  );
+  assert.equal(unavailable.status, 503);
+
+  for (const response of [stale, oversized, missing, unavailable]) {
+    const json = JSON.stringify(await body(response));
+    assert.doesNotMatch(json, /SECRET_STALE|EVIDENCE_SEARCH_MODEL|sk-test/);
+  }
+});
+
 test("card review and scenario conversion map stale conflicts and omit immutable internal snapshots", async () => {
-  const reviewed = await handleEvidenceCardReview(jsonRequest("/", {
-    status: "owner_reviewed", expectedUpdatedAt: 2, content: { situation: "현재" },
-  }), context({ cardId: "card-1" }), runtime());
+  const reviewed = await handleEvidenceCardReview(
+    jsonRequest("/", {
+      status: "owner_reviewed",
+      expectedUpdatedAt: 2,
+      content: { situation: "현재" },
+    }),
+    context({ cardId: "card-1" }),
+    runtime(),
+  );
   assert.equal(reviewed.status, 200);
   const reviewJson = JSON.stringify(await body(reviewed));
-  for (const secret of ["draftContentJson", "currentContentJson", "producerModel", "secret-model", "llm"]) {
+  for (const secret of [
+    "draftContentJson",
+    "currentContentJson",
+    "producerModel",
+    "secret-model",
+    "llm",
+  ]) {
     assert.equal(reviewJson.includes(secret), false);
   }
 
-  const scenario = await handleEvidenceScenarioDraft(jsonRequest("/", {
-    expectedUpdatedAt: 3, campaignId: "campaign-1", role: "ala", principle: "width",
-    prompt: "prompt", hint: "hint", explanation: "explanation", orderIndex: 1, content: {},
-  }), context({ cardId: "card-1" }), runtime());
+  const scenario = await handleEvidenceScenarioDraft(
+    jsonRequest("/", {
+      expectedUpdatedAt: 3,
+      campaignId: "campaign-1",
+      role: "ala",
+      principle: "width",
+      prompt: "prompt",
+      hint: "hint",
+      explanation: "explanation",
+      orderIndex: 1,
+      content: {},
+    }),
+    context({ cardId: "card-1" }),
+    runtime(),
+  );
   assert.equal(scenario.status, 201);
   const scenarioJson = JSON.stringify(await body(scenario));
-  for (const secret of ["pitchJson", "answerJson", "contentJson", "draftContentJson"]) {
+  for (const secret of [
+    "pitchJson",
+    "answerJson",
+    "contentJson",
+    "draftContentJson",
+  ]) {
     assert.equal(scenarioJson.includes(secret), false);
   }
 
-  const stale = await handleEvidenceCardReview(jsonRequest("/", {}), context({ cardId: "card-1" }), runtime({
-    service: {
-      ...runtime().service,
-      reviewCard: async () => { throw new EvidenceConflictError(); },
-    },
-  }));
+  const stale = await handleEvidenceCardReview(
+    jsonRequest("/", {}),
+    context({ cardId: "card-1" }),
+    runtime({
+      service: {
+        ...runtime().service,
+        reviewCard: async () => {
+          throw new EvidenceConflictError();
+        },
+      },
+    }),
+  );
   assert.equal(stale.status, 409);
 });
 
 test("malformed review and scenario inputs are 400 while unavailable source storage is 503", async () => {
-  const invalidReview = await handleEvidenceCardReview(jsonRequest("/", {}), context({ cardId: "card-1" }), runtime({
-    service: {
-      ...runtime().service,
-      reviewCard: async () => { throw new EvidenceRequestValidationError("카드 검수 상태가 올바르지 않습니다."); },
-    },
-  }));
+  const invalidReview = await handleEvidenceCardReview(
+    jsonRequest("/", {}),
+    context({ cardId: "card-1" }),
+    runtime({
+      service: {
+        ...runtime().service,
+        reviewCard: async () => {
+          throw new EvidenceRequestValidationError(
+            "카드 검수 상태가 올바르지 않습니다.",
+          );
+        },
+      },
+    }),
+  );
   assert.equal(invalidReview.status, 400);
 
-  const invalidScenario = await handleEvidenceScenarioDraft(jsonRequest("/", {}), context({ cardId: "card-1" }), runtime({
-    service: {
-      ...runtime().service,
-      createScenarioDraft: async () => { throw new EvidenceRequestValidationError("campaignId이 필요합니다."); },
-    },
-  }));
+  const invalidScenario = await handleEvidenceScenarioDraft(
+    jsonRequest("/", {}),
+    context({ cardId: "card-1" }),
+    runtime({
+      service: {
+        ...runtime().service,
+        createScenarioDraft: async () => {
+          throw new EvidenceRequestValidationError("campaignId이 필요합니다.");
+        },
+      },
+    }),
+  );
   assert.equal(invalidScenario.status, 400);
 
-  const unavailable = await handleEvidenceFileDelete(context({ bundleId: bundle.id, sourceId: source.id }), runtime({
-    service: {
-      ...runtime().service,
-      removeSource: async () => { throw new AggregateError([new Error("R2 provider-secret")], "delete failed"); },
-    },
-  }));
+  const unavailable = await handleEvidenceFileDelete(
+    context({ bundleId: bundle.id, sourceId: source.id }),
+    runtime({
+      service: {
+        ...runtime().service,
+        removeSource: async () => {
+          throw new AggregateError(
+            [new Error("R2 provider-secret")],
+            "delete failed",
+          );
+        },
+      },
+    }),
+  );
   assert.equal(unavailable.status, 503);
-  assert.equal(JSON.stringify(await body(unavailable)).includes("provider-secret"), false);
+  assert.equal(
+    JSON.stringify(await body(unavailable)).includes("provider-secret"),
+    false,
+  );
 
-  const snapshotFailure = await handleEvidenceFileDelete(context({ bundleId: bundle.id, sourceId: source.id }), runtime({
-    service: {
-      ...runtime().service,
-      removeSource: async () => { throw new EvidenceUnavailableError("근거 파일 저장소를 사용할 수 없습니다."); },
-    },
-  }));
+  const snapshotFailure = await handleEvidenceFileDelete(
+    context({ bundleId: bundle.id, sourceId: source.id }),
+    runtime({
+      service: {
+        ...runtime().service,
+        removeSource: async () => {
+          throw new EvidenceUnavailableError(
+            "근거 파일 저장소를 사용할 수 없습니다.",
+          );
+        },
+      },
+    }),
+  );
   assert.equal(snapshotFailure.status, 503);
-  assert.equal(JSON.stringify(await body(snapshotFailure)).includes("provider-secret"), false);
+  assert.equal(
+    JSON.stringify(await body(snapshotFailure)).includes("provider-secret"),
+    false,
+  );
 });
 
 test("authenticated download streams bytes with safe attachment headers and no internal key", async () => {
-  const response = await handleEvidenceFileDownload(context({ bundleId: bundle.id, sourceId: source.id }), runtime());
+  const response = await handleEvidenceFileDownload(
+    context({ bundleId: bundle.id, sourceId: source.id }),
+    runtime(),
+  );
   assert.equal(response.status, 200);
   assert.equal(await response.text(), "근거");
   const disposition = response.headers.get("content-disposition") ?? "";
@@ -1001,7 +2116,10 @@ test("authenticated download streams bytes with safe attachment headers and no i
   assert.match(disposition, /filename\*=UTF-8''/);
   assert.equal(response.headers.get("cache-control"), "private, no-store");
 
-  const missing = await handleEvidenceFileDownload(context({ bundleId: bundle.id, sourceId: "missing" }), runtime());
+  const missing = await handleEvidenceFileDownload(
+    context({ bundleId: bundle.id, sourceId: "missing" }),
+    runtime(),
+  );
   assert.equal(missing.status, 404);
 });
 
@@ -1009,34 +2127,84 @@ test("delete impact is listed first and linked sources are blocked with 409", as
   const impactRuntime = runtime({
     service: {
       ...runtime().service,
-      describeDeleteImpact: async (id) => ({ sourceId: id, cardIds: ["card-1"], scenarioDraftIds: ["scenario-1"] }),
-      removeSource: async () => { throw new EvidenceConflictError("연결된 카드 또는 시나리오 초안이 있어 근거를 삭제할 수 없습니다."); },
+      describeDeleteImpact: async (id) => ({
+        sourceId: id,
+        cardIds: ["card-1"],
+        scenarioDraftIds: ["scenario-1"],
+      }),
+      removeSource: async () => {
+        throw new EvidenceConflictError(
+          "연결된 카드 또는 시나리오 초안이 있어 근거를 삭제할 수 없습니다.",
+        );
+      },
     },
   });
-  const impact = await handleEvidenceFileImpact(context({ bundleId: bundle.id, sourceId: source.id }), impactRuntime);
+  const impact = await handleEvidenceFileImpact(
+    context({ bundleId: bundle.id, sourceId: source.id }),
+    impactRuntime,
+  );
   assert.equal(impact.status, 200);
-  assert.deepEqual(await body(impact), { impact: { sourceId: source.id, cardIds: ["card-1"], scenarioDraftIds: ["scenario-1"] } });
+  assert.deepEqual(await body(impact), {
+    impact: {
+      sourceId: source.id,
+      cardIds: ["card-1"],
+      scenarioDraftIds: ["scenario-1"],
+    },
+  });
 
-  const removed = await handleEvidenceFileDelete(context({ bundleId: bundle.id, sourceId: source.id }), impactRuntime);
+  const removed = await handleEvidenceFileDelete(
+    context({ bundleId: bundle.id, sourceId: source.id }),
+    impactRuntime,
+  );
   assert.equal(removed.status, 409);
 });
 
 test("public campaign, room, and training projections contain no evidence workflow fields", () => {
   const publicScenario = serializePublicTrainingScenario({
-    id: "scenario-1", campaignId: "campaign-1", role: "ala", principle: "width", prompt: "선택", orderIndex: 0,
-    reviewStatus: "reviewed", sourceTitle: null, sourceUrl: null, reviewerName: null,
-    reviewedAt: null, reviewedContentJson: null, contentJson: "", pitchJson: JSON.stringify({
-      players: [{ id: "actor", x: 10, y: 10, team: "us" }], ball: { x: 10, y: 10 }, zones: [],
-    }), answerJson: JSON.stringify({ kind: "circle", cx: 20, cy: 20, radius: 5 }),
-    hint: "private hint", explanation: "private explanation",
-    extractedText: "private", draftContentJson: "private", llm: "private", storageKey: "private",
+    id: "scenario-1",
+    campaignId: "campaign-1",
+    role: "ala",
+    principle: "width",
+    prompt: "선택",
+    orderIndex: 0,
+    reviewStatus: "reviewed",
+    sourceTitle: null,
+    sourceUrl: null,
+    reviewerName: null,
+    reviewedAt: null,
+    reviewedContentJson: null,
+    contentJson: "",
+    pitchJson: JSON.stringify({
+      players: [{ id: "actor", x: 10, y: 10, team: "us" }],
+      ball: { x: 10, y: 10 },
+      zones: [],
+    }),
+    answerJson: JSON.stringify({ kind: "circle", cx: 20, cy: 20, radius: 5 }),
+    hint: "private hint",
+    explanation: "private explanation",
+    extractedText: "private",
+    draftContentJson: "private",
+    llm: "private",
+    storageKey: "private",
   } as never);
-  const campaign = { id: "campaign-1", title: "캠페인", scenarios: [publicScenario] };
-  const room = { members: [{ id: "member-1", nickname: "선수", completedStage: 1 }], teamMastery: { width: 0 } };
+  const campaign = {
+    id: "campaign-1",
+    title: "캠페인",
+    scenarios: [publicScenario],
+  };
+  const room = {
+    members: [{ id: "member-1", nickname: "선수", completedStage: 1 }],
+    teamMastery: { width: 0 },
+  };
   const train = { campaign, scenario: publicScenario };
   for (const projection of [campaign, room, train]) {
     const serialized = JSON.stringify(projection);
-    for (const secret of ["extractedText", "draftContentJson", "llm", "storageKey"]) {
+    for (const secret of [
+      "extractedText",
+      "draftContentJson",
+      "llm",
+      "storageKey",
+    ]) {
       assert.equal(serialized.includes(secret), false);
     }
   }
