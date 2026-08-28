@@ -887,6 +887,158 @@ test("pre-commit candidate failure update retries state repair and preserves sib
   assert.equal((await context.jobs.getSearch("bundle-1", detail.run.id))?.run.status, "completed");
 });
 
+test("import finalization does not overtake a concurrent failed-candidate reacquisition", async () => {
+  let clock = 700_000;
+  let fetchAttempts = 0;
+  const context = createContext([candidate(1)], async (input) => {
+    fetchAttempts += 1;
+    if (fetchAttempts === 1) throw new Error("seed a retryable failure");
+    return successfulFetch(input);
+  }, { now: () => clock });
+  seedBundle(context.db);
+  const detail = await runSearch(context);
+  await select(context, detail, [0]);
+
+  let before = context.scheduled.length;
+  await context.jobs.startImport("bundle-1", detail.run.id, admin);
+  await Promise.all(context.scheduled.slice(before));
+  assert.deepEqual({ ...context.db.first(
+    `SELECT candidate.status AS candidateStatus,run.status AS runStatus
+      FROM evidence_search_candidates AS candidate
+      JOIN evidence_search_runs AS run ON run.id=candidate.run_id
+      WHERE candidate.id=?`,
+    detail.candidates[0]!.id,
+  ) }, { candidateStatus: "failed", runStatus: "failed" });
+
+  context.db.run(
+    `UPDATE evidence_search_runs
+      SET status='importing',error_message=NULL,completed_at=NULL,
+        lease_token='run-finalization-lease',lease_expires_at=?
+      WHERE id=?`,
+    clock + 60_000,
+    detail.run.id,
+  );
+  const advisory = context.db.first<{ candidateStatus: string; runStatus: string }>(
+    `SELECT candidate.status AS candidateStatus,run.status AS runStatus
+      FROM evidence_search_candidates AS candidate
+      JOIN evidence_search_runs AS run ON run.id=candidate.run_id
+      WHERE candidate.id=?`,
+    detail.candidates[0]!.id,
+  );
+  assert.deepEqual({ ...advisory }, { candidateStatus: "failed", runStatus: "importing" });
+
+  context.db.beforeNextRun = {
+    pattern: /UPDATE evidence_search_runs\s+SET status=/,
+    callback: () => {
+      const reacquired = context.db.database.prepare(
+        `UPDATE evidence_search_candidates
+          SET status='importing',lease_token='concurrent-candidate-lease',lease_expires_at=?,updated_at=?
+          WHERE id=? AND run_id=? AND status='failed'
+            AND EXISTS (SELECT 1 FROM evidence_search_runs WHERE id=? AND status='importing' AND is_stale=0)`,
+      ).run(
+        clock + 60_000,
+        clock,
+        detail.candidates[0]!.id,
+        detail.run.id,
+        detail.run.id,
+      );
+      assert.equal(Number(reacquired.changes), 1);
+    },
+  };
+  await (context.jobs as unknown as { finishImportRun(runId: string): Promise<void> })
+    .finishImportRun(detail.run.id);
+
+  assert.deepEqual({ ...context.db.first(
+    `SELECT candidate.status AS candidateStatus,candidate.lease_token AS candidateLeaseToken,
+      run.status AS runStatus,run.lease_token AS runLeaseToken
+      FROM evidence_search_candidates AS candidate
+      JOIN evidence_search_runs AS run ON run.id=candidate.run_id
+      WHERE candidate.id=?`,
+    detail.candidates[0]!.id,
+  ) }, {
+    candidateStatus: "importing",
+    candidateLeaseToken: "concurrent-candidate-lease",
+    runStatus: "importing",
+    runLeaseToken: "run-finalization-lease",
+  });
+
+  clock += 60_000;
+  before = context.scheduled.length;
+  await context.jobs.startImport("bundle-1", detail.run.id, admin);
+  await Promise.all(context.scheduled.slice(before));
+  assert.equal(fetchAttempts, 2);
+  assert.deepEqual({ ...context.db.first(
+    `SELECT candidate.status AS candidateStatus,candidate.lease_token AS candidateLeaseToken,
+      run.status AS runStatus,run.lease_token AS runLeaseToken,run.lease_expires_at AS runLeaseExpiresAt
+      FROM evidence_search_candidates AS candidate
+      JOIN evidence_search_runs AS run ON run.id=candidate.run_id
+      WHERE candidate.id=?`,
+    detail.candidates[0]!.id,
+  ) }, {
+    candidateStatus: "imported",
+    candidateLeaseToken: null,
+    runStatus: "completed",
+    runLeaseToken: null,
+    runLeaseExpiresAt: null,
+  });
+});
+
+test("import finalization marks all-failed terminal work failed", async () => {
+  const context = createContext([candidate(1)], async () => {
+    throw new Error("upstream failure");
+  });
+  seedBundle(context.db);
+  const detail = await runSearch(context);
+  await select(context, detail, [0]);
+
+  const before = context.scheduled.length;
+  await context.jobs.startImport("bundle-1", detail.run.id, admin);
+  await Promise.all(context.scheduled.slice(before));
+
+  assert.deepEqual({ ...context.db.first(
+    `SELECT candidate.status AS candidateStatus,run.status AS runStatus,
+      run.error_message AS errorMessage,run.lease_token AS runLeaseToken,
+      run.lease_expires_at AS runLeaseExpiresAt
+      FROM evidence_search_candidates AS candidate
+      JOIN evidence_search_runs AS run ON run.id=candidate.run_id
+      WHERE candidate.id=?`,
+    detail.candidates[0]!.id,
+  ) }, {
+    candidateStatus: "failed",
+    runStatus: "failed",
+    errorMessage: "선택한 외부 문서를 가져오지 못했습니다.",
+    runLeaseToken: null,
+    runLeaseExpiresAt: null,
+  });
+});
+
+test("import finalization marks mixed imported and failed terminal work completed", async () => {
+  const context = createContext([candidate(1), candidate(2)], async (input) => {
+    if (input.url.endsWith("document-2")) throw new Error("upstream failure");
+    return successfulFetch(input);
+  });
+  seedBundle(context.db);
+  const detail = await runSearch(context);
+  await select(context, detail, [0, 1]);
+
+  const before = context.scheduled.length;
+  await context.jobs.startImport("bundle-1", detail.run.id, admin);
+  await Promise.all(context.scheduled.slice(before));
+
+  assert.deepEqual(
+    context.db.all<{ status: string }>(
+      "SELECT status FROM evidence_search_candidates WHERE run_id=? ORDER BY rank",
+      detail.run.id,
+    ).map((row) => row.status),
+    ["imported", "failed"],
+  );
+  assert.deepEqual({ ...context.db.first(
+    `SELECT status,error_message AS errorMessage,lease_token AS leaseToken,
+      lease_expires_at AS leaseExpiresAt FROM evidence_search_runs WHERE id=?`,
+    detail.run.id,
+  ) }, { status: "completed", errorMessage: null, leaseToken: null, leaseExpiresAt: null });
+});
+
 test("bundle mutation stales searches and an imported source stales prior analysis", async () => {
   const context = createContext([candidate(1)]);
   seedBundle(context.db);

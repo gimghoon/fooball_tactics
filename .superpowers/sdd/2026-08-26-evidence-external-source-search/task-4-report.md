@@ -191,3 +191,38 @@ A targeted search-recovery run then failed specifically with `no such column: le
 - Recovery is intentionally driven by later explicit start calls; there is no background sweeper. This matches the approved no-polling design.
 - Lease takeover can duplicate already-started upstream work after 60 seconds, but exact-token D1/source authority ensures only the current owner can commit. Normal provider/fetch deadlines are safely shorter than the lease.
 - The focused storage suite and builds retain the same pre-existing PDF.js, Node deprecation, and vinext route-classification warnings while all commands exit 0.
+
+---
+
+## Fix round 3 — atomic import-run finalization
+
+### Changes
+
+- Replaced the advisory candidate-count read followed by an unguarded run update with one atomic `UPDATE evidence_search_runs` statement.
+- The terminal update now changes an `importing` run only when no candidate for that run is currently `selected` or `importing`. A concurrent retry acquisition therefore makes the update affect zero rows and leaves the run available to the in-flight candidate worker.
+- `completed` versus `failed` is derived inside the same SQL statement from the current existence of an `imported` candidate. Failed candidates remain terminal and retryable; a later explicit import start can move them back to `importing`.
+- Successful terminal transitions clear both run lease fields. A zero-row transition does not clear or replace existing run ownership state.
+
+### RED evidence
+
+The targeted `import finalization` run executed three tests with **2 passing and 1 failing** before the production change. In the failing real-SQL interleaving, the finalizer had terminal advice for a failed candidate, a concurrent guarded SQL CAS moved that candidate to `importing`, and the old finalizer still changed the run to `failed` and cleared its lease. The assertion observed candidate `importing` beside run `failed`, reproducing the authority split.
+
+### GREEN evidence
+
+- `npx tsx --test --test-timeout=10000 --test-name-pattern='import finalization' tests/evidence-search-jobs.test.ts` passes **3/3**.
+- `npx tsx --test --test-timeout=10000 tests/evidence-search-jobs.test.ts` passes **28/28**.
+- `npm run lint` exits 0.
+- `npm run build` completes all five vinext build stages.
+- `git diff --check` exits 0 before commit.
+
+### Concurrency and terminal-state evidence
+
+- The real SQLite/D1 harness first observes a failed candidate on an importing run, then injects a guarded failed-to-importing CAS immediately before the final terminal SQL executes. The CAS changes one row; the terminal update changes zero, preserving both the candidate and importing run state without throwing.
+- After the injected 60-second candidate lease expires, a later explicit `startImport()` replaces the candidate lease, fetches exactly once for that retry, imports the source, and the later finalization reaches `completed`. Candidate and run lease fields are null at the terminal state, so neither is stranded.
+- A dedicated all-failed case reaches run `failed` with the bounded public error and cleared run leases.
+- A dedicated mixed imported-plus-failed case reaches run `completed` with no run error and cleared run leases.
+
+### Remaining concerns
+
+- Recovery remains explicit-call driven, as approved in fix round 2; no polling or sweeper was added.
+- The build retains the pre-existing Node `module.register()` deprecation and vinext route-classification warnings while exiting 0.

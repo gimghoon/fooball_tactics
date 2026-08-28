@@ -870,39 +870,28 @@ export class EvidenceExternalSearchJobs {
   }
 
   private async finishImportRun(runId: string): Promise<void> {
-    const observedAt = this.now();
-    const counts = await this.dependencies.db.prepare(
-      `SELECT
-        SUM(CASE WHEN status='imported' THEN 1 ELSE 0 END) AS imported,
-        SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) AS failed,
-        SUM(CASE WHEN status='selected'
-          OR (status='importing' AND lease_expires_at>?) THEN 1 ELSE 0 END) AS active,
-        SUM(CASE WHEN status='importing'
-          AND (lease_expires_at IS NULL OR lease_expires_at<=?) THEN 1 ELSE 0 END) AS recoverable
-        FROM evidence_search_candidates WHERE run_id=? AND selected_by IS NOT NULL`,
-    ).bind(observedAt, observedAt, runId).first<{
-      imported: number | null;
-      failed: number | null;
-      active: number | null;
-      recoverable: number | null;
-    }>();
-    if (
-      counts === null
-      || (counts.active ?? 0) !== 0
-      || (counts.recoverable ?? 0) !== 0
-      || (counts.imported ?? 0) + (counts.failed ?? 0) === 0
-    ) return;
     const now = this.now();
-    const status = (counts.imported ?? 0) > 0 ? "completed" : "failed";
     await this.dependencies.db.prepare(
       `UPDATE evidence_search_runs
-        SET status=?,error_message=?,lease_token=NULL,lease_expires_at=NULL,completed_at=?,updated_at=?
-        WHERE id=? AND status='importing' AND is_stale=0`,
+        SET status=CASE WHEN EXISTS (
+            SELECT 1 FROM evidence_search_candidates WHERE run_id=? AND status='imported'
+          ) THEN 'completed' ELSE 'failed' END,
+          error_message=CASE WHEN EXISTS (
+            SELECT 1 FROM evidence_search_candidates WHERE run_id=? AND status='imported'
+          ) THEN NULL ELSE ? END,
+          lease_token=NULL,lease_expires_at=NULL,completed_at=?,updated_at=?
+        WHERE id=? AND status='importing' AND is_stale=0
+          AND NOT EXISTS (
+            SELECT 1 FROM evidence_search_candidates
+              WHERE run_id=? AND status IN ('selected','importing')
+          )`,
     ).bind(
-      status,
-      status === "failed" ? "선택한 외부 문서를 가져오지 못했습니다." : null,
+      runId,
+      runId,
+      "선택한 외부 문서를 가져오지 못했습니다.",
       now,
       now,
+      runId,
       runId,
     ).run();
   }
