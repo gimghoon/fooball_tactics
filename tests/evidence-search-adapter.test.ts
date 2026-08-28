@@ -119,6 +119,18 @@ test("rejects model candidates when the completed web search returned no sources
   assert.deepEqual(result.candidates, []);
 });
 
+test("rejects sources from a web search call without explicit completion", async () => {
+  const response = validSearchEnvelope(1);
+  const searchCall = record(response.output[0]);
+  delete searchCall.status;
+  const provider = createProviderWithFetch(recordingResponsesFetch(response));
+
+  await assert.rejects(
+    () => provider.search(searchInput(), AbortSignal.timeout(1_000)),
+    /검색 제공자 응답이 완료되지 않았습니다/,
+  );
+});
+
 test("rejects malformed or unsafe web-search source records without exposing their values", async () => {
   const provider = createProviderWithFetch(recordingResponsesFetch(validSearchEnvelope(1, [
     null,

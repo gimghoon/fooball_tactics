@@ -385,25 +385,29 @@ function extractOutputText(value: unknown): ParsedResponseOutput {
   for (const item of value.output) {
     if (!isRecord(item)) throw new EvidenceSearchError("검색 제공자 응답 항목이 올바르지 않습니다.", true);
     if (item.status === "incomplete") throw new EvidenceSearchError("검색 제공자 응답이 완료되지 않았습니다.", true);
-    if (item.type === "reasoning" || item.type === "web_search_call") {
+    if (item.type === "reasoning") {
       if (item.status !== undefined && item.status !== "completed") {
         throw new EvidenceSearchError("검색 제공자 응답이 완료되지 않았습니다.", true);
       }
-      if (item.type === "web_search_call") {
-        webSearchCalls += 1;
-        if (webSearchCalls > MAX_WEB_SEARCH_CALLS) {
-          throw new EvidenceSearchError("검색 제공자 응답이 너무 큽니다.", true);
-        }
-        const action = isRecord(item.action) ? item.action : null;
-        const actionSources = action?.type === "search" && Array.isArray(action.sources) ? action.sources : [];
-        const remaining = MAX_WEB_SEARCH_SOURCE_RECORDS - sourceRecords;
-        for (let index = 0; index < Math.min(actionSources.length, remaining); index += 1) {
-          sourceRecords += 1;
-          const source = normalizedWebSearchSource(actionSources[index]);
-          if (source === null || canonicalSourceUrls.has(source.canonicalUrl)) continue;
-          canonicalSourceUrls.add(source.canonicalUrl);
-          sources.push(source);
-        }
+      continue;
+    }
+    if (item.type === "web_search_call") {
+      if (item.status !== "completed") {
+        throw new EvidenceSearchError("검색 제공자 응답이 완료되지 않았습니다.", true);
+      }
+      webSearchCalls += 1;
+      if (webSearchCalls > MAX_WEB_SEARCH_CALLS) {
+        throw new EvidenceSearchError("검색 제공자 응답이 너무 큽니다.", true);
+      }
+      const action = isRecord(item.action) ? item.action : null;
+      const actionSources = action?.type === "search" && Array.isArray(action.sources) ? action.sources : [];
+      const remaining = MAX_WEB_SEARCH_SOURCE_RECORDS - sourceRecords;
+      for (let index = 0; index < Math.min(actionSources.length, remaining); index += 1) {
+        sourceRecords += 1;
+        const source = normalizedWebSearchSource(actionSources[index]);
+        if (source === null || canonicalSourceUrls.has(source.canonicalUrl)) continue;
+        canonicalSourceUrls.add(source.canonicalUrl);
+        sources.push(source);
       }
       continue;
     }
