@@ -157,6 +157,29 @@ function createContext() {
   return { database, repository, bucket, fileStore, service };
 }
 
+function applyMigrationInTransaction(database: DatabaseSync, migrationSql: string): void {
+  database.exec("BEGIN IMMEDIATE");
+  try {
+    for (const statement of migrationSql.split("--> statement-breakpoint").map((value) => value.trim()).filter(Boolean)) {
+      database.exec(statement);
+    }
+    database.exec("COMMIT");
+  } catch (error) {
+    database.exec("ROLLBACK");
+    throw error;
+  }
+}
+
+function databaseThroughMigration(prefix: string): DatabaseSync {
+  const database = new DatabaseSync(":memory:");
+  database.exec("PRAGMA foreign_keys = ON");
+  const migrations = readdirSync("drizzle").filter((value) => /^\d{4}_.*\.sql$/.test(value)).sort();
+  const targetIndex = migrations.findIndex((name) => name.startsWith(prefix));
+  assert.notEqual(targetIndex, -1, `Expected migration ${prefix}`);
+  for (const name of migrations.slice(0, targetIndex + 1)) database.exec(readFileSync(`drizzle/${name}`, "utf8"));
+  return database;
+}
+
 function sourceFor(bundleId: string): StoredEvidenceFile {
   return {
     id: "source-1",
@@ -320,6 +343,60 @@ test("production registration retains committed R2 objects when D1 commits and t
   assert.equal(context.bucket.objects.has(source.storageKey), true);
   assert.equal(source.extractedTextKey === null ? false : context.bucket.objects.has(source.extractedTextKey), true);
   assert.equal(context.database.first<{ count: number }>("SELECT count(*) AS count FROM evidence_r2_cleanup_receipts").count, 0);
+});
+
+test("migration 0012 preserves cleanup receipts while removing the historical bundle cascade", () => {
+  const oldMigration = readFileSync("drizzle/0011_evidence_r2_cleanup_receipts.sql", "utf8");
+  assert.match(oldMigration, /FOREIGN KEY \(`bundle_id`\).*ON DELETE cascade/);
+  assert.doesNotMatch(oldMigration, /idx_evidence_r2_cleanup_bundle/);
+
+  const migrations = readdirSync("drizzle").filter((value) => /^\d{4}_.*\.sql$/.test(value)).sort();
+  const migrationName = migrations.find((name) => name.startsWith("0012_"));
+  assert.notEqual(migrationName, undefined, "Expected additive migration 0012");
+  const migration = readFileSync(`drizzle/${migrationName}`, "utf8");
+  assert.doesNotMatch(migration, /PRAGMA foreign_keys\s*=\s*OFF/i, "migration must remain safe inside a D1 transaction");
+  const database = databaseThroughMigration("0011_");
+  database.prepare(
+    "INSERT INTO evidence_bundles (id,title,purpose,version,content_version,created_at,updated_at) VALUES (?,?,?,?,?,?,?)",
+  ).run("cleanup-bundle", "Cleanup", "receipt upgrade", 1, "v1", 1, 2);
+  database.prepare(
+    `INSERT INTO evidence_r2_cleanup_receipts
+      (id,bundle_id,source_id,storage_key,extracted_text_key,status,error_message,created_at,updated_at)
+      VALUES (?,?,?,?,?,?,?,?,?)`,
+  ).run("pending-cleanup", "cleanup-bundle", "source-pending", "original-key", null, "pending", "delete failed", 11, 12);
+  database.prepare(
+    `INSERT INTO evidence_r2_cleanup_receipts
+      (id,bundle_id,source_id,storage_key,extracted_text_key,status,error_message,created_at,updated_at)
+      VALUES (?,?,?,?,?,?,?,?,?)`,
+  ).run("completed-cleanup", "cleanup-bundle", "source-completed", null, null, "completed", null, 13, 14);
+  const receiptQuery = `SELECT id,bundle_id AS bundleId,source_id AS sourceId,storage_key AS storageKey,
+    extracted_text_key AS extractedTextKey,status,error_message AS errorMessage,created_at AS createdAt,
+    updated_at AS updatedAt FROM evidence_r2_cleanup_receipts ORDER BY id`;
+  const before = database.prepare(receiptQuery).all().map((row) => ({ ...row }));
+
+  applyMigrationInTransaction(database, migration);
+  assert.deepEqual(database.prepare(receiptQuery).all().map((row) => ({ ...row })), before);
+  assert.equal(database.prepare("SELECT count(*) AS count FROM evidence_r2_cleanup_receipts").get()?.count, 2);
+  assert.deepEqual(database.prepare("PRAGMA foreign_key_list('evidence_r2_cleanup_receipts')").all(), []);
+  const indexNames = database.prepare("PRAGMA index_list('evidence_r2_cleanup_receipts')").all()
+    .map((row) => String(row.name));
+  assert.equal(indexNames.includes("idx_evidence_r2_cleanup_status"), true);
+  assert.equal(indexNames.includes("idx_evidence_r2_cleanup_bundle"), true);
+  assert.deepEqual(database.prepare("PRAGMA foreign_key_check").all(), []);
+
+  database.prepare("DELETE FROM evidence_bundles WHERE id=?").run("cleanup-bundle");
+  assert.deepEqual(database.prepare(receiptQuery).all().map((row) => ({ ...row })), before);
+  assert.deepEqual(database.prepare("PRAGMA foreign_key_check").all(), []);
+
+  const emptyDatabase = databaseThroughMigration("0011_");
+  applyMigrationInTransaction(emptyDatabase, migration);
+  assert.equal(emptyDatabase.prepare("SELECT count(*) AS count FROM evidence_r2_cleanup_receipts").get()?.count, 0);
+  assert.deepEqual(emptyDatabase.prepare("PRAGMA foreign_key_check").all(), []);
+
+  const journal = JSON.parse(readFileSync("drizzle/meta/_journal.json", "utf8")) as {
+    entries: { idx: number; tag: string }[];
+  };
+  assert.equal(journal.entries.filter((entry) => entry.idx === 12 && entry.tag.startsWith("0012_")).length, 1);
 });
 
 test("production repository keeps cleanup ownership metadata after bundle deletion and reports missing receipts", async () => {

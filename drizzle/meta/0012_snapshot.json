@@ -1,8 +1,8 @@
 {
   "version": "6",
   "dialect": "sqlite",
-  "id": "70d59762-d711-4a3b-ac39-369d8106dc62",
-  "prevId": "66da2273-2b48-4225-aba7-13bb58b72a53",
+  "id": "6f180dae-a2e5-4de1-9461-3d5b2a912d45",
+  "prevId": "70d59762-d711-4a3b-ac39-369d8106dc62",
   "tables": {
     "attempts": {
       "name": "attempts",
@@ -825,23 +825,16 @@
             "updated_at"
           ],
           "isUnique": false
-        }
-      },
-      "foreignKeys": {
-        "evidence_r2_cleanup_receipts_bundle_id_evidence_bundles_id_fk": {
-          "name": "evidence_r2_cleanup_receipts_bundle_id_evidence_bundles_id_fk",
-          "tableFrom": "evidence_r2_cleanup_receipts",
-          "tableTo": "evidence_bundles",
-          "columnsFrom": [
+        },
+        "idx_evidence_r2_cleanup_bundle": {
+          "name": "idx_evidence_r2_cleanup_bundle",
+          "columns": [
             "bundle_id"
           ],
-          "columnsTo": [
-            "id"
-          ],
-          "onDelete": "cascade",
-          "onUpdate": "no action"
+          "isUnique": false
         }
       },
+      "foreignKeys": {},
       "compositePrimaryKeys": {},
       "uniqueConstraints": {},
       "checkConstraints": {}

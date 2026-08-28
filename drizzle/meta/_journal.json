@@ -85,6 +85,13 @@
       "when": 1787911935144,
       "tag": "0011_evidence_r2_cleanup_receipts",
       "breakpoints": true
+    },
+    {
+      "idx": 12,
+      "version": "6",
+      "when": 1787912802525,
+      "tag": "0012_evidence_r2_cleanup_without_bundle_fk",
+      "breakpoints": true
     }
   ]
 }
