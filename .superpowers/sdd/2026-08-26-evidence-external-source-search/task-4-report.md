@@ -1,0 +1,89 @@
+# Task 4 implementer report: search, selection, and import orchestration
+
+## Status
+
+**DONE** — Task 4 is implemented in `54d1d68` (`feat: orchestrate external evidence selection`). The brief-defined focused tests, ESLint, and the production build pass.
+
+## Exact files
+
+Implementation commit `54d1d68` changes exactly the requested five files:
+
+- `lib/server/evidence-search-jobs.ts` (new)
+- `lib/server/evidence-service.ts`
+- `lib/server/evidence-runtime.ts`
+- `tests/evidence-search-jobs.test.ts` (new)
+- `tests/evidence-service.test.ts`
+
+No schema migration or runtime package was added.
+
+## Implemented behavior
+
+### Explicit search lifecycle
+
+- `startSearch()` reads the current bundle and builds a direct-evidence summary from uploaded extracted text plus direct video observations. The summary is capped at 4,000 UTF-8 bytes and also at the search adapter's 2,000-code-unit boundary.
+- The search input hash covers bundle content/version, title, purpose, the bounded summary, search model, and search prompt version.
+- A unique D1 input version plus `INSERT OR IGNORE` deduplicates concurrent starts. Existing `queued`, `searching`, or `ready` work is reused; a provider-failed run with no candidates can be requeued safely.
+- The run is stored as `queued` before scheduling. Candidate insertion and the `searching → ready` checkpoint share one D1 batch, are guarded by the original bundle authority, and retain at most eight server-policy-approved canonical URLs.
+- Search failures store only a classified Korean message capped at 240 characters. Provider bodies, API keys, and arbitrary transport messages are never persisted or returned.
+- `getLatestSearch()` and `getSearch()` expose parsed query strings and candidate metadata, but not provider envelopes, request bodies, storage keys, or credentials.
+
+### Selection CAS and audit
+
+- `saveSelection()` validates the run/bundle relationship, state, stale bit, expected numeric bundle version, candidate ownership, five-selection maximum, and selected/excluded disjointness.
+- Advisory reads are followed by a single D1 batch whose every candidate/audit write shares the same bundle version, run status/stale/`updated_at`, and complete candidate-membership guard. The final run `updated_at` write is the CAS checkpoint; a zero-row result becomes a 409 conflict.
+- Selected and excluded decisions record actor/time and an `evidence_audit_events` row per changed candidate.
+- Imported candidates cannot be excluded, importing candidates cannot be changed, and previously imported candidates count toward the five-source cap.
+- A post-commit transport error is reconciled by rereading the requested candidate states, making exact selection retries idempotent.
+
+### Selected-only isolated imports
+
+- `startImport()` requires at least one selected or failed candidate, enforces the five-candidate boundary again, deduplicates an already-importing run, and schedules only D1-selected rows.
+- Candidates execute sequentially but independently as `selected|failed → importing → imported|failed`. Sequential execution avoids self-induced bundle CAS races while retaining per-candidate partial failure and retry behavior.
+- Each candidate uses the existing bounded `fetchExternalEvidence()` path. The orchestrator independently rechecks the final URL with server policy and verifies that the proposed quote appears in the returned extracted pages before any R2 write.
+- Successful bytes use the existing `EvidenceFileStore`, external metadata validation, URL/hash deduplication, opaque R2 keys, registration CAS, and durable loser-cleanup receipts.
+- The source insert, bundle version increase, analysis/card invalidation, importing-run version advance, and new candidate `source_id`/hash transition are guarded in the same D1 mutation batch when a new source is registered. If the bundle/source CAS loses, the existing storage reconciliation removes only unowned R2 objects.
+- A duplicate existing source is linked to the importing candidate without a new bundle version or R2 write. A post-commit D1 transport error is reconciled to the already committed source/candidate state.
+- One failed candidate does not roll back a successful sibling. A run becomes `completed` when at least one selected source imports and all selected work is terminal; it becomes `failed` only when all imports fail. Retrying a completed partial-success run fetches only failed candidates.
+
+### Staleness, detail, deletion, and runtime
+
+- Content-bearing service mutations stale other search runs in the existing guarded D1 mutation. The importing run that owns a newly registered candidate is preserved and atomically advanced to the new bundle version.
+- Purpose, uploaded source, external source, video observation, and source deletion changes therefore invalidate prior search authority. Title-only mutations keep the existing content-version behavior.
+- Administrator bundle detail retains `origin`, `canonicalUrl`, `publisher`, `publishedAt`, and `retrievedAt` from the production repository.
+- External source removal continues through the existing link-impact check, durable receipt, bundle/source CAS, and compensated R2 pair deletion path. Existing card and exact scenario relations still block deletion.
+- Production runtime optionally composes `EvidenceExternalSearchJobs` without starting search implicitly. Its real import closure uses Cloudflare Workers `fetch`, the server-owned allowlist, and bounded Cloudflare DoH. No raw TCP, IP-pinned socket, or unsupported resolution override was introduced.
+
+## RED/GREEN evidence
+
+### RED 1 — orchestrator absent
+
+`npx tsx --test tests/evidence-search-jobs.test.ts` exited 1 with `ERR_MODULE_NOT_FOUND` for `lib/server/evidence-search-jobs.ts`. This was the brief-specified initial failure and established that the new public orchestration surface did not exist.
+
+### RED 2 — production runtime not wired
+
+After the core orchestrator/service slice was green, the runtime composition test failed because `runtime.searchJobs` was `undefined`. Adding the optional production composition made the same test pass while preserving explicit search start semantics.
+
+### GREEN
+
+- Final required command `npx tsx --test tests/evidence-search-jobs.test.ts tests/evidence-service.test.ts tests/evidence-storage.test.ts && npm run lint` passed **68/68** tests with 0 failures, cancellations, skips, or todos; ESLint exited 0.
+- `npm run build` completed all five vinext build stages successfully.
+- `npm test` passed the repository suite: domain **47/47**, integration/component **18/18**, rendered output **5/5**, with its production build stage also successful.
+- `git diff --check` reported no whitespace errors before the implementation commit.
+
+## Concurrency and failure-injection evidence
+
+- Repeated explicit search starts produce one D1 run, one scheduled promise, one provider call, and at most eight unique candidates.
+- A real SQLite/D1 `beforeNextBatch` bundle-version winner causes selection CAS failure with zero candidate changes and zero selection audit rows.
+- A source-registration CAS loss after fetch leaves zero `evidence_sources` rows and zero R2 objects; the candidate reaches terminal `failed` state without exposing the injected upstream body.
+- A D1 transport error injected after the registration batch commits reconciles to exactly one source, two owned R2 objects, an `imported` candidate, a `completed` run, and matching run/bundle version 2.
+- Partial import failure preserves the successful source. Retry fetches only the failed URL, reaches two sources, and an additional completed-run retry performs no work.
+- Quote mismatch fails before R2/source registration.
+- Provider failure leaves prior analysis/card state unchanged and persists only the bounded classified failure message.
+- Existing Task 3 tests continue to prove durable pending cleanup receipts, URL/content race reconciliation, pair compensation, and no restoration of unowned objects.
+
+## Concerns
+
+- No Task 4 blocker remains.
+- The focused storage suite still prints existing PDF.js standard-font/indexing warnings while passing; these are unchanged from the Task 3 baseline.
+- The build still prints the existing Node `module.register()` deprecation and vinext route-classification warnings while exiting 0.
+- Repository-wide bare `npx tsc --noEmit` was already documented by Task 3 as a non-green, unsupported broad gate; Task 4 used the brief-defined tests, ESLint, and production build gates instead.
