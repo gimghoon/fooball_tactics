@@ -26,6 +26,10 @@ import {
   EvidenceRequestValidationError,
   EvidenceUnavailableError,
 } from "./evidence-errors.ts";
+import {
+  enforceExternalEvidenceRules,
+  type EvidenceChunkOrigin,
+} from "./evidence-analyzer.ts";
 export { EvidenceConflictError } from "./evidence-errors.ts";
 
 export type EvidenceAnalysisSettings = {
@@ -90,6 +94,10 @@ export type EvidenceCitationSnapshot = {
   locationLabel: string;
   content: string;
   contentHash: string;
+};
+type EvidenceCitationAuthority = EvidenceCitationSnapshot & {
+  inputVersion: string;
+  origin: EvidenceChunkOrigin;
 };
 export type EvidenceAdminCitation = EvidenceCitationSnapshot & {
   origin: "uploaded" | "external_web" | "video_observation";
@@ -211,7 +219,7 @@ export type EvidenceServiceRepository = {
   findCard(cardId: string): Promise<EvidenceCardRecord | null>;
   listCardCitations(
     cardId: string,
-  ): Promise<(EvidenceCitationSnapshot & { inputVersion: string })[]>;
+  ): Promise<EvidenceCitationAuthority[]>;
   countCardCitations(cardId: string, inputVersion: string): Promise<number>;
   listCardCitationsForAdmin(cardId: string, inputVersion: string, limit: number): Promise<EvidenceAdminCitation[]>;
   findCardReview(
@@ -258,7 +266,7 @@ function cardCitationIds(content: TacticCardContent): string[] {
 
 function exactCitationSnapshot(
   content: TacticCardContent,
-  citations: (EvidenceCitationSnapshot & { inputVersion: string })[],
+  citations: EvidenceCitationAuthority[],
   bundleVersion: string,
 ): EvidenceCitationSnapshot[] {
   const current = new Map(
@@ -282,6 +290,25 @@ function exactCitationSnapshot(
       contentHash: citation.contentHash,
     };
   });
+}
+
+function exactCitationOrigins(
+  content: TacticCardContent,
+  citations: EvidenceCitationAuthority[],
+  bundleVersion: string,
+): ReadonlyMap<string, EvidenceChunkOrigin> {
+  const current = new Map(
+    citations
+      .filter((citation) => citation.inputVersion === bundleVersion)
+      .map((citation) => [citation.chunkId, citation]),
+  );
+  const ids = cardCitationIds(content);
+  if (ids.some((id) => !current.has(id))) {
+    throw new EvidenceConflictError(
+      "현재 카드의 유효한 근거를 확인할 수 없어 검수할 수 없습니다.",
+    );
+  }
+  return new Map(ids.map((id) => [id, current.get(id)!.origin]));
 }
 
 function expectedTimestamp(value: number): number {
@@ -746,18 +773,20 @@ export class D1EvidenceServiceRepository implements EvidenceServiceRepository {
   }
   async listCardCitations(
     cardId: string,
-  ): Promise<(EvidenceCitationSnapshot & { inputVersion: string })[]> {
+  ): Promise<EvidenceCitationAuthority[]> {
     return (
       await this.db
         .prepare(
           `SELECT chunk.id AS chunkId,chunk.source_id AS sourceId,chunk.video_clip_id AS videoClipId,
-        chunk.location_label AS locationLabel,chunk.content,chunk.content_hash AS contentHash,chunk.input_version AS inputVersion
+        chunk.location_label AS locationLabel,chunk.content,chunk.content_hash AS contentHash,chunk.input_version AS inputVersion,
+        CASE WHEN chunk.video_clip_id IS NOT NULL THEN 'video_observation' ELSE source.origin END AS origin
         FROM tactic_card_citations AS citation
         JOIN evidence_chunks AS chunk ON chunk.id=citation.chunk_id AND chunk.bundle_id=citation.bundle_id
+        LEFT JOIN evidence_sources AS source ON source.id=chunk.source_id AND source.bundle_id=chunk.bundle_id
         WHERE citation.card_id=? ORDER BY chunk.id`,
         )
         .bind(cardId)
-        .all<EvidenceCitationSnapshot & { inputVersion: string }>()
+        .all<EvidenceCitationAuthority>()
     ).results;
   }
   async countCardCitations(cardId: string, inputVersion: string): Promise<number> {
@@ -1223,8 +1252,12 @@ export class EvidenceService {
     if (card.updatedAt !== expectedUpdatedAt) throw new EvidenceConflictError();
     this.assertCurrentCard(card);
 
-    const content = parseTacticCardContent(command.content);
+    const submittedContent = parseTacticCardContent(command.content);
     const citations = await this.d.repository.listCardCitations(card.id);
+    const content = enforceExternalEvidenceRules(
+      submittedContent,
+      exactCitationOrigins(submittedContent, citations, card.bundleVersion),
+    );
     const snapshot = exactCitationSnapshot(
       content,
       citations,
