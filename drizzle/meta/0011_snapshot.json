@@ -825,23 +825,16 @@
             "updated_at"
           ],
           "isUnique": false
-        }
-      },
-      "foreignKeys": {
-        "evidence_r2_cleanup_receipts_bundle_id_evidence_bundles_id_fk": {
-          "name": "evidence_r2_cleanup_receipts_bundle_id_evidence_bundles_id_fk",
-          "tableFrom": "evidence_r2_cleanup_receipts",
-          "tableTo": "evidence_bundles",
-          "columnsFrom": [
+        },
+        "idx_evidence_r2_cleanup_bundle": {
+          "name": "idx_evidence_r2_cleanup_bundle",
+          "columns": [
             "bundle_id"
           ],
-          "columnsTo": [
-            "id"
-          ],
-          "onDelete": "cascade",
-          "onUpdate": "no action"
+          "isUnique": false
         }
       },
+      "foreignKeys": {},
       "compositePrimaryKeys": {},
       "uniqueConstraints": {},
       "checkConstraints": {}

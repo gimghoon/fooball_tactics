@@ -157,8 +157,8 @@ test("extracts an inert bounded HTML snapshot and verifies normalized quotes", a
   ), /인용/);
 });
 
-test("strips forged content after self-closing syntax for every active HTML element", async () => {
-  for (const tag of ["script", "style", "form", "iframe", "object", "embed", "svg"]) {
+test("strips forged content after self-closing syntax for every content-bearing stripped HTML element", async () => {
+  for (const tag of ["script", "style", "form", "iframe", "object", "svg"]) {
     const html = `<${tag}/>forged-${tag}</${tag}><main>verified safe text</main>`;
     const result = await fetchExternalEvidence(
       { url: `https://fifa.com/guidance/${tag}`, expectedType: "web_page", quote: "verified safe text" },
@@ -167,6 +167,22 @@ test("strips forged content after self-closing syntax for every active HTML elem
     const snapshot = new TextDecoder().decode(result.bytes);
     assert.doesNotMatch(snapshot, new RegExp(`forged-${tag}`), tag);
     assert.match(snapshot, /verified safe text/, tag);
+  }
+});
+
+test("treats embed as a void element and retains legitimate following text", async () => {
+  for (const [path, html, quote] of [
+    ["embed", '<embed src="media.example/clip">text after embed<main>verified main text</main>', "text after embed"],
+    ["embed-slash", '<embed src="media.example/clip"/>text after slash<main>verified main text</main>', "text after slash"],
+  ] as const) {
+    const result = await fetchExternalEvidence(
+      { url: `https://fifa.com/guidance/${path}`, expectedType: "web_page", quote },
+      dependencies(responseFetch(htmlResponse(html))),
+    );
+    const snapshot = new TextDecoder().decode(result.bytes);
+    assert.match(snapshot, new RegExp(quote));
+    assert.match(snapshot, /verified main text/);
+    assert.doesNotMatch(snapshot, /media\.example/);
   }
 });
 

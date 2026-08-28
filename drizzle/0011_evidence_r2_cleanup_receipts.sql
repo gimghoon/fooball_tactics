@@ -7,8 +7,8 @@ CREATE TABLE `evidence_r2_cleanup_receipts` (
 	`status` text DEFAULT 'pending' NOT NULL,
 	`error_message` text,
 	`created_at` integer NOT NULL,
-	`updated_at` integer NOT NULL,
-	FOREIGN KEY (`bundle_id`) REFERENCES `evidence_bundles`(`id`) ON UPDATE no action ON DELETE cascade
+	`updated_at` integer NOT NULL
 );
 --> statement-breakpoint
-CREATE INDEX `idx_evidence_r2_cleanup_status` ON `evidence_r2_cleanup_receipts` (`status`,`updated_at`);
+CREATE INDEX `idx_evidence_r2_cleanup_status` ON `evidence_r2_cleanup_receipts` (`status`,`updated_at`);--> statement-breakpoint
+CREATE INDEX `idx_evidence_r2_cleanup_bundle` ON `evidence_r2_cleanup_receipts` (`bundle_id`);

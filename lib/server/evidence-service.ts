@@ -15,6 +15,7 @@ import {
 } from "../domain/evidence.ts";
 import type { EvidenceAdmin } from "./evidence-auth.ts";
 import type {
+  EvidenceCleanupReceiptCompletion,
   EvidenceCleanupReceiptInput,
   EvidenceFileStore,
   StoredEvidenceFile,
@@ -191,7 +192,7 @@ export type EvidenceServiceRepository = {
     canonicalUrl?: string,
   ): Promise<StoredEvidenceFile | null>;
   createR2CleanupReceipt(receipt: EvidenceCleanupReceiptInput & { id: string; createdAt: number }): Promise<void>;
-  finishR2CleanupReceipt(receiptId: string, error: string | null, updatedAt: number): Promise<void>;
+  finishR2CleanupReceipt(receiptId: string, completion: EvidenceCleanupReceiptCompletion, updatedAt: number): Promise<void>;
   describeDeleteImpact(sourceId: string): Promise<EvidenceDeleteImpact>;
   createBundle(
     bundle: EvidenceBundleRecord,
@@ -374,10 +375,20 @@ export class D1EvidenceServiceRepository implements EvidenceServiceRepository {
       receipt.createdAt,
     ).run();
   }
-  async finishR2CleanupReceipt(receiptId: string, error: string | null, updatedAt: number) {
-    await this.db.prepare(
-      "UPDATE evidence_r2_cleanup_receipts SET status=?,error_message=?,updated_at=? WHERE id=?",
-    ).bind(error === null ? "completed" : "pending", error, updatedAt, receiptId).run();
+  async finishR2CleanupReceipt(receiptId: string, completion: EvidenceCleanupReceiptCompletion, updatedAt: number) {
+    const result = await this.db.prepare(
+      "UPDATE evidence_r2_cleanup_receipts SET storage_key=?,extracted_text_key=?,status=?,error_message=?,updated_at=? WHERE id=?",
+    ).bind(
+      completion.storageKey,
+      completion.extractedTextKey,
+      completion.error === null ? "completed" : "pending",
+      completion.error,
+      updatedAt,
+      receiptId,
+    ).run();
+    if ((result.meta?.changes ?? 0) !== 1) {
+      throw new Error("근거 객체 정리 영수증을 찾을 수 없습니다.");
+    }
   }
   async describeDeleteImpact(sourceId: string) {
     const [cards, scenarios] = await Promise.all([
@@ -993,8 +1004,8 @@ export class EvidenceService {
         await this.d.repository.createR2CleanupReceipt({ ...input, id, createdAt: this.now() });
         return id;
       },
-      finishCleanup: (receiptId: string, error: string | null) =>
-        this.d.repository.finishR2CleanupReceipt(receiptId, error, this.now()),
+      finishCleanup: (receiptId: string, completion: EvidenceCleanupReceiptCompletion) =>
+        this.d.repository.finishR2CleanupReceipt(receiptId, completion, this.now()),
     };
   }
   async addSource(s: StoredEvidenceFile, a: EvidenceAdmin) {

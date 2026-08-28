@@ -35,7 +35,7 @@ export function createEvidenceProductionRuntime(dependencies: EvidenceProduction
     },
     findById(sourceId) {
       if (registration === null) throw new Error("근거 자료 등록 서비스가 구성되지 않았습니다.");
-      return registration.findById!(sourceId);
+      return registration.findById(sourceId);
     },
     register(source) {
       if (registration === null) throw new Error("근거 자료 등록 서비스가 구성되지 않았습니다.");
@@ -43,11 +43,11 @@ export function createEvidenceProductionRuntime(dependencies: EvidenceProduction
     },
     startCleanup(input) {
       if (registration === null) throw new Error("근거 자료 등록 서비스가 구성되지 않았습니다.");
-      return registration.startCleanup!(input);
+      return registration.startCleanup(input);
     },
-    finishCleanup(receiptId, error) {
+    finishCleanup(receiptId, completion) {
       if (registration === null) throw new Error("근거 자료 등록 서비스가 구성되지 않았습니다.");
-      return registration.finishCleanup!(receiptId, error);
+      return registration.finishCleanup(receiptId, completion);
     },
   };
   const fileStore = new EvidenceFileStore({

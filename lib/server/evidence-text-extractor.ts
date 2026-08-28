@@ -11,7 +11,8 @@ export const MAX_PDF_PAGES = 200;
 export const MAX_EXTRACTED_OUTPUT_BYTES = 5 * 1024 * 1024;
 export const MAX_EXTRACTION_MS = 10_000;
 const HTML_SECTION_BYTES = 32 * 1024;
-const HTML_STRIPPED_ELEMENTS = new Set(["script", "style", "form", "iframe", "object", "embed", "svg"]);
+const HTML_STRIPPED_CONTENT_ELEMENTS = new Set(["script", "style", "form", "iframe", "object", "svg"]);
+const HTML_STRIPPED_VOID_ELEMENTS = new Set(["embed"]);
 const HTML_BLOCK_ELEMENTS = new Set([
   "address", "article", "aside", "blockquote", "br", "dd", "div", "dl", "dt", "figcaption", "figure",
   "footer", "h1", "h2", "h3", "h4", "h5", "h6", "header", "hr", "li", "main", "nav", "ol", "p",
@@ -214,7 +215,7 @@ function inertHtmlText(html: string): string {
     }
     const closing = match[1] === "/";
     const name = match[2]!.toLowerCase();
-    if (HTML_STRIPPED_ELEMENTS.has(name)) {
+    if (HTML_STRIPPED_CONTENT_ELEMENTS.has(name)) {
       if (closing) {
         if (strippedStack.at(-1) === name) strippedStack.pop();
       } else {
@@ -222,6 +223,9 @@ function inertHtmlText(html: string): string {
         // Keep stripping until the matching end tag instead of trusting `/ >`.
         strippedStack.push(name);
       }
+    } else if (HTML_STRIPPED_VOID_ELEMENTS.has(name)) {
+      // Void elements have no content in HTML. Remove only the tag; a `/` does
+      // not change that parsing rule and following text remains document text.
     } else if (strippedStack.length === 0 && HTML_BLOCK_ELEMENTS.has(name)) {
       output.push("\n");
     }

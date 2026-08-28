@@ -4,6 +4,8 @@ import { deflateSync } from "node:zlib";
 
 import {
   EvidenceFileStore,
+  type EvidenceSourceRegistrationPort,
+  type StoredEvidenceFile,
   validateEvidenceFile,
 } from "../lib/server/evidence-storage.ts";
 import { extractEvidenceText } from "../lib/server/evidence-text-extractor.ts";
@@ -355,7 +357,7 @@ type SourceRow = {
   id: string;
   bundleId: string;
   originalFileName: string;
-  mediaType: string;
+  mediaType: StoredEvidenceFile["mediaType"];
   byteSize: number;
   contentHash: string;
   storageKey: string;
@@ -430,7 +432,7 @@ class FakeD1Statement {
   async run(): Promise<void> {
     assert.match(this.sql, /^\s*INSERT INTO evidence_sources/);
     const [id, bundleId, originalFileName, mediaType, byteSize, contentHash, storageKey, extractedTextKey, extractionStatus, extractionError] = this.values as [
-      string, string, string, string, number, string, string, string | null, SourceRow["extractionStatus"], string | null,
+      string, string, string, StoredEvidenceFile["mediaType"], number, string, string, string | null, SourceRow["extractionStatus"], string | null,
     ];
     const source = { id, bundleId, originalFileName, mediaType, byteSize, contentHash, storageKey, extractedTextKey, extractionStatus, extractionError };
     if (this.database.nextUniqueConflict !== null) {
@@ -442,7 +444,7 @@ class FakeD1Statement {
   }
 }
 
-class FakeD1 {
+class FakeD1 implements EvidenceSourceRegistrationPort {
   readonly rows: SourceRow[] = [];
   readonly cleanupReceipts: CleanupReceipt[] = [];
   nextUniqueConflict: SourceRow | null = null;
@@ -468,11 +470,13 @@ class FakeD1 {
     return id;
   }
 
-  async finishCleanup(id: string, error: string | null): Promise<void> {
+  async finishCleanup(id: string, completion: { storageKey: string | null; extractedTextKey: string | null; error: string | null }): Promise<void> {
     const receipt = this.cleanupReceipts.find((value) => value.id === id);
     assert.ok(receipt);
-    receipt.status = error === null ? "completed" : "pending";
-    receipt.error = error;
+    receipt.storageKey = completion.storageKey;
+    receipt.extractedTextKey = completion.extractedTextKey;
+    receipt.status = completion.error === null ? "completed" : "pending";
+    receipt.error = completion.error;
   }
 
   async register(source: SourceRow): Promise<SourceRow> {
@@ -517,6 +521,24 @@ test("persists one opaque original and extracted pair, then reuses a duplicate s
   await store.deleteFilePair(first.storageKey, first.extractedTextKey);
   assert.equal(await store.getFile(first.storageKey), null);
   assert.equal(await store.getFile(first.extractedTextKey ?? "missing"), null);
+});
+
+test("rejects incomplete registration capabilities before any R2 write", async () => {
+  const bucket = new FakeR2();
+  const registration = {
+    async findExisting() { return null; },
+    async register(source: SourceRow) { return source; },
+  } as unknown as EvidenceSourceRegistrationPort;
+
+  await assert.rejects(() => new EvidenceFileStore({ bucket, registration }).putValidatedFile({
+    bundleId: "bundle-1",
+    name: "notes.txt",
+    type: "text/plain",
+    bytes: new TextEncoder().encode("valid text"),
+  }), /등록 정리 서비스가 구성되지 않았습니다/);
+
+  assert.equal(bucket.putKeys.length, 0);
+  assert.equal(bucket.objects.size, 0);
 });
 
 test("normalizes and forwards external source metadata while keeping both R2 keys opaque", async () => {

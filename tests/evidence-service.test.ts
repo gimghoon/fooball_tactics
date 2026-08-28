@@ -322,7 +322,7 @@ test("production registration retains committed R2 objects when D1 commits and t
   assert.equal(context.database.first<{ count: number }>("SELECT count(*) AS count FROM evidence_r2_cleanup_receipts").count, 0);
 });
 
-test("production repository durably tracks pending and completed unowned R2 cleanup", async () => {
+test("production repository keeps cleanup ownership metadata after bundle deletion and reports missing receipts", async () => {
   const context = createContext();
   const bundle = await context.service.createBundle(bundleInput, admin);
   await context.repository.createR2CleanupReceipt({
@@ -338,18 +338,63 @@ test("production repository durably tracks pending and completed unowned R2 clea
     errorMessage: null,
   });
 
-  await context.repository.finishR2CleanupReceipt("cleanup-1", "delete failure", 2_001);
-  assert.deepEqual({ ...context.database.first("SELECT status,error_message AS errorMessage,updated_at AS updatedAt FROM evidence_r2_cleanup_receipts WHERE id='cleanup-1'") }, {
+  context.database.run("DELETE FROM evidence_bundles WHERE id=?", bundle.id);
+  assert.equal(context.database.first<{ count: number }>("SELECT count(*) AS count FROM evidence_r2_cleanup_receipts WHERE id='cleanup-1'").count, 1);
+
+  await context.repository.finishR2CleanupReceipt("cleanup-1", {
+    storageKey: "unowned-original",
+    extractedTextKey: null,
+    error: "delete failure",
+  }, 2_001);
+  assert.deepEqual({ ...context.database.first("SELECT bundle_id AS bundleId,storage_key AS storageKey,extracted_text_key AS extractedTextKey,status,error_message AS errorMessage,updated_at AS updatedAt FROM evidence_r2_cleanup_receipts WHERE id='cleanup-1'") }, {
+    bundleId: bundle.id,
+    storageKey: "unowned-original",
+    extractedTextKey: null,
     status: "pending",
     errorMessage: "delete failure",
     updatedAt: 2_001,
   });
 
-  await context.repository.finishR2CleanupReceipt("cleanup-1", null, 2_002);
-  assert.deepEqual({ ...context.database.first("SELECT status,error_message AS errorMessage,updated_at AS updatedAt FROM evidence_r2_cleanup_receipts WHERE id='cleanup-1'") }, {
+  await context.repository.finishR2CleanupReceipt("cleanup-1", {
+    storageKey: null,
+    extractedTextKey: null,
+    error: null,
+  }, 2_002);
+  assert.deepEqual({ ...context.database.first("SELECT storage_key AS storageKey,extracted_text_key AS extractedTextKey,status,error_message AS errorMessage,updated_at AS updatedAt FROM evidence_r2_cleanup_receipts WHERE id='cleanup-1'") }, {
+    storageKey: null,
+    extractedTextKey: null,
     status: "completed",
     errorMessage: null,
     updatedAt: 2_002,
+  });
+
+  await assert.rejects(
+    () => context.repository.finishR2CleanupReceipt("missing-cleanup", {
+      storageKey: "still-unowned",
+      extractedTextKey: null,
+      error: "delete failure",
+    }, 2_003),
+    /정리 영수증.*찾을 수 없습니다/,
+  );
+});
+
+test("missing-bundle registration leaves a durable pending receipt with only the undeleted R2 key", async () => {
+  const context = createContext();
+  context.bucket.failDelete = (key) => key === context.bucket.putKeys[0];
+
+  await assert.rejects(() => uploadText(context, "missing-bundle"), /정리/);
+
+  assert.equal(context.database.first<{ count: number }>("SELECT count(*) AS count FROM evidence_bundles").count, 0);
+  assert.equal(context.bucket.objects.has(context.bucket.putKeys[0]!), true);
+  assert.equal(context.bucket.objects.has(context.bucket.putKeys[1]!), false);
+  assert.deepEqual({ ...context.database.first(
+    "SELECT bundle_id AS bundleId,storage_key AS storageKey,extracted_text_key AS extractedTextKey,status,error_message AS errorMessage FROM evidence_r2_cleanup_receipts",
+  ) }, {
+    bundleId: "missing-bundle",
+    storageKey: context.bucket.putKeys[0],
+    extractedTextKey: null,
+    status: "pending",
+    errorMessage: `permanent delete failure for ${context.bucket.putKeys[0]}`,
   });
 });
 
@@ -393,8 +438,13 @@ test("production URL-race cleanup never restores a deleted loser object and leav
   assert.equal(context.bucket.objects.has(context.bucket.putKeys[1]!), false);
   assert.equal(context.bucket.putKeys.length, 2, "loser cleanup must not restore the deleted extracted object");
   assert.deepEqual({ ...context.database.first(
-    "SELECT status,error_message AS errorMessage FROM evidence_r2_cleanup_receipts",
-  ) }, { status: "pending", errorMessage: `permanent delete failure for ${context.bucket.putKeys[0]}` });
+    "SELECT storage_key AS storageKey,extracted_text_key AS extractedTextKey,status,error_message AS errorMessage FROM evidence_r2_cleanup_receipts",
+  ) }, {
+    storageKey: context.bucket.putKeys[0],
+    extractedTextKey: null,
+    status: "pending",
+    errorMessage: `permanent delete failure for ${context.bucket.putKeys[0]}`,
+  });
 });
 
 test("a lost bundle CAS changes none of the guarded source, work, or audit rows", async () => {

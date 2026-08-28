@@ -80,6 +80,14 @@ const source = {
   extractionError: null,
 };
 
+function cleanupRegistrationCapabilities() {
+  return {
+    async findById() { return null; },
+    async startCleanup() { return "cleanup-receipt"; },
+    async finishCleanup() {},
+  };
+}
+
 function runtime(overrides: Partial<EvidenceRouteRuntime> = {}): EvidenceRouteRuntime {
   return {
     admin,
@@ -412,6 +420,7 @@ test("PDF preflight rejects corrupt content and preserves valid scan/text behavi
       async delete(key) { objects.delete(key); },
     },
     registration: {
+      ...cleanupRegistrationCapabilities(),
       async findExisting() { return null; },
       async register(value) { rows.push(value); return value; },
     },
@@ -465,6 +474,7 @@ test("recovered PDF stream errors return 415 and pre-aborted uploads return 400 
         async delete(key) { objects.delete(key); },
       },
       registration: {
+        ...cleanupRegistrationCapabilities(),
         async findExisting() { return null; },
         async register(value) { rows.push(value); return value; },
       },
@@ -504,6 +514,7 @@ test("real upload route rejects indirect, LZW, and later-stage stream failures w
         async delete(key) { objects.delete(key); },
       },
       registration: {
+        ...cleanupRegistrationCapabilities(),
         async findExisting() { return null; },
         async register(value) { rows.push(value); return value; },
       },
@@ -546,6 +557,7 @@ test("real upload route preserves image scans, commented lengths, and validated 
         async delete(key) { objects.delete(key); },
       },
       registration: {
+        ...cleanupRegistrationCapabilities(),
         async findExisting() { return null; },
         async register(value) { rows.push(value); return value; },
       },
@@ -596,6 +608,7 @@ test("request abort during stalled multipart parsing cancels input and persists 
       async delete(key) { objects.delete(key); },
     },
     registration: {
+      ...cleanupRegistrationCapabilities(),
       async findExisting() { return null; },
       async register(value) { rows.push(value); return value; },
     },
@@ -692,6 +705,7 @@ test("upload preserves typed registration conflicts/not-found after cleanup with
         async delete(key) { objects.delete(key); },
       },
       registration: {
+        ...cleanupRegistrationCapabilities(),
         async findExisting() { return null; },
         async register() { throw error; },
       },

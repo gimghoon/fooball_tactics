@@ -99,10 +99,10 @@ export type EvidenceD1Database = {
 /** Service-owned registration keeps a new source in the same version/audit mutation. */
 export type EvidenceSourceRegistrationPort = {
   findExisting(bundleId: string, contentHash: string, canonicalUrl?: string): Promise<StoredEvidenceFile | null>;
-  findById?: (sourceId: string) => Promise<StoredEvidenceFile | null>;
+  findById(sourceId: string): Promise<StoredEvidenceFile | null>;
   register(source: StoredEvidenceFile): Promise<StoredEvidenceFile>;
-  startCleanup?: (input: EvidenceCleanupReceiptInput) => Promise<string>;
-  finishCleanup?: (receiptId: string, error: string | null) => Promise<void>;
+  startCleanup(input: EvidenceCleanupReceiptInput): Promise<string>;
+  finishCleanup(receiptId: string, completion: EvidenceCleanupReceiptCompletion): Promise<void>;
 };
 
 export type EvidenceCleanupReceiptInput = {
@@ -111,6 +111,23 @@ export type EvidenceCleanupReceiptInput = {
   storageKey: string | null;
   extractedTextKey: string | null;
 };
+
+export type EvidenceCleanupReceiptCompletion = Pick<
+  EvidenceCleanupReceiptInput,
+  "storageKey" | "extractedTextKey"
+> & { error: string | null };
+
+function assertRegistrationCapabilities(registration: EvidenceSourceRegistrationPort): void {
+  if (
+    typeof registration.findExisting !== "function"
+    || typeof registration.findById !== "function"
+    || typeof registration.register !== "function"
+    || typeof registration.startCleanup !== "function"
+    || typeof registration.finishCleanup !== "function"
+  ) {
+    throw new EvidenceValidationError("근거 자료 등록 정리 서비스가 구성되지 않았습니다.");
+  }
+}
 
 async function sha256(bytes: Uint8Array): Promise<string> {
   const digest = await crypto.subtle.digest("SHA-256", bytes);
@@ -317,6 +334,7 @@ export class EvidenceFileStore {
     input: EvidenceFileInput & { bundleId: string; externalMetadata?: ExternalSourceMetadata },
     requestPreflightOptions: EvidencePdfPreflightOptions = {},
   ): Promise<StoredEvidenceFile> {
+    assertRegistrationCapabilities(this.dependencies.registration);
     const externalMetadata = normalizedExternalMetadata(input.externalMetadata);
     const validatedInput = externalMetadata === undefined ? input : {
       ...input,
@@ -378,13 +396,6 @@ export class EvidenceFileStore {
 
   private async reconcileFailedRegistration(source: StoredEvidenceFile, registrationError: unknown): Promise<StoredEvidenceFile> {
     const registration = this.dependencies.registration;
-    if (registration.findById === undefined || registration.startCleanup === undefined || registration.finishCleanup === undefined) {
-      throw new AggregateError(
-        [registrationError, new Error("근거 자료 등록 정리 서비스가 구성되지 않았습니다.")],
-        "등록 결과를 안전하게 확인할 수 없습니다.",
-      );
-    }
-
     const exact = await registration.findById(source.id);
     const duplicate = await registration.findExisting(source.bundleId, source.contentHash, source.canonicalUrl);
     const owner = exact ?? duplicate;
@@ -409,12 +420,17 @@ export class EvidenceFileStore {
       storageKey: unownedStorageKey,
       extractedTextKey: unownedExtractedKey,
     });
-    const cleanupErrors = await this.deleteUnownedKeys([unownedStorageKey, unownedExtractedKey].filter((key): key is string => key !== null));
+    const cleanup = await this.deleteUnownedKeys([unownedStorageKey, unownedExtractedKey].filter((key): key is string => key !== null));
+    const cleanupErrors = cleanup.errors;
     const cleanupError = cleanupErrors.length === 0
       ? null
       : cleanupErrors.map((value) => value instanceof Error ? value.message : "unknown cleanup failure").join("; ").slice(0, 500);
     try {
-      await registration.finishCleanup(receiptId, cleanupError);
+      await registration.finishCleanup(receiptId, {
+        storageKey: unownedStorageKey !== null && cleanup.failedKeys.includes(unownedStorageKey) ? unownedStorageKey : null,
+        extractedTextKey: unownedExtractedKey !== null && cleanup.failedKeys.includes(unownedExtractedKey) ? unownedExtractedKey : null,
+        error: cleanupError,
+      });
     } catch (receiptError) {
       throw new AggregateError([registrationError, ...cleanupErrors, receiptError], "미소유 근거 객체 정리 상태를 기록하지 못했습니다.");
     }
@@ -425,7 +441,7 @@ export class EvidenceFileStore {
     throw registrationError;
   }
 
-  private async deleteUnownedKeys(keys: string[]): Promise<unknown[]> {
+  private async deleteUnownedKeys(keys: string[]): Promise<{ failedKeys: string[]; errors: unknown[] }> {
     let remaining = [...keys];
     let errors: unknown[] = [];
     for (let attempt = 0; attempt < DELETE_RECONCILIATION_ATTEMPTS && remaining.length > 0; attempt += 1) {
@@ -440,7 +456,7 @@ export class EvidenceFileStore {
       });
       remaining = failedKeys;
     }
-    return errors;
+    return { failedKeys: remaining, errors };
   }
 
   getFile(key: string): Promise<unknown | null> {
