@@ -79,6 +79,50 @@ test("analysis remains disabled until the operator explicitly confirms the evide
   assert.equal(button(container, "분석 시작").disabled, false);
 });
 
+test("external search only starts after the explicit button", async () => {
+  const requests: Array<{ path: string; init?: RequestInit }> = [];
+  const api = async (path: string, init?: RequestInit) => {
+    requests.push({ path, init });
+    if (path.endsWith("/search")) return { search: { id: "search-1", bundleId: bundle.id, status: "queued" } };
+    throw new Error(`unexpected ${path}`);
+  };
+  const container = await render(<EvidenceWizard initialBundles={[bundle]} initialBundleId={bundle.id} request={api} />);
+  assert.deepEqual(requests, []);
+  await act(async () => button(container, "외부 검색").click());
+  await act(async () => button(container, "외부 출처 찾기").click());
+  assert.deepEqual(requests.map((item) => item.path), [`/api/admin/evidence/${bundle.id}/search`]);
+  assert.equal(requests[0]?.init?.method, "POST");
+});
+
+test("operator selects at most five and imports only the checked candidates", async () => {
+  const candidates = Array.from({ length: 8 }, (_, index) => ({
+    id: `candidate-${index + 1}`, title: `외부 출처 ${index + 1}`, publisher: "협회", publishedAt: "2026-01-02",
+    canonicalUrl: `https://example.com/${index + 1}`, documentType: "web_page", quote: "핵심 인용", relevance: "관련성", trustTier: 1,
+    rank: index + 1, status: "candidate", failureReason: null,
+  }));
+  const search = { run: { id: "search-1", bundleId: bundle.id, bundleVersion: bundle.version, status: "ready", errorMessage: null, isStale: false, startedAt: 1, completedAt: null, createdAt: 1, updatedAt: 1 }, candidates };
+  const container = await render(<EvidenceWizard initialBundles={[{ ...bundle, latestSearch: search }]} initialBundleId={bundle.id} request={async () => ({ search })} />);
+  await act(async () => button(container, "외부 검색").click());
+  for (const candidate of candidates.slice(0, 5)) {
+    const input = container.querySelector<HTMLInputElement>(`input[value="${candidate.id}"]`);
+    assert.ok(input); await act(async () => input.click());
+  }
+  assert.equal(button(container, "선택 출처 가져오기").disabled, false);
+  const sixth = container.querySelector<HTMLInputElement>('input[value="candidate-6"]');
+  assert.ok(sixth); await act(async () => sixth.click());
+  assert.match(container.textContent ?? "", /최대 5개/);
+});
+
+test("direct-only analysis remains available", async () => {
+  const container = await render(<EvidenceWizard initialBundles={[bundle]} initialBundleId={bundle.id} />);
+  await act(async () => button(container, "외부 검색").click());
+  await act(async () => button(container, "외부 출처 없이 분석 확인").click());
+  assert.match(container.textContent ?? "", /직접 등록 1개 · 외부 보충 0개 · 영상 관찰 0개/);
+  const confirmation = container.querySelector<HTMLInputElement>('input[name="analysis-confirmation"]');
+  assert.ok(confirmation); await act(async () => confirmation.click());
+  assert.equal(button(container, "분석 시작").disabled, false);
+});
+
 test("card review places cited source context beside action reasons and shows animation memory labels", async () => {
   const reviewBundle: EvidenceWizardBundle = {
     ...bundle,
@@ -104,7 +148,7 @@ test("a referenced source cannot be confirmed for deletion", async () => {
     throw new Error(`unexpected ${path}`);
   };
   const container = await render(<EvidenceWizard initialBundles={[bundle]} initialBundleId="bundle-1" request={api} />);
-  await act(async () => button(container, "근거 추가").click());
+  await act(async () => button(container, "직접 근거").click());
   await act(async () => button(container, "삭제").click());
   assert.match(container.textContent ?? "", /카드 1개/);
   assert.match(container.textContent ?? "", /시나리오 초안 1개/);

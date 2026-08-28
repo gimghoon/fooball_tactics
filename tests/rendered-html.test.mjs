@@ -79,3 +79,15 @@ test("renders the three-stage reviewed explanation controls in the client bundle
   assert.match(assets, /path-endpoint/);
   assert.match(assets, /playback-keyframe-seek/);
 });
+
+test("renders the five-step evidence search controls with accessible external links", async () => {
+  const assets = (await renderedClientAssets()).join("\n");
+
+  assert.match(assets, /외부 출처 찾기/);
+  assert.match(assets, /선택 출처 가져오기/);
+  assert.match(assets, /외부 출처 없이 분석 확인/);
+  assert.match(assets, /최대 5개/);
+  assert.match(assets, /noreferrer noopener/);
+  assert.match(assets, /candidate-list/);
+  assert.match(assets, /min-height:44px/);
+});
