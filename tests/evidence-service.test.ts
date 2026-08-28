@@ -332,6 +332,72 @@ test("production external registration persists every metadata field and dedupli
   assert.equal(context.database.first<{ count: number }>("SELECT count(*) AS count FROM evidence_sources").count, 1);
 });
 
+test("administrator bundle detail exposes external provenance and deletion keeps the compensated source workflow", async () => {
+  const context = createContext();
+  const bundle = await context.service.createBundle(bundleInput, admin);
+  const source = await context.fileStore.putValidatedFile({
+    bundleId: bundle.id,
+    name: "ignored.txt",
+    type: "text/plain",
+    bytes: new TextEncoder().encode("Verified external coaching guidance."),
+    externalMetadata: {
+      origin: "external_web",
+      canonicalUrl: "https://fifa.com/guidance/external",
+      publisher: "FIFA",
+      publishedAt: "2026-08-20",
+      retrievedAt: 1_777_000_000_000,
+      searchCandidateId: "candidate-detail",
+    },
+  });
+
+  const detail = await context.service.getBundleForAdmin(bundle.id, admin);
+  assert.ok(detail);
+  assert.deepEqual(detail.sources.map((item) => ({
+    id: item.id,
+    origin: item.origin,
+    canonicalUrl: item.canonicalUrl,
+    publisher: item.publisher,
+    publishedAt: item.publishedAt,
+    retrievedAt: item.retrievedAt,
+  })), [{
+    id: source.id,
+    origin: "external_web",
+    canonicalUrl: "https://fifa.com/guidance/external",
+    publisher: "FIFA",
+    publishedAt: "2026-08-20",
+    retrievedAt: 1_777_000_000_000,
+  }]);
+
+  await context.service.removeSource(source.id, admin);
+  assert.equal(await context.repository.findSource(source.id), null);
+  assert.equal(context.bucket.objects.size, 0);
+  assert.equal(context.database.first<{ count: number }>(
+    "SELECT count(*) AS count FROM evidence_audit_events WHERE action='source.removed' AND target_id=?",
+    source.id,
+  ).count, 1);
+});
+
+test("a direct evidence mutation stales a pending external search run", async () => {
+  const context = createContext();
+  const bundle = await context.service.createBundle(bundleInput, admin);
+  context.database.run(
+    `INSERT INTO evidence_search_runs
+      (id,bundle_id,input_version,bundle_version,status,search_model,prompt_version,query_json,is_stale,created_at,updated_at)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+    "pending-search", bundle.id, "search-input", bundle.version, "ready", "search-model", "search-prompt", "[]", 0, 1, 1,
+  );
+
+  await uploadText(context, bundle.id);
+
+  assert.deepEqual({ ...context.database.first(
+    "SELECT status,is_stale AS isStale,error_message AS errorMessage FROM evidence_search_runs WHERE id='pending-search'",
+  ) }, {
+    status: "ready",
+    isStale: 1,
+    errorMessage: "근거 묶음이 갱신되었습니다.",
+  });
+});
+
 test("production registration retains committed R2 objects when D1 commits and the transport then throws", async () => {
   const context = createContext();
   const bundle = await context.service.createBundle(bundleInput, admin);

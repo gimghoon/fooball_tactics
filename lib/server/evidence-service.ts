@@ -436,8 +436,27 @@ export class D1EvidenceServiceRepository implements EvidenceServiceRepository {
     const next = mutation.next;
     const oldState = [current.id, current.version, current.contentVersion];
     const statements: EvidenceD1Statement[] = [];
-    let dependentGuard = guard;
-    let dependentGuardValues: unknown[] = oldState;
+    const searchCandidateId = mutation.sourceToInsert?.origin === "external_web"
+      ? mutation.sourceToInsert.searchCandidateId ?? null
+      : null;
+    const searchCandidateAuthority = searchCandidateId === null
+      ? ""
+      : ` AND (
+        NOT EXISTS (SELECT 1 FROM evidence_search_candidates WHERE id=?)
+        OR EXISTS (
+          SELECT 1 FROM evidence_search_candidates AS candidate
+          JOIN evidence_search_runs AS run
+            ON run.id=candidate.run_id AND run.bundle_id=candidate.bundle_id
+          WHERE candidate.id=? AND candidate.bundle_id=?
+            AND candidate.status IN ('importing','imported')
+            AND run.status='importing' AND run.is_stale=0
+        )
+      )`;
+    const searchCandidateAuthorityValues = searchCandidateId === null
+      ? []
+      : [searchCandidateId, searchCandidateId, current.id];
+    let dependentGuard = `${guard}${searchCandidateAuthority}`;
+    let dependentGuardValues: unknown[] = [...oldState, ...searchCandidateAuthorityValues];
 
     if (mutation.sourceToDelete) {
       // D1 does not fail a batch when a required DELETE affects zero rows. This
@@ -479,7 +498,7 @@ export class D1EvidenceServiceRepository implements EvidenceServiceRepository {
         this.db
           .prepare(
             `INSERT INTO evidence_sources (id,bundle_id,origin,original_file_name,media_type,byte_size,content_hash,storage_key,canonical_url,publisher,published_at,retrieved_at,search_candidate_id,external_text_hash,extracted_text_key,extraction_status,extraction_error,created_at,updated_at)
-          SELECT ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,? WHERE ${guard}`,
+          SELECT ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,? WHERE ${dependentGuard}`,
           )
           .bind(
             source.id,
@@ -501,7 +520,7 @@ export class D1EvidenceServiceRepository implements EvidenceServiceRepository {
             source.extractionError,
             next.updatedAt,
             next.updatedAt,
-            ...oldState,
+            ...dependentGuardValues,
           ),
       );
     }
@@ -539,6 +558,25 @@ export class D1EvidenceServiceRepository implements EvidenceServiceRepository {
     statements.push(
       this.db
         .prepare(
+          `UPDATE evidence_search_runs
+          SET is_stale=1,error_message='근거 묶음이 갱신되었습니다.',updated_at=?
+          WHERE bundle_id=? AND bundle_version<>? AND is_stale=0
+            AND (? IS NULL OR id NOT IN (
+              SELECT run_id FROM evidence_search_candidates WHERE id=? AND bundle_id=?
+            ))
+            AND ${dependentGuard}`,
+        )
+        .bind(
+          next.updatedAt,
+          current.id,
+          next.version,
+          searchCandidateId,
+          searchCandidateId,
+          current.id,
+          ...dependentGuardValues,
+        ),
+      this.db
+        .prepare(
           `UPDATE evidence_analysis_jobs
           SET is_stale=1,
             status=CASE WHEN status IN ('queued','running','review_ready') THEN 'failed' ELSE status END,
@@ -567,6 +605,46 @@ export class D1EvidenceServiceRepository implements EvidenceServiceRepository {
           ...dependentGuardValues,
         ),
       this.audit(mutation.audit, dependentGuard, dependentGuardValues),
+      ...(searchCandidateId === null || mutation.sourceToInsert === undefined
+        ? []
+        : [
+            this.db
+              .prepare(
+                `UPDATE evidence_search_runs
+                SET bundle_version=?,updated_at=?
+                WHERE id=(SELECT run_id FROM evidence_search_candidates WHERE id=? AND bundle_id=?)
+                  AND bundle_id=? AND status='importing' AND is_stale=0 AND bundle_version=?
+                  AND ${dependentGuard}`,
+              )
+              .bind(
+                next.version,
+                next.updatedAt,
+                searchCandidateId,
+                current.id,
+                current.id,
+                current.version,
+                ...dependentGuardValues,
+              ),
+            this.db
+              .prepare(
+                `UPDATE evidence_search_candidates
+                SET status='imported',source_id=?,content_hash=?,failure_reason=NULL,updated_at=?
+                WHERE id=? AND bundle_id=? AND status='importing'
+                  AND EXISTS (SELECT 1 FROM evidence_sources WHERE id=? AND bundle_id=? AND content_hash=?)
+                  AND ${dependentGuard}`,
+              )
+              .bind(
+                mutation.sourceToInsert.id,
+                mutation.sourceToInsert.contentHash,
+                next.updatedAt,
+                searchCandidateId,
+                current.id,
+                mutation.sourceToInsert.id,
+                current.id,
+                mutation.sourceToInsert.contentHash,
+                ...dependentGuardValues,
+              ),
+          ]),
       // D1 batch statements execute sequentially. The CAS must remain last so
       // every dependent old-state guard is true on success and false on a miss.
       this.db
@@ -580,7 +658,7 @@ export class D1EvidenceServiceRepository implements EvidenceServiceRepository {
             WHERE id=? AND bundle_id=? AND source_id=?
           )`
               : ""
-          }`,
+          }${searchCandidateAuthority}`,
         )
         .bind(
           next.title,
@@ -592,6 +670,7 @@ export class D1EvidenceServiceRepository implements EvidenceServiceRepository {
           ...(mutation.sourceToDelete
             ? [mutation.audit.id, current.id, mutation.sourceToDelete]
             : []),
+          ...searchCandidateAuthorityValues,
         ),
     );
 
