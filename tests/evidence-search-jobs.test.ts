@@ -1090,6 +1090,40 @@ test("bundle mutation stales searches and an imported source stales prior analys
   );
 });
 
+test("title-only bundle edits stale old search selection and import without staling analysis", async () => {
+  const context = createContext([candidate(1)]);
+  seedBundle(context.db);
+  const detail = await runSearch(context);
+  await select(context, detail, [0]);
+  seedApprovedWork(context.db);
+  const before = context.db.first<{ version: number; contentVersion: string }>(
+    "SELECT version,content_version AS contentVersion FROM evidence_bundles WHERE id='bundle-1'",
+  );
+
+  await context.service.updateBundle("bundle-1", { title: "새 압박 탈출 제목" }, admin);
+
+  const after = context.db.first<{ version: number; contentVersion: string }>(
+    "SELECT version,content_version AS contentVersion FROM evidence_bundles WHERE id='bundle-1'",
+  );
+  assert.deepEqual({ ...after }, { version: before.version + 1, contentVersion: before.contentVersion });
+  assert.equal(context.db.first<{ isStale: number }>(
+    "SELECT is_stale AS isStale FROM evidence_search_runs WHERE id=?",
+    detail.run.id,
+  ).isStale, 1);
+  await assert.rejects(() => context.jobs.saveSelection("bundle-1", detail.run.id, {
+    expectedBundleVersion: after.version,
+    selectedIds: [detail.candidates[0]!.id],
+    excludedIds: [],
+  }, admin), /갱신|오래된/);
+  await assert.rejects(() => context.jobs.startImport("bundle-1", detail.run.id, admin), /갱신|오래된/);
+  assert.deepEqual({ ...context.db.first(
+    "SELECT status,is_stale AS isStale FROM evidence_analysis_jobs WHERE id='analysis-1'",
+  ) }, { status: "queued", isStale: 0 });
+  assert.deepEqual({ ...context.db.first(
+    "SELECT status,is_stale AS isStale FROM tactic_cards WHERE id='card-1'",
+  ) }, { status: "coach_reviewed", isStale: 0 });
+});
+
 test("selection CAS leaves candidate and audit state unchanged when the bundle wins the race", async () => {
   const context = createContext([candidate(1), candidate(2)]);
   seedBundle(context.db);

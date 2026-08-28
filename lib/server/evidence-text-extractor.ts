@@ -11,6 +11,9 @@ export const MAX_PDF_PAGES = 200;
 export const MAX_EXTRACTED_OUTPUT_BYTES = 5 * 1024 * 1024;
 export const MAX_EXTRACTION_MS = 10_000;
 const HTML_SECTION_BYTES = 32 * 1024;
+const HTML_TEXT_CHUNK_CODE_UNITS = 8 * 1024;
+const HTML_TOKENIZER_CHECKPOINT_CODE_UNITS = 4 * 1024;
+const HTML_STRIPPED_STACK_LIMIT = 256;
 const HTML_STRIPPED_CONTENT_ELEMENTS = new Set(["script", "style", "form", "iframe", "object", "svg"]);
 const HTML_STRIPPED_VOID_ELEMENTS = new Set(["embed"]);
 const HTML_BLOCK_ELEMENTS = new Set([
@@ -32,6 +35,8 @@ export type EvidenceExtractionOptions = {
 export type HtmlEvidenceExtractionOptions = {
   maxPages?: number;
   maxOutputBytes?: number;
+  /** Checks the caller-owned shared deadline/abort state during synchronous tokenization. */
+  assertActive?: () => void;
 };
 
 export type EvidencePdfTextContent = { items: Array<{ str?: string }> };
@@ -158,9 +163,10 @@ function strictText(bytes: Uint8Array): string {
   }
 }
 
-function htmlTagEnd(html: string, start: number): number {
+function htmlTagEnd(html: string, start: number, checkpoint: (index: number) => void): number {
   let quote = "";
   for (let index = start + 1; index < html.length; index += 1) {
+    checkpoint(index);
     const character = html[index]!;
     if (quote !== "") {
       if (character === quote) quote = "";
@@ -172,69 +178,225 @@ function htmlTagEnd(html: string, start: number): number {
   return -1;
 }
 
-function decodeHtmlEntity(entity: string): string {
-  const named: Record<string, string> = {
-    amp: "&", apos: "'", copy: "©", emsp: " ", ensp: " ", gt: ">", hellip: "…", lt: "<",
-    mdash: "—", nbsp: " ", ndash: "–", quot: "\"", reg: "®",
-  };
-  if (entity[0] !== "#") return named[entity.toLowerCase()] ?? `&${entity};`;
-  const hexadecimal = entity[1]?.toLowerCase() === "x";
-  const digits = entity.slice(hexadecimal ? 2 : 1);
-  if (!(hexadecimal ? /^[0-9a-f]+$/i : /^\d+$/).test(digits)) return `&${entity};`;
-  const codePoint = Number.parseInt(digits, hexadecimal ? 16 : 10);
-  if (codePoint <= 0 || codePoint > 0x10ffff || (codePoint >= 0xd800 && codePoint <= 0xdfff)) return "�";
-  return String.fromCodePoint(codePoint);
+const HTML_NAMED_ENTITIES: Readonly<Record<string, string>> = {
+  amp: "&", apos: "'", copy: "©", emsp: " ", ensp: " ", gt: ">", hellip: "…", lt: "<",
+  mdash: "—", nbsp: " ", ndash: "–", quot: "\"", reg: "®",
+};
+
+function isAsciiLetter(character: string): boolean {
+  const code = character.charCodeAt(0);
+  return (code >= 65 && code <= 90) || (code >= 97 && code <= 122);
+}
+
+function isAsciiAlphaNumeric(character: string): boolean {
+  const code = character.charCodeAt(0);
+  return isAsciiLetter(character) || (code >= 48 && code <= 57);
+}
+
+function isHtmlWhitespace(character: string): boolean {
+  const code = character.charCodeAt(0);
+  return (code >= 0x09 && code <= 0x0d)
+    || code === 0x20
+    || code === 0x00a0
+    || code === 0x1680
+    || (code >= 0x2000 && code <= 0x200a)
+    || code === 0x2028
+    || code === 0x2029
+    || code === 0x202f
+    || code === 0x205f
+    || code === 0x3000
+    || code === 0xfeff;
+}
+
+function utf8CharacterBytes(character: string): number {
+  const codePoint = character.codePointAt(0)!;
+  if (codePoint <= 0x7f) return 1;
+  if (codePoint <= 0x7ff) return 2;
+  if (codePoint <= 0xffff) return 3;
+  return 4;
+}
+
+type HtmlEntity = {
+  end: number;
+  decoded: string | null;
+};
+
+function htmlEntityAt(html: string, start: number, checkpoint: (index: number) => void): HtmlEntity | null {
+  let index = start + 1;
+  if (html[index] === "#") {
+    index += 1;
+    const hexadecimal = html[index]?.toLowerCase() === "x";
+    if (hexadecimal) index += 1;
+    const digitsStart = index;
+    let codePoint = 0;
+    let overflowed = false;
+    while (index < html.length) {
+      checkpoint(index);
+      const code = html.charCodeAt(index);
+      const digit = code >= 48 && code <= 57
+        ? code - 48
+        : hexadecimal && code >= 65 && code <= 70
+          ? code - 55
+          : hexadecimal && code >= 97 && code <= 102
+            ? code - 87
+            : -1;
+      if (digit < 0) break;
+      if (!overflowed) {
+        codePoint = codePoint * (hexadecimal ? 16 : 10) + digit;
+        overflowed = codePoint > 0x10ffff;
+      }
+      index += 1;
+    }
+    if (index === digitsStart || html[index] !== ";") return null;
+    const valid = !overflowed
+      && codePoint > 0
+      && !(codePoint >= 0xd800 && codePoint <= 0xdfff);
+    return { end: index, decoded: valid ? String.fromCodePoint(codePoint) : "�" };
+  }
+  if (!isAsciiLetter(html[index] ?? "")) return null;
+  let name = "";
+  while (index < html.length && isAsciiAlphaNumeric(html[index]!)) {
+    checkpoint(index);
+    if (name.length <= 16) name += html[index]!.toLowerCase();
+    index += 1;
+  }
+  if (html[index] !== ";") return null;
+  return { end: index, decoded: HTML_NAMED_ENTITIES[name] ?? null };
 }
 
 /** Converts untrusted HTML to plain text without creating a DOM or retaining active content. */
-function inertHtmlText(html: string): string {
-  const output: string[] = [];
+function inertHtmlText(
+  html: string,
+  maxOutputBytes: number,
+  assertActive: (() => void) | undefined,
+): { text: string; outputBytes: number } {
+  const outputChunks: string[] = [];
+  let outputChunk = "";
+  let outputBytes = 0;
+  let pendingWhitespace = false;
   const strippedStack: string[] = [];
+  let nextCheckpoint = 0;
+  const checkpoint = (index: number) => {
+    if (index < nextCheckpoint) return;
+    assertActive?.();
+    nextCheckpoint = index + HTML_TOKENIZER_CHECKPOINT_CODE_UNITS;
+  };
+  const retain = (value: string, bytes: number) => {
+    outputChunk += value;
+    outputBytes += bytes;
+    if (outputChunk.length >= HTML_TEXT_CHUNK_CODE_UNITS) {
+      outputChunks.push(outputChunk);
+      outputChunk = "";
+    }
+  };
+  const append = (value: string) => {
+    for (let index = 0; index < value.length;) {
+      const codePoint = value.codePointAt(index)!;
+      const character = String.fromCodePoint(codePoint);
+      index += character.length;
+      if (isHtmlWhitespace(character)) {
+        if (outputBytes > 0) pendingWhitespace = true;
+        continue;
+      }
+      const characterBytes = utf8CharacterBytes(character);
+      const nextBytes = characterBytes + (pendingWhitespace ? 1 : 0);
+      if (outputBytes + nextBytes > maxOutputBytes) {
+        throw new Error("추출 텍스트 크기 제한을 초과했습니다.");
+      }
+      if (pendingWhitespace) retain(" ", 1);
+      pendingWhitespace = false;
+      retain(character, characterBytes);
+    }
+  };
+  const appendRange = (start: number, end: number) => {
+    for (let index = start; index < end;) {
+      checkpoint(index);
+      const codePoint = html.codePointAt(index)!;
+      const character = String.fromCodePoint(codePoint);
+      append(character);
+      index += character.length;
+    }
+  };
+
+  checkpoint(0);
   let cursor = 0;
   while (cursor < html.length) {
+    checkpoint(cursor);
     if (html[cursor] !== "<") {
-      const nextTag = html.indexOf("<", cursor);
-      const end = nextTag === -1 ? html.length : nextTag;
-      if (strippedStack.length === 0) output.push(html.slice(cursor, end));
-      cursor = end;
+      if (strippedStack.length > 0) {
+        cursor += html.codePointAt(cursor)! > 0xffff ? 2 : 1;
+        continue;
+      }
+      if (html[cursor] === "&") {
+        const entity = htmlEntityAt(html, cursor, checkpoint);
+        if (entity !== null) {
+          if (entity.decoded === null) appendRange(cursor, entity.end + 1);
+          else append(entity.decoded);
+          cursor = entity.end + 1;
+          continue;
+        }
+      }
+      const codePoint = html.codePointAt(cursor)!;
+      const character = String.fromCodePoint(codePoint);
+      append(character);
+      cursor += character.length;
       continue;
     }
     if (html.startsWith("<!--", cursor)) {
-      const commentEnd = html.indexOf("-->", cursor + 4);
-      cursor = commentEnd === -1 ? html.length : commentEnd + 3;
+      let commentCursor = cursor + 4;
+      let closed = false;
+      while (commentCursor < html.length) {
+        checkpoint(commentCursor);
+        if (html.startsWith("-->", commentCursor)) {
+          cursor = commentCursor + 3;
+          closed = true;
+          break;
+        }
+        commentCursor += 1;
+      }
+      if (!closed) cursor = html.length;
       continue;
     }
-    const end = htmlTagEnd(html, cursor);
+    const end = htmlTagEnd(html, cursor, checkpoint);
     if (end === -1) break;
-    const token = html.slice(cursor + 1, end);
-    const match = /^\s*(\/?)\s*([a-z][a-z0-9:-]*)/i.exec(token);
-    if (!match) {
-      if (strippedStack.length === 0) output.push("<");
+    let tokenCursor = cursor + 1;
+    while (tokenCursor < end && isHtmlWhitespace(html[tokenCursor]!)) tokenCursor += 1;
+    const closing = html[tokenCursor] === "/";
+    if (closing) tokenCursor += 1;
+    while (tokenCursor < end && isHtmlWhitespace(html[tokenCursor]!)) tokenCursor += 1;
+    if (!isAsciiLetter(html[tokenCursor] ?? "")) {
+      if (strippedStack.length === 0) append("<");
       cursor += 1;
       continue;
     }
-    const closing = match[1] === "/";
-    const name = match[2]!.toLowerCase();
+    let name = "";
+    while (tokenCursor < end) {
+      const character = html[tokenCursor]!;
+      if (!isAsciiAlphaNumeric(character) && character !== ":" && character !== "-") break;
+      if (name.length <= 16) name += character.toLowerCase();
+      tokenCursor += 1;
+    }
     if (HTML_STRIPPED_CONTENT_ELEMENTS.has(name)) {
       if (closing) {
         if (strippedStack.at(-1) === name) strippedStack.pop();
       } else {
         // HTML ignores self-closing syntax on these content-bearing elements.
         // Keep stripping until the matching end tag instead of trusting `/ >`.
+        if (strippedStack.length >= HTML_STRIPPED_STACK_LIMIT) {
+          throw new Error("웹 문서 HTML 중첩 제한을 초과했습니다.");
+        }
         strippedStack.push(name);
       }
     } else if (HTML_STRIPPED_VOID_ELEMENTS.has(name)) {
       // Void elements have no content in HTML. Remove only the tag; a `/` does
       // not change that parsing rule and following text remains document text.
     } else if (strippedStack.length === 0 && HTML_BLOCK_ELEMENTS.has(name)) {
-      output.push("\n");
+      append("\n");
     }
     cursor = end + 1;
   }
-  return output.join("")
-    .replace(/&(#(?:x[0-9a-f]+|\d+)|[a-z][a-z0-9]+);/gi, (_match, entity: string) => decodeHtmlEntity(entity))
-    .replace(/[\s\u00a0]+/gu, " ")
-    .trim();
+  if (outputChunk !== "") outputChunks.push(outputChunk);
+  return { text: outputChunks.join(""), outputBytes };
 }
 
 /** Extracts bounded section locators from an inert, whitespace-normalized HTML snapshot. */
@@ -244,16 +406,21 @@ export function extractHtmlTextSections(
 ): { text: string; pages: ExtractedPage[] } {
   const maxPages = Math.min(options.maxPages ?? 64, 64);
   const maxOutputBytes = Math.min(options.maxOutputBytes ?? 2 * 1024 * 1024, 2 * 1024 * 1024);
-  const text = inertHtmlText(html);
-  const encoder = new TextEncoder();
-  if (encoder.encode(text).byteLength > maxOutputBytes) throw new Error("추출 텍스트 크기 제한을 초과했습니다.");
+  const { text } = inertHtmlText(html, maxOutputBytes, options.assertActive);
   if (text === "") return { text, pages: [] };
 
   const sections: string[] = [];
   let section = "";
   let sectionBytes = 0;
+  let processedCodeUnits = 0;
+  let nextSectionCheckpoint = 0;
   for (const character of text) {
-    const characterBytes = encoder.encode(character).byteLength;
+    if (processedCodeUnits >= nextSectionCheckpoint) {
+      options.assertActive?.();
+      nextSectionCheckpoint = processedCodeUnits + HTML_TOKENIZER_CHECKPOINT_CODE_UNITS;
+    }
+    processedCodeUnits += character.length;
+    const characterBytes = utf8CharacterBytes(character);
     if (sectionBytes + characterBytes > HTML_SECTION_BYTES && section !== "") {
       sections.push(section.trim());
       section = "";

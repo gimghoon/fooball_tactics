@@ -335,6 +335,7 @@ export async function fetchExternalEvidence(
         const extracted = extractHtmlTextSections(html, {
           maxPages: 64,
           maxOutputBytes: EXTERNAL_FETCH_LIMITS.extractedTextBytes,
+          assertActive: () => { guard.remaining(); },
         });
         const snapshot = new TextEncoder().encode(extracted.text);
         guard.remaining();

@@ -4,7 +4,12 @@ import test from "node:test";
 import { EvidenceValidationError } from "../lib/domain/evidence.ts";
 import { serializePublicTrainingScenario } from "../lib/domain/content.ts";
 import type { EvidenceAdmin } from "../lib/server/evidence-auth.ts";
-import { EvidenceConflictError } from "../lib/server/evidence-service.ts";
+import {
+  EvidenceConflictError,
+  EvidenceService,
+  type EvidenceBundleRecord,
+  type EvidenceServiceRepository,
+} from "../lib/server/evidence-service.ts";
 import {
   EvidenceFileStore,
   type StoredEvidenceFile,
@@ -496,6 +501,85 @@ test("list, create, get, and update expose safe bundle projections", async () =>
     runtime(),
   );
   assert.equal(updated.status, 200);
+});
+
+test("title-only route edits stale old-run selection and import with 409 while preserving content version", async () => {
+  let current: EvidenceBundleRecord = { ...bundle };
+  const oldSearchVersion = current.version;
+  const repository: EvidenceServiceRepository = {
+    campaignExists: async () => true,
+    getBundle: async (id) => id === current.id ? current : null,
+    listBundles: async () => [current],
+    listSources: async () => [],
+    findSource: async () => null,
+    listVideoClips: async () => [],
+    findSourceByHash: async () => null,
+    createR2CleanupReceipt: async () => undefined,
+    finishR2CleanupReceipt: async () => undefined,
+    describeDeleteImpact: async (sourceId) => ({ sourceId, cardIds: [], scenarioDraftIds: [] }),
+    createBundle: async () => undefined,
+    applyMutation: async (mutation) => {
+      if (mutation.current.version !== current.version || mutation.current.contentVersion !== current.contentVersion) return false;
+      current = mutation.next;
+      return true;
+    },
+    listCardsForJob: async () => [],
+    countCardsForJob: async () => 0,
+    findCard: async () => null,
+    listCardCitations: async () => [],
+    countCardCitations: async () => 0,
+    listCardCitationsForAdmin: async () => [],
+    findCardReview: async () => null,
+    applyCardReview: async () => false,
+    findScenarioDraftByReview: async () => null,
+    createScenarioDraft: async () => "conflict",
+  };
+  const service = new EvidenceService({
+    repository,
+    settings: { analyzerModel: "model", promptVersion: "prompt", schemaVersion: "schema" },
+    now: () => current.updatedAt + 1,
+    newId: () => "audit-title-update",
+  });
+  const titleRuntime = runtime({
+    service,
+    searchJobs: {
+      ...runtime().searchJobs,
+      saveSelection: async () => {
+        if (current.version !== oldSearchVersion) throw new EvidenceConflictError();
+        return searchDetail();
+      },
+      startImport: async () => {
+        if (current.version !== oldSearchVersion) throw new EvidenceConflictError();
+        return searchRunRecord("importing");
+      },
+    },
+  });
+
+  const updated = await handleEvidenceBundleUpdate(
+    jsonRequest("/", { title: "새 라우트 제목" }, "PATCH"),
+    context({ bundleId: bundle.id }),
+    titleRuntime,
+  );
+  assert.equal(updated.status, 200);
+  const updatedBundle = (await body(updated)).bundle as { version: number; contentVersion: string };
+  assert.equal(updatedBundle.version, oldSearchVersion + 1);
+  assert.equal(updatedBundle.contentVersion, bundle.contentVersion);
+
+  const selection = await handleEvidenceSearchSelection(
+    jsonRequest("/", {
+      expectedBundleVersion: oldSearchVersion + 1,
+      selectedIds: ["candidate-1"],
+      excludedIds: [],
+    }, "PATCH"),
+    context({ bundleId: bundle.id, runId: "search-1" }),
+    titleRuntime,
+  );
+  const imported = await handleEvidenceSearchImport(
+    context({ bundleId: bundle.id, runId: "search-1" }),
+    titleRuntime,
+  );
+  assert.equal(selection.status, 409);
+  assert.equal(imported.status, 409);
 });
 
 test("source projections redact arbitrary extraction provider errors", async () => {

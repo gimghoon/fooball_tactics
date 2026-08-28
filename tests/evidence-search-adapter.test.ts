@@ -29,11 +29,23 @@ function candidate(index: number, overrides: Record<string, unknown> = {}): Reco
   };
 }
 
-function validSearchEnvelope(count: number) {
+function source(index: number, overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    type: "url",
+    url: `https://learning.uefa.com/guidance/${index}#provider-source`,
+    ...overrides,
+  };
+}
+
+function validSearchEnvelope(
+  count: number,
+  sources: unknown[] = Array.from({ length: count }, (_, index) => source(index + 1)),
+  actionType = "search",
+) {
   return {
     status: "completed",
     output: [
-      { type: "web_search_call", status: "completed", action: { sources: [] } },
+      { type: "web_search_call", status: "completed", action: { type: actionType, sources } },
       {
         type: "message",
         status: "completed",
@@ -99,6 +111,57 @@ test("search request enables web_search and returns at most eight allowed candid
   assert.deepEqual(result.queries, ["다이아몬드 중앙 차단 탈출 UEFA coaching"]);
 });
 
+test("rejects model candidates when the completed web search returned no sources", async () => {
+  const provider = createProviderWithFetch(recordingResponsesFetch(validSearchEnvelope(1, [])));
+
+  const result = await provider.search(searchInput(), AbortSignal.timeout(1_000));
+
+  assert.deepEqual(result.candidates, []);
+});
+
+test("rejects malformed or unsafe web-search source records without exposing their values", async () => {
+  const provider = createProviderWithFetch(recordingResponsesFetch(validSearchEnvelope(1, [
+    null,
+    { type: "url" },
+    { type: "other", url: "https://learning.uefa.com/guidance/1" },
+    { type: "url", url: "http://learning.uefa.com/guidance/1" },
+    { type: "url", url: "https://user:sk-test@learning.uefa.com/guidance/1" },
+    { type: "url", url: `https://learning.uefa.com/${"x".repeat(5_000)}` },
+  ])));
+
+  const result = await provider.search(searchInput(), AbortSignal.timeout(1_000));
+
+  assert.deepEqual(result.candidates, []);
+
+  const wrongActionProvider = createProviderWithFetch(recordingResponsesFetch(
+    validSearchEnvelope(1, [source(1)], "open_page"),
+  ));
+  const wrongActionResult = await wrongActionProvider.search(searchInput(), AbortSignal.timeout(1_000));
+  assert.deepEqual(wrongActionResult.candidates, []);
+});
+
+test("rejects a model candidate whose canonical URL does not match a returned source", async () => {
+  const provider = createProviderWithFetch(recordingResponsesFetch(validSearchEnvelope(1, [source(99)])));
+
+  const result = await provider.search(searchInput(), AbortSignal.timeout(1_000));
+
+  assert.deepEqual(result.candidates, []);
+});
+
+test("uses the normalized matching web-search source URL as candidate authority", async () => {
+  const provider = createProviderWithFetch(recordingResponsesFetch(validSearchEnvelope(1, [{
+    type: "url",
+    url: "https://LEARNING.UEFA.com/guidance/1#provider-source",
+  }])));
+
+  const result = await provider.search(searchInput(), AbortSignal.timeout(1_000));
+
+  assert.equal(result.candidates.length, 1);
+  assert.equal(result.candidates[0]!.url, "https://learning.uefa.com/guidance/1");
+  assert.equal(result.candidates[0]!.canonicalUrl, "https://learning.uefa.com/guidance/1");
+  assert.equal(result.candidates[0]!.proposedTrustTier, 1);
+});
+
 test("request sends only the bounded direct-evidence summary and no API secret", async () => {
   const provider = createProviderWithFetch(recordingResponsesFetch(validSearchEnvelope(1)));
   const summary = `bounded-summary-${"x".repeat(4_000)}`;
@@ -137,4 +200,5 @@ test("transport diagnostics redact keys from every emitted field", async () => {
   await assert.rejects(() => provider.search(searchInput(), AbortSignal.timeout(1_000)));
   assert.ok(diagnostic);
   assert.equal(JSON.stringify(diagnostic).includes(apiKey), false);
+  assert.ok(Object.values(diagnostic).every((value) => typeof value !== "string" || value.length <= 240));
 });

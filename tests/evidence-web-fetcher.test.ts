@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { createEvidenceSourcePolicy } from "../lib/server/evidence-source-policy.ts";
+import { extractHtmlTextSections } from "../lib/server/evidence-text-extractor.ts";
 import {
   EXTERNAL_FETCH_LIMITS,
   fetchExternalEvidence,
@@ -155,6 +156,33 @@ test("extracts an inert bounded HTML snapshot and verifies normalized quotes", a
     { url: "https://fifa.com/guidance/width.html", expectedType: "web_page", quote: "not in the document" },
     dependencies(responseFetch(htmlResponse(html))),
   ), /인용/);
+});
+
+test("rejects high-token HTML at the encoded budget before a later tokenizer deadline", () => {
+  let checkpoints = 0;
+  const html = "<i>가</i>".repeat(100_000);
+
+  assert.throws(() => extractHtmlTextSections(html, {
+    maxOutputBytes: 64,
+    assertActive() {
+      checkpoints += 1;
+      if (checkpoints > 1) throw new Error("tokenizer deadline reached");
+    },
+  }), /크기 제한/);
+  assert.equal(checkpoints, 1, "the output budget must reject before scanning later tokens");
+});
+
+test("checks the shared deadline while tokenizing high-token HTML with little visible text", () => {
+  let checkpoints = 0;
+  const html = "<i></i>".repeat(100_000);
+
+  assert.throws(() => extractHtmlTextSections(html, {
+    assertActive() {
+      checkpoints += 1;
+      if (checkpoints === 3) throw new Error("tokenizer deadline reached");
+    },
+  }), /tokenizer deadline reached/);
+  assert.equal(checkpoints, 3);
 });
 
 test("strips forged content after self-closing syntax for every content-bearing stripped HTML element", async () => {

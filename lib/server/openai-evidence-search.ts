@@ -1,4 +1,5 @@
 import {
+  normalizeExternalUrl,
   parseSearchCandidateDraft,
   type SearchCandidateDraft,
 } from "../domain/evidence-search.ts";
@@ -11,6 +12,9 @@ const REQUEST_TIMEOUT_MS = 30_000;
 const MAX_RESPONSE_BYTES = 1_000_000;
 const MAX_DIRECT_EVIDENCE_SUMMARY_LENGTH = 2_000;
 const MAX_CANDIDATES = 8;
+const MAX_WEB_SEARCH_CALLS = 16;
+const MAX_WEB_SEARCH_SOURCE_RECORDS = 64;
+const MAX_WEB_SEARCH_SOURCE_URL_BYTES = 4 * 1024;
 
 type AbortCause = "none" | "timeout" | "caller";
 
@@ -61,6 +65,17 @@ type AdapterConfig = {
   fetch: typeof globalThis.fetch;
   requestTimeoutMs: number;
   onTransportError?: (diagnostic: EvidenceSearchTransportDiagnostic) => void;
+};
+
+type WebSearchSource = {
+  type: "url";
+  url: string;
+  canonicalUrl: string;
+};
+
+type ParsedResponseOutput = {
+  text: string;
+  sources: WebSearchSource[];
 };
 
 const SEARCH_SCHEMA = {
@@ -180,15 +195,15 @@ class OpenAiEvidenceSearch implements EvidenceSearchProvider {
     input: { title: string; purpose: string; directEvidenceSummary: string },
     signal: AbortSignal,
   ): Promise<{ queries: string[]; candidates: SearchCandidateDraft[] }> {
-    const text = await this.request({
+    const output = await this.request({
       title: boundedText(input.title, 200),
       purpose: boundedText(input.purpose, 600),
       directEvidenceSummary: boundedText(input.directEvidenceSummary, MAX_DIRECT_EVIDENCE_SUMMARY_LENGTH),
     }, signal);
-    return parseSearchOutput(text, this.config.policy);
+    return parseSearchOutput(output.text, output.sources, this.config.policy);
   }
 
-  private async request(input: Record<string, string>, signal: AbortSignal): Promise<string> {
+  private async request(input: Record<string, string>, signal: AbortSignal): Promise<ParsedResponseOutput> {
     const controller = new AbortController();
     let abortCause: AbortCause = signal.aborted ? "caller" : "none";
     const abort = (cause: Exclude<AbortCause, "none">) => {
@@ -301,7 +316,11 @@ async function readBoundedResponse(response: Response, limit: number): Promise<U
   return all;
 }
 
-function parseSearchOutput(text: string, policy: EvidenceSourcePolicy): { queries: string[]; candidates: SearchCandidateDraft[] } {
+function parseSearchOutput(
+  text: string,
+  sources: WebSearchSource[],
+  policy: EvidenceSourcePolicy,
+): { queries: string[]; candidates: SearchCandidateDraft[] } {
   let parsedOutput: unknown;
   try {
     parsedOutput = JSON.parse(text) as unknown;
@@ -315,11 +334,19 @@ function parseSearchOutput(text: string, policy: EvidenceSourcePolicy): { querie
     .map((query) => query.trim())
     .slice(0, MAX_CANDIDATES);
   const canonicalUrls = new Set<string>();
+  const sourcesByCanonicalUrl = new Map(sources.map((source) => [source.canonicalUrl, source]));
   const candidates: SearchCandidateDraft[] = [];
   for (const candidateValue of parsedOutput.candidates) {
     if (candidates.length === MAX_CANDIDATES) break;
     try {
-      const candidate = parseSearchCandidateDraft(candidateValue);
+      const proposedCandidate = parseSearchCandidateDraft(candidateValue);
+      const matchedSource = sourcesByCanonicalUrl.get(proposedCandidate.canonicalUrl);
+      if (matchedSource === undefined) continue;
+      const candidate = {
+        ...proposedCandidate,
+        url: matchedSource.url,
+        canonicalUrl: matchedSource.canonicalUrl,
+      };
       const trustTier = policy.classify(new URL(candidate.canonicalUrl));
       if (trustTier === null || canonicalUrls.has(candidate.canonicalUrl)) continue;
       canonicalUrls.add(candidate.canonicalUrl);
@@ -331,19 +358,52 @@ function parseSearchOutput(text: string, policy: EvidenceSourcePolicy): { querie
   return { queries, candidates };
 }
 
-function extractOutputText(value: unknown): string {
+function normalizedWebSearchSource(value: unknown): WebSearchSource | null {
+  if (!isRecord(value) || value.type !== "url" || typeof value.url !== "string") return null;
+  if (value.url.length > MAX_WEB_SEARCH_SOURCE_URL_BYTES) return null;
+  try {
+    if (new TextEncoder().encode(value.url).byteLength > MAX_WEB_SEARCH_SOURCE_URL_BYTES) return null;
+    const canonicalUrl = normalizeExternalUrl(value.url);
+    if (new TextEncoder().encode(canonicalUrl).byteLength > MAX_WEB_SEARCH_SOURCE_URL_BYTES) return null;
+    return { type: "url", url: canonicalUrl, canonicalUrl };
+  } catch {
+    return null;
+  }
+}
+
+function extractOutputText(value: unknown): ParsedResponseOutput {
   if (!isRecord(value) || value.status !== "completed") {
     throw new EvidenceSearchError("검색 제공자 응답이 완료되지 않았습니다.", true);
   }
   if (!Array.isArray(value.output)) throw new EvidenceSearchError("검색 제공자 응답에 출력이 없습니다.", true);
   let messageCount = 0;
+  let webSearchCalls = 0;
+  let sourceRecords = 0;
   const texts: string[] = [];
+  const sources: WebSearchSource[] = [];
+  const canonicalSourceUrls = new Set<string>();
   for (const item of value.output) {
     if (!isRecord(item)) throw new EvidenceSearchError("검색 제공자 응답 항목이 올바르지 않습니다.", true);
     if (item.status === "incomplete") throw new EvidenceSearchError("검색 제공자 응답이 완료되지 않았습니다.", true);
     if (item.type === "reasoning" || item.type === "web_search_call") {
       if (item.status !== undefined && item.status !== "completed") {
         throw new EvidenceSearchError("검색 제공자 응답이 완료되지 않았습니다.", true);
+      }
+      if (item.type === "web_search_call") {
+        webSearchCalls += 1;
+        if (webSearchCalls > MAX_WEB_SEARCH_CALLS) {
+          throw new EvidenceSearchError("검색 제공자 응답이 너무 큽니다.", true);
+        }
+        const action = isRecord(item.action) ? item.action : null;
+        const actionSources = action?.type === "search" && Array.isArray(action.sources) ? action.sources : [];
+        const remaining = MAX_WEB_SEARCH_SOURCE_RECORDS - sourceRecords;
+        for (let index = 0; index < Math.min(actionSources.length, remaining); index += 1) {
+          sourceRecords += 1;
+          const source = normalizedWebSearchSource(actionSources[index]);
+          if (source === null || canonicalSourceUrls.has(source.canonicalUrl)) continue;
+          canonicalSourceUrls.add(source.canonicalUrl);
+          sources.push(source);
+        }
       }
       continue;
     }
@@ -363,7 +423,7 @@ function extractOutputText(value: unknown): string {
   if (messageCount !== 1 || texts.length !== 1) {
     throw new EvidenceSearchError("검색 제공자 응답에 구조화된 출력이 없습니다.", true);
   }
-  return texts[0];
+  return { text: texts[0]!, sources };
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

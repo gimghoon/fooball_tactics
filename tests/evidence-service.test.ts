@@ -272,6 +272,32 @@ test("production source upload atomically inserts, versions, invalidates approve
   );
 });
 
+test("title-only bundle edits advance search CAS without staling analysis content", async () => {
+  const context = createContext();
+  const bundle = await context.service.createBundle(bundleInput, admin);
+  seedApprovedWork(context.database, bundle);
+  context.database.run(
+    `INSERT INTO evidence_search_runs
+      (id,bundle_id,input_version,bundle_version,status,search_model,prompt_version,query_json,is_stale,created_at,updated_at)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+    "title-search", bundle.id, "title-input", bundle.version, "ready", "search-model", "search-prompt", "[]", 0, 1, 1,
+  );
+
+  const updated = await context.service.updateBundle(bundle.id, { title: "새 훈련 제목" }, admin);
+
+  assert.equal(updated.version, bundle.version + 1);
+  assert.equal(updated.contentVersion, bundle.contentVersion);
+  assert.deepEqual({ ...context.database.first(
+    "SELECT bundle_version AS bundleVersion,is_stale AS isStale FROM evidence_search_runs WHERE id='title-search'",
+  ) }, { bundleVersion: bundle.version, isStale: 1 });
+  assert.deepEqual({ ...context.database.first(
+    "SELECT status,is_stale AS isStale FROM evidence_analysis_jobs WHERE id='job-1'",
+  ) }, { status: "queued", isStale: 0 });
+  assert.deepEqual({ ...context.database.first(
+    "SELECT status,is_stale AS isStale FROM tactic_cards WHERE id='card-1'",
+  ) }, { status: "coach_reviewed", isStale: 0 });
+});
+
 test("production external registration persists every metadata field and deduplicates by URL or hash", async () => {
   const context = createContext();
   const bundle = await context.service.createBundle(bundleInput, admin);

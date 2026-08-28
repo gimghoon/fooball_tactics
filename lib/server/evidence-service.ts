@@ -1078,12 +1078,13 @@ export class EvidenceService {
         title: u.title ?? c.title,
         purpose: u.purpose ?? c.purpose,
       }),
-      changed = x.purpose !== c.purpose,
+      purposeChanged = x.purpose !== c.purpose,
+      searchInputChanged = x.title !== c.title || purposeChanged,
       n = {
         ...c,
         ...x,
-        version: changed ? c.version + 1 : c.version,
-        contentVersion: changed
+        version: searchInputChanged ? c.version + 1 : c.version,
+        contentVersion: purposeChanged
           ? await this.hash(
               x.purpose,
               await this.d.repository.listSources(id),
@@ -1101,7 +1102,7 @@ export class EvidenceService {
         "bundle.updated",
         "bundle",
         id,
-        { contentChanged: changed },
+        { contentChanged: purposeChanged },
         n.updatedAt,
       ),
     });
