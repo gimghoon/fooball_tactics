@@ -104,7 +104,10 @@ test("renders the five-step evidence search controls with accessible external li
 test("keeps responsive Coach Desk candidate styling and 44px candidate actions", async () => {
   const css = (await renderedStyles()).join("\n");
 
-  assert.match(css, /\.candidate-list\{[^}]*grid-template-columns:1fr[^}]*display:grid/);
+  const candidateListRule = css.match(/\.candidate-list\{([^}]*)\}/)?.[1];
+  assert.ok(candidateListRule, "candidate list CSS rule is emitted");
+  assert.match(candidateListRule, /display:grid/);
+  assert.match(candidateListRule, /grid-template-columns:1fr/);
   assert.match(css, /@media ?\(min-width:768px\)\{\.candidate-list\{grid-template-columns:repeat\(2,minmax\(0,1fr\)\)\}\}/);
   assert.match(css, /\.candidate-card \.quote-toggle,\.candidate-card \.candidate-exclude,\.candidate-card \.candidate-retry\{[^}]*min-height:44px/);
   assert.match(css, /\.candidate-card a\{overflow-wrap:anywhere\}/);
