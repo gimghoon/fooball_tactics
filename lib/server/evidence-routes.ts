@@ -3,6 +3,7 @@ import { EvidenceSearchValidationError } from "../domain/evidence-search.ts";
 import { EvidenceAnalyzerError } from "./evidence-analyzer.ts";
 import type { EvidenceAdmin } from "./evidence-auth.ts";
 import {
+  EvidenceConflictError,
   EvidencePayloadTooLargeError,
   EvidencePublicError,
   EvidenceRequestValidationError,
@@ -201,6 +202,14 @@ function safeSearchRun(run: EvidenceSearchRunRecord) {
     completedAt: run.completedAt,
     createdAt: run.createdAt,
     updatedAt: run.updatedAt,
+  };
+}
+
+function safeSearchStart(run: EvidenceSearchRunRecord) {
+  return {
+    id: run.id,
+    bundleId: run.bundleId,
+    status: run.status,
   };
 }
 
@@ -685,8 +694,11 @@ export async function handleEvidenceSearchStart(
     const missing = await requireSearchBundle(bundleId, runtime);
     if (missing) return missing;
     const search = await runtime.searchJobs.startSearch(bundleId, runtime.admin);
-    const status = search.status === "queued" || search.status === "searching" ? 202 : 200;
-    return adminJson({ search: safeSearchRun(search) }, { status });
+    if (search.status !== "queued" && search.status !== "searching" && search.status !== "ready") {
+      throw new EvidenceConflictError();
+    }
+    const status = search.status === "ready" ? 200 : 202;
+    return adminJson({ search: safeSearchStart(search) }, { status });
   } catch (error) {
     return routeFailure(error);
   }
@@ -756,11 +768,9 @@ export async function handleEvidenceSearchImport(
     const { bundleId, runId } = await context.params;
     const missing = await requireSearchBundle(bundleId, runtime);
     if (missing) return missing;
-    await runtime.searchJobs.startImport(bundleId, runId, runtime.admin);
-    const search = await runtime.searchJobs.getSearch(bundleId, runId);
-    if (search === null)
-      return jsonError("외부 출처 검색 작업을 찾을 수 없습니다.", 404);
-    return adminJson({ search: safeSearchDetail(search) }, { status: 202 });
+    const search = await runtime.searchJobs.startImport(bundleId, runId, runtime.admin);
+    if (search.status !== "importing") throw new EvidenceConflictError();
+    return adminJson({ search: safeSearchStart(search) }, { status: 202 });
   } catch (error) {
     return routeFailure(error);
   }

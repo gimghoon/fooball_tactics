@@ -336,6 +336,7 @@ test("search is explicit, deduplicated by input version, and stores at most eigh
 
   assert.equal(context.db.first<{ count: number }>("SELECT count(*) AS count FROM evidence_search_runs").count, 0);
   const first = await context.jobs.startSearch("bundle-1", admin);
+  assert.equal(first.status, "queued", "accepted search must return its queued starter snapshot");
   const second = await context.jobs.startSearch("bundle-1", admin);
   assert.equal(first.id, second.id);
   assert.equal(context.scheduled.length, 1);
@@ -544,7 +545,8 @@ test("selection uses bundle CAS and never fetches or stores an unselected candid
     ],
   );
   const before = context.scheduled.length;
-  await context.jobs.startImport("bundle-1", detail.run.id, admin);
+  const started = await context.jobs.startImport("bundle-1", detail.run.id, admin);
+  assert.equal(started.status, "importing", "accepted import must return its importing starter snapshot");
   await Promise.all(context.scheduled.slice(before));
 
   assert.deepEqual(fetchCalls, [detail.candidates[0]!.url]);
@@ -596,9 +598,20 @@ test("one failed import preserves its successful sibling and retry is idempotent
   assert.equal(attempts.get(detail.candidates[0]!.url), 1);
   assert.equal(attempts.get(detail.candidates[1]!.url), 2);
 
-  const completed = await context.jobs.startImport("bundle-1", detail.run.id, admin);
-  assert.equal(completed.status, "completed");
+  await assert.rejects(
+    () => context.jobs.startImport("bundle-1", detail.run.id, admin),
+    /갱신/,
+  );
   assert.equal(context.db.first<{ count: number }>("SELECT count(*) AS count FROM evidence_sources").count, 2);
+
+  context.db.run(
+    "UPDATE evidence_search_runs SET status='failed',error_message='safe terminal label' WHERE id=?",
+    detail.run.id,
+  );
+  await assert.rejects(
+    () => context.jobs.startImport("bundle-1", detail.run.id, admin),
+    /갱신/,
+  );
 });
 
 test("post-commit import start is reconciled and repeated importing starts repair handoff once", async () => {

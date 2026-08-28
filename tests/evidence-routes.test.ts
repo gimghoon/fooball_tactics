@@ -163,9 +163,9 @@ function searchRunRecord(status: "queued" | "searching" | "ready" | "importing" 
   };
 }
 
-function searchDetail() {
+function searchDetail(status: "queued" | "searching" | "ready" | "importing" | "completed" | "failed" = "ready") {
   return {
-    run: searchRunRecord("ready"),
+    run: searchRunRecord(status),
     candidates: [{
       id: "candidate-1", runId: "search-1", bundleId: bundle.id,
       url: "https://uefa.example/private-original", canonicalUrl: "https://uefa.example/pressing",
@@ -989,9 +989,7 @@ test("search routes expose safe scoped workflow responses with accepted start se
   assert.equal(started.status, 202);
   assert.deepEqual(await body(started), {
     search: {
-      id: "search-1", bundleId: bundle.id, bundleVersion: bundle.version,
-      status: "queued", errorMessage: null, isStale: false,
-      startedAt: 3, completedAt: null, createdAt: 2, updatedAt: 3,
+      id: "search-1", bundleId: bundle.id, status: "queued",
     },
   });
 
@@ -999,6 +997,9 @@ test("search routes expose safe scoped workflow responses with accepted start se
     searchJobs: { ...runtime().searchJobs, startSearch: async () => searchRunRecord("ready") },
   }));
   assert.equal(deduplicated.status, 200);
+  assert.deepEqual(await body(deduplicated), {
+    search: { id: "search-1", bundleId: bundle.id, status: "ready" },
+  });
 
   const latest = await handleEvidenceSearchLatest(context({ bundleId: bundle.id }), runtime());
   const detail = await handleEvidenceSearchGet(context({ bundleId: bundle.id, runId: "search-1" }), runtime());
@@ -1015,10 +1016,50 @@ test("search routes expose safe scoped workflow responses with accepted start se
   assert.equal(detail.status, 200);
   assert.equal(selected.status, 200);
   assert.equal(imported.status, 202);
+  assert.deepEqual(await body(imported), {
+    search: { id: "search-1", bundleId: bundle.id, status: "importing" },
+  });
 
   for (const response of [started, deduplicated, latest, detail, selected, imported]) {
     assert.equal(response.headers.get("cache-control"), "private, no-store");
     assert.equal(response.headers.has("access-control-allow-origin"), false);
+  }
+});
+
+test("starter POSTs reject terminal no-ops while GET polling exposes terminal detail", async () => {
+  for (const terminal of ["completed", "failed"] as const) {
+    const terminalRuntime = runtime({
+      searchJobs: {
+        ...runtime().searchJobs,
+        startSearch: async () => searchRunRecord(terminal),
+        startImport: async () => searchRunRecord(terminal),
+        getSearch: async () => searchDetail(terminal),
+      },
+    });
+    const searchPost = await handleEvidenceSearchStart(
+      context({ bundleId: bundle.id }),
+      terminalRuntime,
+    );
+    const importPost = await handleEvidenceSearchImport(
+      context({ bundleId: bundle.id, runId: "search-1" }),
+      terminalRuntime,
+    );
+    const get = await handleEvidenceSearchGet(
+      context({ bundleId: bundle.id, runId: "search-1" }),
+      terminalRuntime,
+    );
+
+    for (const response of [searchPost, importPost]) {
+      assert.equal(response.status, 409);
+      assert.equal(response.headers.get("cache-control"), "private, no-store");
+      assert.equal(response.headers.has("access-control-allow-origin"), false);
+      assert.doesNotMatch(JSON.stringify(await body(response)), /completed|failed/);
+    }
+    assert.equal(get.status, 200);
+    assert.equal(
+      ((await body(get)).search as { run: { status: string } }).run.status,
+      terminal,
+    );
   }
 });
 

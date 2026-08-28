@@ -296,9 +296,7 @@ export class EvidenceExternalSearchJobs {
     if (existing !== null && SEARCH_REUSABLE_STATUSES.has(existing.status)) {
       if (existing.status === "queued" || existing.status === "searching") {
         await this.scheduleSearchContinuation(existing.id, bundle, directEvidenceSummary);
-        const repaired = await this.run(existing.id);
-        if (repaired === null) throw new EvidenceConflictError();
-        return asRun(repaired);
+        return asRun(existing);
       }
       return asRun(existing);
     }
@@ -386,9 +384,10 @@ export class EvidenceExternalSearchJobs {
       }
     }
 
-    await this.scheduleSearchContinuation(runId, bundle, directEvidenceSummary);
     const created = await this.run(runId);
     if (created === null) throw new EvidenceConflictError();
+    await this.scheduleSearchContinuation(runId, bundle, directEvidenceSummary);
+    if (await this.run(runId) === null) throw new EvidenceConflictError();
     return asRun(created);
   }
 
@@ -515,9 +514,7 @@ export class EvidenceExternalSearchJobs {
       const bundle = await this.bundle(bundleId);
       if (run.bundleVersion !== bundle.version) throw new EvidenceConflictError();
       this.scheduleImportContinuation(bundleId, runId);
-      const repaired = await this.run(runId);
-      if (repaired === null) throw new EvidenceConflictError();
-      return asRun(repaired);
+      return asRun(run);
     }
     if (!IMPORT_START_STATUSES.has(run.status)) {
       throw new EvidenceConflictError("가져올 수 있는 외부 출처 검색 작업 상태가 아닙니다.");
@@ -527,13 +524,16 @@ export class EvidenceExternalSearchJobs {
     const retryable = (await this.candidates(runId)).filter((candidate) =>
       candidate.selectedBy !== null && (candidate.status === "selected" || candidate.status === "failed"));
     if (retryable.length === 0) {
-      if (run.status === "completed") return asRun(run);
+      if (run.status === "completed" || run.status === "failed") {
+        throw new EvidenceConflictError();
+      }
       throw new EvidenceRequestValidationError("가져올 외부 출처 후보를 하나 이상 선택해 주세요.");
     }
     if (retryable.length > MAX_SELECTION) throw new EvidenceRequestValidationError("선택한 후보는 최대 5개여야 합니다.");
 
     const now = Math.max(this.now(), run.updatedAt + 1);
     let result: { meta?: { changes?: number } } | undefined;
+    let accepted: EvidenceSearchRunRow | null = null;
     try {
       result = await this.dependencies.db.prepare(
         `UPDATE evidence_search_runs
@@ -547,20 +547,32 @@ export class EvidenceExternalSearchJobs {
     } catch (error) {
       const committed = await this.run(runId);
       if (committed?.status !== "importing" || committed.bundleVersion !== bundle.version) throw error;
+      accepted = committed;
     }
     if (changes(result) !== 1) {
-      const winner = await this.run(runId);
+      const winner = accepted ?? await this.run(runId);
       if (winner?.status !== "importing") throw new EvidenceConflictError();
+      accepted = winner;
+    } else {
+      accepted = {
+        ...run,
+        status: "importing",
+        errorMessage: null,
+        completedAt: null,
+        leaseToken: null,
+        leaseExpiresAt: null,
+        updatedAt: now,
+      };
     }
+    if (accepted === null) throw new EvidenceConflictError();
 
     try {
       this.scheduleImportContinuation(bundleId, runId);
     } catch {
       throw new EvidenceUnavailableError("외부 문서 가져오기 작업을 예약하지 못했습니다.");
     }
-    const started = await this.run(runId);
-    if (started === null) throw new EvidenceConflictError();
-    return asRun(started);
+    if (await this.run(runId) === null) throw new EvidenceConflictError();
+    return asRun(accepted);
   }
 
   private async executeSearch(
