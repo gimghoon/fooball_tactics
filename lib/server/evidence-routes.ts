@@ -134,7 +134,7 @@ async function parseJson(request: Request): Promise<unknown> {
 }
 
 function safeSource(source: StoredEvidenceFile) {
-  return {
+  const safe = {
     id: source.id,
     bundleId: source.bundleId,
     originalFileName: source.originalFileName,
@@ -146,6 +146,17 @@ function safeSource(source: StoredEvidenceFile) {
       source.extractionError === null
         ? null
         : "근거 텍스트를 준비하지 못했습니다.",
+  };
+  if (source.origin !== "external_web" || !source.canonicalUrl || !source.publisher || !source.publishedAt || !Number.isSafeInteger(source.retrievedAt) || source.retrievedAt < 0) {
+    return { ...safe, origin: "uploaded" as const };
+  }
+  return {
+    ...safe,
+    origin: "external_web" as const,
+    canonicalUrl: source.canonicalUrl,
+    publisher: source.publisher,
+    publishedAt: source.publishedAt,
+    retrievedAt: source.retrievedAt,
   };
 }
 
