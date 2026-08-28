@@ -87,3 +87,54 @@ After the core orchestrator/service slice was green, the runtime composition tes
 - The focused storage suite still prints existing PDF.js standard-font/indexing warnings while passing; these are unchanged from the Task 3 baseline.
 - The build still prints the existing Node `module.register()` deprecation and vinext route-classification warnings while exiting 0.
 - Repository-wide bare `npx tsc --noEmit` was already documented by Task 3 as a non-green, unsupported broad gate; Task 4 used the brief-defined tests, ESLint, and production build gates instead.
+
+---
+
+## Fix round 1 — authority races and interrupted handoffs
+
+Implementation commit: `7b55d78` (`fix: harden evidence search handoffs`).
+
+### Changes
+
+- Search-run creation now uses `INSERT OR IGNORE ... SELECT` with the captured bundle numeric version and content version in the insert authority. A bundle mutation between the advisory read and insert produces zero rows and a 409 without leaving a queued run.
+- A queued search whose acquisition loses because bundle authority changed is terminally changed to `failed`, `is_stale=1`, with a bounded public error. It can no longer remain reusable forever.
+- Search insert and import-start D1 post-commit transport failures now reconcile the authoritative row before scheduling. Subsequent calls seeing `queued` search work or an `importing` run re-schedule the continuation; provider and candidate acquisition CAS operations ensure only one provider/fetch worker wins.
+- Candidate acquisition is reconciled after a post-commit exception by matching its authoritative `importing` timestamp. Pre-commit acquisition failures remain selected for a later repaired handoff.
+- Each import candidate, including acquisition and failure-state persistence, is isolated from its siblings. Failure-state writes reconcile committed terminal state and retry a transient pre-commit state write once. `finishImportRun()` is attempted from `finally`, even when enumeration or a candidate path fails.
+- An already-`importing` run now schedules a repair continuation instead of returning forever. A repair can finish a terminal-but-uncheckpointed run or acquire still-selected/failed candidates without duplicating a candidate already acquired by another continuation.
+- Selection now catches and reconciles only exceptions thrown by `db.batch()`. A successfully returned batch whose final CAS reports zero changes always throws 409; identical candidate state can no longer mask lost authority.
+
+### RED evidence
+
+The first fix-round run of `npx tsx --test tests/evidence-search-jobs.test.ts` executed 17 tests with **10 passing and 7 failing**. The failures exactly reproduced:
+
+- unguarded search insertion after a bundle mutation;
+- a bundle-mutation acquisition loss remaining `queued` instead of terminal stale/failed;
+- post-commit search insertion and import-start exceptions escaping before scheduling;
+- first-candidate acquisition and failure-update exceptions aborting sibling work;
+- a returned zero-row selection CAS being swallowed after an identical concurrent winner.
+
+### GREEN evidence
+
+- `npx tsx --test tests/evidence-search-jobs.test.ts` passes **19/19**, including added pre-commit and post-commit candidate acquisition/failure-update cases.
+- `npx tsx --test tests/evidence-search-jobs.test.ts tests/evidence-service.test.ts tests/evidence-storage.test.ts` passes **77/77**.
+- `npm run lint` exits 0.
+- `npm run build` completes all five vinext build stages.
+- `npm test` passes domain **47/47**, integration/component **18/18**, and rendered output **5/5**, including its production build stage.
+- `git diff --check` exits 0 before the fix commit.
+
+### Concurrency and failure evidence
+
+- A real SQLite hook mutating bundle version/content immediately before run insertion proves zero search rows and zero scheduled work.
+- Mutation immediately before acquisition proves zero provider calls and a terminal `failed`/stale run.
+- Search and import start post-commit exceptions are followed by repeated calls while acquisition is held. Two continuations are registered, but acquisition CAS produces exactly one provider call or fetch.
+- With two selected candidates, a pre-commit acquisition failure on the first leaves it recoverable, imports the sibling, and a later `startImport()` imports only the first.
+- A post-commit acquisition exception is reconciled and both candidates import exactly once.
+- Pre-commit and post-commit failure-state exceptions both preserve sibling success and terminal run checkpointing; retry fetches only the failed candidate.
+- In the selection regression, one request pauses before its batch, an identical concurrent request commits, the bundle then mutates, and the paused request's old expected version receives 409. Only the winning request's two audit rows exist.
+
+### Remaining concerns
+
+- No fix-round blocker remains.
+- The focused storage suite continues to print the pre-existing PDF.js standard-font/indexing warnings while passing.
+- Build and full-test output continue to include the pre-existing Node `module.register()` deprecation and vinext route-classification warnings while exiting 0.
