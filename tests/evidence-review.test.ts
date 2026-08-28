@@ -526,6 +526,11 @@ test("admin job card listing returns current cards with only current-version cit
   const { database, service } = createContext();
   seedCard(database);
   database.run(
+    `UPDATE evidence_sources SET origin='external_web',canonical_url=?,publisher=?,published_at=?,retrieved_at=?
+      WHERE id='source-1'`,
+    "https://uefa.example/pressing", "UEFA", "2026-01-02", 4,
+  );
+  database.run(
     `INSERT INTO evidence_chunks
       (id,bundle_id,input_version,source_id,video_clip_id,ordinal,location_label,content,content_hash,created_at)
       VALUES (?,?,?,?,?,?,?,?,?,?)`,
@@ -544,6 +549,20 @@ test("admin job card listing returns current cards with only current-version cit
     { chunkId: "chunk-1", content: "반대편 패스" },
     { chunkId: "chunk-2", content: "중앙 드리블 위험" },
   ]);
+  assert.deepEqual(cards.cards[0]?.citations.map((citation) => ({
+    chunkId: citation.chunkId,
+    origin: citation.origin,
+    canonicalUrl: citation.canonicalUrl,
+    publisher: citation.publisher,
+    publishedAt: citation.publishedAt,
+    retrievedAt: citation.retrievedAt,
+  })), [{
+    chunkId: "chunk-1", origin: "external_web", canonicalUrl: "https://uefa.example/pressing",
+    publisher: "UEFA", publishedAt: "2026-01-02", retrievedAt: 4,
+  }, {
+    chunkId: "chunk-2", origin: "video_observation", canonicalUrl: null,
+    publisher: null, publishedAt: null, retrievedAt: null,
+  }]);
   assert.deepEqual(await service.listCardsForJob("missing-job", admin), { cards: [], totalCount: 0, nextOffset: null });
 });
 

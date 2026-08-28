@@ -2,20 +2,22 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   EvidenceAnalyzerError,
+  enforceExternalEvidenceRules,
   parseAnalyzerCards,
   parseExtractedEvidence,
   type EvidenceChunkInput,
   type ExtractedEvidence,
 } from "../lib/server/evidence-analyzer.ts";
+import type { TacticCardContent } from "../lib/domain/evidence.ts";
 import { createConfiguredEvidenceAnalyzer } from "../lib/server/openai-evidence-analyzer.ts";
 
-const chunks: EvidenceChunkInput[] = [{ id: "chunk-1", locationLabel: "page:1", content: "수비수는 중앙을 막는다." }];
+const chunks: EvidenceChunkInput[] = [{ id: "chunk-1", locationLabel: "page:1", content: "수비수는 중앙을 막는다.", origin: "uploaded" }];
 const defaultConfig = {
   EVIDENCE_LLM_ENDPOINT: "https://llm.example.test/v1/responses",
   EVIDENCE_LLM_API_KEY: "key",
   EVIDENCE_LLM_MODEL: "model",
 };
-const card = (citationIds = ["chunk-1"]) => ({
+const card = (citationIds = ["chunk-1"]): TacticCardContent => ({
   situation: "중앙으로 공을 운반한다.",
   conditions: ["전방 압박이 없다."],
   defenseType: "central_block",
@@ -133,6 +135,38 @@ test("simulation assumptions cannot remain high-confidence but stay available fo
   const result = parseAnalyzerCards(JSON.stringify({ cards: [assumption] }), chunks)[0]!;
   assert.equal(result.preferred[0]?.confidence, "medium");
   assert.equal(result.scenarioSuitable, true);
+});
+
+test("external-only cards are capped from high to medium using every action citation", () => {
+  const externalOnly = {
+    ...card(["external-chunk"]),
+    confidence: "high" as const,
+    alternatives: [{ action: "move" as const, reason: "외부 근거의 대안이다.", citationIds: ["external-chunk"] }],
+  };
+  const origins = new Map([
+    ["external-chunk", "external_web" as const],
+    ["uncited-uploaded-chunk", "uploaded" as const],
+  ]);
+
+  assert.equal(enforceExternalEvidenceRules(externalOnly, origins).confidence, "medium");
+  assert.equal(enforceExternalEvidenceRules({
+    ...externalOnly,
+    preferred: [{ action: "pass", reason: "직접 근거도 사용한다.", citationIds: ["uploaded-chunk"] }],
+  }, new Map([...origins, ["uploaded-chunk", "uploaded" as const]])).confidence, "high");
+});
+
+test("same-condition conflicts remain exact and block scenario and animation suitability", () => {
+  const conflict = "직접 근거는 중앙 유지, 외부 근거는 즉시 측면 이동을 지시함";
+  const result = enforceExternalEvidenceRules({
+    ...card(),
+    conflicts: [conflict],
+    scenarioSuitable: true,
+    animationSuitable: true,
+  }, new Map([["chunk-1", "uploaded"]]));
+
+  assert.deepEqual(result.conflicts, [conflict]);
+  assert.equal(result.scenarioSuitable, false);
+  assert.equal(result.animationSuitable, false);
 });
 
 test("configured adapter sends a strict Responses structured-output request and returns only domain cards", async () => {
@@ -286,7 +320,33 @@ test("extraction adapter sends strict schema and evidence-only instructions", as
   assert.match(String(body.instructions), /conflict/i);
   assert.match(String(body.instructions), /differing conditions/i);
   assert.match(String(body.instructions), /action and reason.*cite/i);
+  assert.match(String(body.instructions), /documents?.*data.*not.*instructions/i);
+  assert.match(String(body.instructions), /external-only.*medium/i);
   assert.equal(request?.redirect, "manual");
+});
+
+test("extraction input includes bounded external provenance but no uploaded display metadata", async () => {
+  let request: Request | undefined;
+  const analyzer = createConfiguredEvidenceAnalyzer(defaultConfig, { fetch: async (input, init) => {
+    request = new Request(input, init);
+    return completedResponse(JSON.stringify({ extracted: [extracted()] }));
+  } });
+  const externalChunks: EvidenceChunkInput[] = [
+    chunks[0]!,
+    {
+      id: "external-chunk", locationLabel: "page:2", content: "측면으로 이동한다.", origin: "external_web",
+      canonicalUrl: "https://uefa.example/pressing", publisher: "UEFA", publishedAt: "2026-01-02", retrievedAt: 123,
+    },
+  ];
+
+  await analyzer.analyzeExtraction({ chunks: externalChunks, promptVersion: "p" }, AbortSignal.timeout(1_000));
+
+  const body = await request?.json() as Record<string, unknown>;
+  const input = record(JSON.parse(String(body.input)));
+  assert.deepEqual(input.chunks, externalChunks);
+  assert.deepEqual((input.chunks as EvidenceChunkInput[])[0], {
+    id: "chunk-1", locationLabel: "page:1", content: "수비수는 중앙을 막는다.", origin: "uploaded",
+  });
 });
 
 test("rejects all invalid Responses envelopes after inspecting every output item", async (t) => {
@@ -386,6 +446,27 @@ test("reports a sanitized transport diagnostic without credentials or request ev
   }]);
   assert.equal(JSON.stringify(diagnostics).includes("secret-key"), false);
   assert.equal(JSON.stringify(diagnostics).includes("chunk-1"), false);
+});
+
+test("redacts and bounds every analyzer transport diagnostic string field", async () => {
+  const diagnostics: Array<{ name: string; message: string; causeName?: string; causeCode?: string }> = [];
+  const cause = Object.assign(new Error("cause"), { code: `CODE-secret-key-${"c".repeat(300)}` });
+  cause.name = `Cause-secret-key-${"n".repeat(300)}`;
+  const failure = new TypeError(`message-secret-key-${"m".repeat(300)}`, { cause });
+  failure.name = `Type-secret-key-${"t".repeat(300)}`;
+  const analyzer = createConfiguredEvidenceAnalyzer({
+    EVIDENCE_LLM_ENDPOINT: "https://llm.example.test/v1/responses",
+    EVIDENCE_LLM_API_KEY: "secret-key",
+    EVIDENCE_LLM_MODEL: "model",
+  }, {
+    fetch: async () => { throw failure; },
+    onTransportError: (diagnostic) => diagnostics.push(diagnostic),
+  });
+
+  await assert.rejects(() => analyzer.generateCards(cardInput, AbortSignal.timeout(1_000)), EvidenceAnalyzerError);
+  assert.equal(diagnostics.length, 1);
+  assert.equal(JSON.stringify(diagnostics).includes("secret-key"), false);
+  for (const value of Object.values(diagnostics[0]!)) assert.ok(value.length <= 240);
 });
 
 test("distinguishes an injected adapter timeout from caller cancellation", async () => {

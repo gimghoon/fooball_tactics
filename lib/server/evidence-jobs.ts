@@ -1,11 +1,14 @@
 import { computeEvidenceVersion, type TacticCardContent } from "../domain/evidence.ts";
 import {
   EvidenceAnalyzerError,
+  enforceExternalEvidenceRules,
   extractedCitationIds,
   parseAnalyzerCards,
+  parseEvidenceChunks,
   parseExtractedEvidence,
   type EvidenceAnalyzer,
   type EvidenceChunkInput,
+  type EvidenceChunkOrigin,
 } from "./evidence-analyzer.ts";
 import type { EvidenceAdmin } from "./evidence-auth.ts";
 import type {
@@ -64,6 +67,23 @@ type EvidenceSourceRow = {
   extractedTextKey: string | null;
   extractionStatus: "pending" | "completed" | "failed";
   extractionError: string | null;
+  origin: "uploaded" | "external_web";
+  canonicalUrl: string | null;
+  publisher: string | null;
+  publishedAt: string | null;
+  retrievedAt: number | null;
+};
+
+type EvidenceChunkRow = {
+  id: string;
+  locationLabel: string;
+  content: string;
+  videoClipId: string | null;
+  sourceOrigin: "uploaded" | "external_web" | null;
+  canonicalUrl: string | null;
+  publisher: string | null;
+  publishedAt: string | null;
+  retrievedAt: number | null;
 };
 
 type EvidenceVideoClipRow = {
@@ -357,26 +377,41 @@ export class EvidenceAnalysisJobs {
   private async sources(bundleId: string): Promise<EvidenceSourceRow[]> {
     return (await this.dependencies.db.prepare(
       `SELECT id,bundle_id AS bundleId,content_hash AS contentHash,storage_key AS storageKey,
-        extracted_text_key AS extractedTextKey,extraction_status AS extractionStatus,extraction_error AS extractionError
+        extracted_text_key AS extractedTextKey,extraction_status AS extractionStatus,extraction_error AS extractionError,
+        origin,canonical_url AS canonicalUrl,publisher,published_at AS publishedAt,retrieved_at AS retrievedAt
         FROM evidence_sources WHERE bundle_id=? ORDER BY id`,
     ).bind(bundleId).all<EvidenceSourceRow>()).results;
   }
 
   private async chunks(job: EvidenceAnalysisJobRecord): Promise<EvidenceChunkInput[]> {
-    return (await this.dependencies.db.prepare(
-      `SELECT chunk.id,chunk.location_label AS locationLabel,chunk.content
+    const rows = (await this.dependencies.db.prepare(
+      `SELECT chunk.id,chunk.location_label AS locationLabel,chunk.content,chunk.video_clip_id AS videoClipId,
+          source.origin AS sourceOrigin,source.canonical_url AS canonicalUrl,source.publisher,
+          source.published_at AS publishedAt,source.retrieved_at AS retrievedAt
         FROM evidence_chunks AS chunk
+        LEFT JOIN evidence_sources AS source
+          ON source.id=chunk.source_id AND source.bundle_id=chunk.bundle_id
+        LEFT JOIN evidence_video_clips AS clip
+          ON clip.id=chunk.video_clip_id AND clip.bundle_id=chunk.bundle_id
         WHERE chunk.bundle_id=? AND chunk.input_version=?
-          AND ((chunk.source_id IS NOT NULL AND EXISTS (
-            SELECT 1 FROM evidence_sources AS source
-            WHERE source.id=chunk.source_id AND source.bundle_id=chunk.bundle_id
-              AND source.extraction_status='completed'
-          )) OR (chunk.video_clip_id IS NOT NULL AND EXISTS (
-            SELECT 1 FROM evidence_video_clips AS clip
-            WHERE clip.id=chunk.video_clip_id AND clip.bundle_id=chunk.bundle_id
-          )))
+          AND ((source.id IS NOT NULL AND source.extraction_status='completed') OR clip.id IS NOT NULL)
         ORDER BY chunk.source_id,chunk.video_clip_id,chunk.ordinal,chunk.id`,
-    ).bind(job.bundleId, job.inputVersion).all<EvidenceChunkInput>()).results;
+    ).bind(job.bundleId, job.inputVersion).all<EvidenceChunkRow>()).results;
+    const chunks = rows.map((row): EvidenceChunkInput => {
+      const base = { id: row.id, locationLabel: row.locationLabel, content: row.content };
+      if (row.videoClipId !== null) return { ...base, origin: "video_observation" };
+      if (row.sourceOrigin === "uploaded") return { ...base, origin: "uploaded" };
+      if (row.sourceOrigin === "external_web") return {
+        ...base,
+        origin: "external_web",
+        canonicalUrl: row.canonicalUrl ?? "",
+        publisher: row.publisher ?? "",
+        publishedAt: row.publishedAt ?? "",
+        retrievedAt: row.retrievedAt ?? -1,
+      };
+      throw new EvidenceAnalyzerError("근거 청크 출처가 올바르지 않습니다.", false);
+    });
+    return chunks.length === 0 ? [] : parseEvidenceChunks(chunks);
   }
 
   private guard(job: EvidenceAnalysisJobRecord, checkpointAt: number): unknown[] {
@@ -534,7 +569,11 @@ export class EvidenceAnalysisJobs {
       promptVersion: job.promptVersion,
       schemaVersion: job.schemaVersion,
     }, new AbortController().signal);
-    const cards = parseAnalyzerCards(result, allowedCitationIds, extractedCitationIds(extracted));
+    const originsByChunkId = new Map<string, EvidenceChunkOrigin>(
+      chunks.map((chunk) => [chunk.id, chunk.origin]),
+    );
+    const cards = parseAnalyzerCards(result, allowedCitationIds, extractedCitationIds(extracted))
+      .map((card) => enforceExternalEvidenceRules(card, originsByChunkId));
     for (const card of cards) {
       boundedJson(card, EVIDENCE_CARD_MAX_BYTES, "전술 카드가 저장 가능한 크기를 초과했습니다.");
     }
@@ -552,11 +591,14 @@ export class EvidenceAnalysisJobs {
   private async persistCards(job: EvidenceAnalysisJobRecord): Promise<void> {
     const chunks = await this.chunks(job);
     const extracted = parseExtractedEvidence(JSON.parse(job.extractedEvidenceJson ?? "null") as unknown, chunks);
+    const originsByChunkId = new Map<string, EvidenceChunkOrigin>(
+      chunks.map((chunk) => [chunk.id, chunk.origin]),
+    );
     const cards = parseAnalyzerCards(
       JSON.parse(job.generatedCardsJson ?? "null") as unknown,
       chunks,
       extractedCitationIds(extracted),
-    );
+    ).map((card) => enforceExternalEvidenceRules(card, originsByChunkId));
     const now = this.now();
     const statements: EvidenceD1Statement[] = [];
     for (const card of cards) {

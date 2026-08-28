@@ -33,6 +33,16 @@ function applyMigrationsBefore(database: DatabaseSync, targetPrefix: string): st
   return migrations[targetIndex];
 }
 
+function addExternalEvidenceSourceColumns(database: DatabaseSync): void {
+  database.exec(`
+    ALTER TABLE evidence_sources ADD origin text DEFAULT 'uploaded' NOT NULL;
+    ALTER TABLE evidence_sources ADD canonical_url text;
+    ALTER TABLE evidence_sources ADD publisher text;
+    ALTER TABLE evidence_sources ADD published_at text;
+    ALTER TABLE evidence_sources ADD retrieved_at integer;
+  `);
+}
+
 class SQLiteD1Statement implements EvidenceD1Statement {
   private values: SQLInputValue[] = [];
 
@@ -256,7 +266,13 @@ function seedBundle(database: SQLiteD1Database, id = "bundle-1", contentVersion 
 function seedSource(
   database: SQLiteD1Database,
   files: MemoryFiles,
-  input: { id: string; bundleId?: string; failed?: boolean; text?: string },
+  input: {
+    id: string;
+    bundleId?: string;
+    failed?: boolean;
+    text?: string;
+    external?: { canonicalUrl: string; publisher: string; publishedAt: string; retrievedAt: number };
+  },
 ): void {
   const bundleId = input.bundleId ?? "bundle-1";
   const failed = input.failed ?? false;
@@ -268,9 +284,12 @@ function seedSource(
   }
   database.run(
     `INSERT INTO evidence_sources
-      (id,bundle_id,original_file_name,media_type,byte_size,content_hash,storage_key,extracted_text_key,extraction_status,extraction_error,created_at,updated_at)
-      VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
-    input.id, bundleId, `${input.id}.md`, "text/markdown", 12, `${input.id}-hash`, originalKey, extractedKey,
+      (id,bundle_id,origin,original_file_name,media_type,byte_size,content_hash,storage_key,canonical_url,publisher,published_at,retrieved_at,
+       extracted_text_key,extraction_status,extraction_error,created_at,updated_at)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+    input.id, bundleId, input.external ? "external_web" : "uploaded", `${input.id}.md`, "text/markdown", 12,
+    `${input.id}-hash`, originalKey, input.external?.canonicalUrl ?? null, input.external?.publisher ?? null,
+    input.external?.publishedAt ?? null, input.external?.retrievedAt ?? null, extractedKey,
     failed ? "failed" : "completed", failed ? "스캔 PDF는 OCR을 지원하지 않습니다." : null, 1, 1,
   );
 }
@@ -429,6 +448,7 @@ test("migration upgrades the exact old queued default and runs validation first"
       VALUES (?,?,?,?,?,?,?,?,?)`,
   ).run("queued-job", "queued-bundle", inputVersion, "model-1", "prompt-1", "schema-1", 0, 1, 1);
   database.exec(readFileSync(`drizzle/${migration}`, "utf8"));
+  addExternalEvidenceSourceColumns(database);
   const d1 = new SQLiteD1Database(database, false);
   const scheduled: Promise<unknown>[] = [];
   const scheduledStages: string[] = [];
@@ -543,6 +563,7 @@ test("migration preserves durable decisions and quarantines invalid draft-only l
   );
 
   database.exec(readFileSync(`drizzle/${migration}`, "utf8"));
+  addExternalEvidenceSourceColumns(database);
   assert.deepEqual({ ...database.prepare(
     "SELECT status,stage FROM evidence_analysis_jobs WHERE id='complete-job'",
   ).get() }, { status: "review_ready", stage: "done" });
@@ -678,6 +699,7 @@ test("migration rewinds done draft-only jobs and quarantines current drafts desp
   }
 
   database.exec(readFileSync(`drizzle/${migration}`, "utf8"));
+  addExternalEvidenceSourceColumns(database);
   for (const item of cases) {
     assert.deepEqual({ ...database.prepare(
       "SELECT status,is_stale AS isStale FROM tactic_cards WHERE id=?",
@@ -1066,6 +1088,114 @@ test("chunks are scoped to one input version and failed sources cannot leak old 
   await context.jobs.runAnalysisStep("job-3");
 
   assert.deepEqual(seenInputs.at(-1), []);
+});
+
+test("only registered uploaded and selected imported sources enter analyzer chunks with bounded provenance", async () => {
+  let analyzerChunks: EvidenceChunkInput[] = [];
+  const analyzer = new RecordingAnalyzer({
+    extract: async (input) => {
+      analyzerChunks = input.chunks;
+      return [{
+        citationIds: ["direct-chunk"], situation: "상황", conditions: [], cues: [],
+        actions: [{ action: "pass", reason: "이유", citationIds: ["direct-chunk"] }], outcomes: [], exceptions: [],
+      }];
+    },
+  });
+  const context = createContext({ analyzer });
+  seedBundle(context.database);
+  seedSource(context.database, context.files, { id: "direct-source" });
+  seedSource(context.database, context.files, {
+    id: "selected-imported-source",
+    external: {
+      canonicalUrl: "https://uefa.example/pressing", publisher: "UEFA", publishedAt: "2026-01-02", retrievedAt: 123,
+    },
+  });
+  seedChunk(context.database, { id: "direct-chunk", sourceId: "direct-source" });
+  seedChunk(context.database, { id: "selected-imported-chunk", sourceId: "selected-imported-source" });
+  context.database.run(
+    `INSERT INTO evidence_search_runs
+      (id,bundle_id,input_version,bundle_version,status,search_model,prompt_version,query_json,is_stale,created_at,updated_at)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+    "run-1", "bundle-1", "input-1", 1, "completed", "search-model", "search-prompt", "[]", 0, 1, 1,
+  );
+  context.database.run(
+    `INSERT INTO evidence_search_candidates
+      (id,run_id,bundle_id,url,canonical_url,title,publisher,published_at,document_type,quote,relevance,trust_tier,rank,status,created_at,updated_at)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+    "candidate-only", "run-1", "bundle-1", "https://fifa.example/candidate", "https://fifa.example/candidate",
+    "Candidate", "FIFA", "2026-01-01", "web", "인용", "관련성", 1, 1, "candidate", 1, 1,
+  );
+  seedJob(context.database, { stage: "extract_evidence" });
+
+  await context.jobs.runAnalysisStep("job-1");
+
+  assert.deepEqual(analyzerChunks.map((chunk) => chunk.id).sort(), ["direct-chunk", "selected-imported-chunk"]);
+  assert.deepEqual(analyzerChunks.find((chunk) => chunk.id === "direct-chunk"), {
+    id: "direct-chunk", locationLabel: "paragraph:1", content: "압박 대응", origin: "uploaded",
+  });
+  assert.deepEqual(analyzerChunks.find((chunk) => chunk.id === "selected-imported-chunk"), {
+    id: "selected-imported-chunk", locationLabel: "paragraph:1", content: "압박 대응", origin: "external_web",
+    canonicalUrl: "https://uefa.example/pressing", publisher: "UEFA", publishedAt: "2026-01-02", retrievedAt: 123,
+  });
+  assert.equal(analyzerChunks.some((chunk) => chunk.id === "candidate-only"), false);
+});
+
+test("external-only card confidence is capped using cited chunks rather than bundle inventory", async () => {
+  const analyzer = new RecordingAnalyzer({ cards: async () => [card("external-chunk")] });
+  const context = createContext({ analyzer });
+  seedBundle(context.database);
+  seedSource(context.database, context.files, { id: "direct-source" });
+  seedSource(context.database, context.files, {
+    id: "external-source",
+    external: {
+      canonicalUrl: "https://uefa.example/pressing", publisher: "UEFA", publishedAt: "2026-01-02", retrievedAt: 123,
+    },
+  });
+  seedChunk(context.database, { id: "direct-chunk", sourceId: "direct-source" });
+  seedChunk(context.database, { id: "external-chunk", sourceId: "external-source" });
+  seedJob(context.database, {
+    stage: "generate_cards",
+    extractedEvidenceJson: JSON.stringify([{
+      citationIds: ["external-chunk"], situation: "상황", conditions: [], cues: [],
+      actions: [{ action: "pass", reason: "이유", citationIds: ["external-chunk"] }], outcomes: [], exceptions: [],
+    }]),
+  });
+
+  await context.jobs.runAnalysisStep("job-1");
+  await drainScheduled(context.scheduled);
+
+  const stored = JSON.parse(context.database.first<{ content: string }>(
+    "SELECT current_content_json AS content FROM tactic_cards",
+  ).content) as TacticCardContent;
+  assert.equal(stored.confidence, "medium");
+});
+
+test("persisted conflicts remain exact and disable both suitability flags", async () => {
+  const conflict = "직접 근거는 중앙 유지, 외부 근거는 즉시 측면 이동을 지시함";
+  const analyzer = new RecordingAnalyzer({ cards: async () => [{
+    ...card("chunk-1"), conflicts: [conflict], scenarioSuitable: true, animationSuitable: true,
+  }] });
+  const context = createContext({ analyzer });
+  seedBundle(context.database);
+  seedSource(context.database, context.files, { id: "source-1" });
+  seedChunk(context.database, { id: "chunk-1", sourceId: "source-1" });
+  seedJob(context.database, {
+    stage: "generate_cards",
+    extractedEvidenceJson: JSON.stringify([{
+      citationIds: ["chunk-1"], situation: "상황", conditions: [], cues: [],
+      actions: [{ action: "pass", reason: "이유", citationIds: ["chunk-1"] }], outcomes: [], exceptions: [],
+    }]),
+  });
+
+  await context.jobs.runAnalysisStep("job-1");
+  await drainScheduled(context.scheduled);
+
+  const stored = JSON.parse(context.database.first<{ content: string }>(
+    "SELECT current_content_json AS content FROM tactic_cards",
+  ).content) as TacticCardContent;
+  assert.deepEqual(stored.conflicts, [conflict]);
+  assert.equal(stored.scenarioSuitable, false);
+  assert.equal(stored.animationSuitable, false);
 });
 
 test("retryable and malformed analyzer output gets at most three persisted attempts", async () => {

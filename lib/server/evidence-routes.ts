@@ -39,6 +39,8 @@ const JOB_CARD_PAGE_SIZE = 20;
 const JOB_CARD_CITATION_LIMIT = 20;
 const JOB_EXCERPT_MAX_BYTES = 2_000;
 const JOB_AGGREGATE_EXCERPT_MAX_BYTES = 32 * 1024;
+const EXTERNAL_CITATION_URL_MAX_BYTES = 4 * 1024;
+const EXTERNAL_CITATION_PUBLISHER_MAX_LENGTH = 160;
 
 type RouteContext<T extends Record<string, string>> = { params: Promise<T> };
 
@@ -277,6 +279,31 @@ function truncateUtf8(value: string, maximumBytes: number): string {
   return value.slice(0, read);
 }
 
+function safeExternalCitationMetadata(citation: EvidenceCardAdminDetail["citations"][number]) {
+  if (citation.origin !== "external_web") return { origin: citation.origin };
+  if (typeof citation.canonicalUrl !== "string" || typeof citation.publisher !== "string"
+    || typeof citation.publishedAt !== "string" || typeof citation.retrievedAt !== "number"
+    || citation.publisher.trim() === "" || citation.publisher.length > EXTERNAL_CITATION_PUBLISHER_MAX_LENGTH
+    || !/^\d{4}-\d{2}-\d{2}$/.test(citation.publishedAt)
+    || !Number.isSafeInteger(citation.retrievedAt) || citation.retrievedAt < 0
+    || new TextEncoder().encode(citation.canonicalUrl).byteLength > EXTERNAL_CITATION_URL_MAX_BYTES) {
+    return { origin: citation.origin };
+  }
+  try {
+    const url = new URL(citation.canonicalUrl);
+    if (url.protocol !== "https:" || url.username || url.password) return { origin: citation.origin };
+  } catch {
+    return { origin: citation.origin };
+  }
+  return {
+    origin: citation.origin,
+    canonicalUrl: citation.canonicalUrl,
+    publisher: citation.publisher,
+    publishedAt: citation.publishedAt,
+    retrievedAt: citation.retrievedAt,
+  };
+}
+
 function safeCardDetail(card: EvidenceCardAdminDetail, budget: { remaining: number }) {
   return {
     ...safeCard(card),
@@ -285,7 +312,7 @@ function safeCardDetail(card: EvidenceCardAdminDetail, budget: { remaining: numb
       const excerpt = truncateUtf8(citation.content, Math.min(JOB_EXCERPT_MAX_BYTES, budget.remaining));
       budget.remaining -= new TextEncoder().encode(excerpt).byteLength;
       return { chunkId: citation.chunkId, sourceId: citation.sourceId, videoClipId: citation.videoClipId,
-        locationLabel: citation.locationLabel, excerpt };
+        locationLabel: citation.locationLabel, excerpt, ...safeExternalCitationMetadata(citation) };
     }),
   };
 }

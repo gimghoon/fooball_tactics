@@ -872,6 +872,8 @@ test("review-ready job polling returns discoverable cards and bounded citation e
         citations: [{
           chunkId: "chunk-1", sourceId: source.id, videoClipId: null, locationLabel: "문서 1쪽",
           content: longExcerpt, contentHash: "secret-hash",
+          origin: "external_web", canonicalUrl: "https://uefa.example/pressing", publisher: "UEFA",
+          publishedAt: "2026-01-02", retrievedAt: 4, searchCandidateId: "must-not-leak",
         }],
       }], totalCount: 1, nextOffset: null }),
     },
@@ -883,9 +885,15 @@ test("review-ready job polling returns discoverable cards and bounded citation e
   assert.deepEqual(cards[0]?.content, { situation: "측면 압박" });
   const citations = cards[0]?.citations as Array<Record<string, unknown>>;
   assert.equal(citations[0]?.chunkId, "chunk-1");
+  assert.deepEqual(citations[0], {
+    chunkId: "chunk-1", sourceId: source.id, videoClipId: null, locationLabel: "문서 1쪽",
+    excerpt: citations[0]?.excerpt,
+    origin: "external_web", canonicalUrl: "https://uefa.example/pressing", publisher: "UEFA",
+    publishedAt: "2026-01-02", retrievedAt: 4,
+  });
   assert.equal((citations[0]?.excerpt as string).length <= 2_001, true);
   const serialized = JSON.stringify(responseBody);
-  for (const secret of ["producerModel", "secret-model", "draftContentJson", "currentContentJson", "contentHash", "secret-hash"]) {
+  for (const secret of ["producerModel", "secret-model", "draftContentJson", "currentContentJson", "contentHash", "secret-hash", "searchCandidateId", "must-not-leak"]) {
     assert.equal(serialized.includes(secret), false);
   }
 });
@@ -900,6 +908,7 @@ test("job polling caps cards, citations, and aggregate UTF-8 excerpts with conti
     citations: Array.from({ length: 30 }, (_, index) => ({
       chunkId: `chunk-${index}`, sourceId: source.id, videoClipId: null,
       locationLabel: `page:${index}`, content: "가".repeat(4_000), contentHash: "hash",
+      origin: "uploaded" as const, canonicalUrl: null, publisher: null, publishedAt: null, retrievedAt: null,
     })),
   };
   const response = await handleEvidenceJobStatus(

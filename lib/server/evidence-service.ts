@@ -91,8 +91,15 @@ export type EvidenceCitationSnapshot = {
   content: string;
   contentHash: string;
 };
+export type EvidenceAdminCitation = EvidenceCitationSnapshot & {
+  origin: "uploaded" | "external_web" | "video_observation";
+  canonicalUrl: string | null;
+  publisher: string | null;
+  publishedAt: string | null;
+  retrievedAt: number | null;
+};
 export type EvidenceCardAdminDetail = EvidenceCardRecord & {
-  citations: EvidenceCitationSnapshot[];
+  citations: EvidenceAdminCitation[];
   citationCount: number;
 };
 export type EvidenceCardsPage = { cards: EvidenceCardAdminDetail[]; totalCount: number; nextOffset: number | null };
@@ -206,7 +213,7 @@ export type EvidenceServiceRepository = {
     cardId: string,
   ): Promise<(EvidenceCitationSnapshot & { inputVersion: string })[]>;
   countCardCitations(cardId: string, inputVersion: string): Promise<number>;
-  listCardCitationsForAdmin(cardId: string, inputVersion: string, limit: number): Promise<EvidenceCitationSnapshot[]>;
+  listCardCitationsForAdmin(cardId: string, inputVersion: string, limit: number): Promise<EvidenceAdminCitation[]>;
   findCardReview(
     reviewId: string,
     cardId: string,
@@ -759,13 +766,19 @@ export class D1EvidenceServiceRepository implements EvidenceServiceRepository {
       WHERE citation.card_id=? AND chunk.input_version=?`).bind(cardId, inputVersion).first<{count:number}>();
     return row?.count ?? 0;
   }
-  async listCardCitationsForAdmin(cardId: string, inputVersion: string, limit: number): Promise<EvidenceCitationSnapshot[]> {
+  async listCardCitationsForAdmin(cardId: string, inputVersion: string, limit: number): Promise<EvidenceAdminCitation[]> {
     return (await this.db.prepare(`SELECT chunk.id AS chunkId,chunk.source_id AS sourceId,chunk.video_clip_id AS videoClipId,
-      chunk.location_label AS locationLabel,chunk.content,chunk.content_hash AS contentHash
+      chunk.location_label AS locationLabel,chunk.content,chunk.content_hash AS contentHash,
+      CASE WHEN chunk.video_clip_id IS NOT NULL THEN 'video_observation' ELSE source.origin END AS origin,
+      CASE WHEN source.origin='external_web' THEN source.canonical_url ELSE NULL END AS canonicalUrl,
+      CASE WHEN source.origin='external_web' THEN source.publisher ELSE NULL END AS publisher,
+      CASE WHEN source.origin='external_web' THEN source.published_at ELSE NULL END AS publishedAt,
+      CASE WHEN source.origin='external_web' THEN source.retrieved_at ELSE NULL END AS retrievedAt
       FROM tactic_card_citations AS citation
       JOIN evidence_chunks AS chunk ON chunk.id=citation.chunk_id AND chunk.bundle_id=citation.bundle_id
+      LEFT JOIN evidence_sources AS source ON source.id=chunk.source_id AND source.bundle_id=chunk.bundle_id
       WHERE citation.card_id=? AND chunk.input_version=? ORDER BY chunk.id LIMIT ?`)
-      .bind(cardId, inputVersion, limit).all<EvidenceCitationSnapshot>()).results;
+      .bind(cardId, inputVersion, limit).all<EvidenceAdminCitation>()).results;
   }
   async findCardReview(
     reviewId: string,

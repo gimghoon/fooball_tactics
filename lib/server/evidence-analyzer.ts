@@ -1,10 +1,29 @@
 import type { ActionProvenance, CardAction, Confidence, SpatialPoint, TacticalIntent, TacticCardContent } from "../domain/evidence.ts";
 
-export type EvidenceChunkInput = {
+export type EvidenceChunkOrigin = "uploaded" | "external_web" | "video_observation";
+
+type ExternalEvidenceChunkMetadata = {
+  canonicalUrl: string;
+  publisher: string;
+  publishedAt: string;
+  retrievedAt: number;
+};
+
+type EvidenceChunkBase = {
   id: string;
   locationLabel: string;
   content: string;
 };
+
+export type EvidenceChunkInput = EvidenceChunkBase & ({
+  origin: "external_web";
+} & ExternalEvidenceChunkMetadata | {
+  origin: "uploaded" | "video_observation";
+  canonicalUrl?: never;
+  publisher?: never;
+  publishedAt?: never;
+  retrievedAt?: never;
+});
 
 export type ExtractedEvidence = {
   citationIds: string[];
@@ -47,6 +66,9 @@ const DEFENSE_TYPES = new Set<TacticCardContent["defenseType"]>([
   "numerical_superiority", "numerical_inferiority", "unknown",
 ]);
 const CONFIDENCES = new Set<TacticCardContent["confidence"]>(["high", "medium", "low"]);
+const CHUNK_ORIGINS = new Set<EvidenceChunkOrigin>(["uploaded", "external_web", "video_observation"]);
+const MAX_EXTERNAL_CANONICAL_URL_BYTES = 4 * 1024;
+const MAX_EXTERNAL_PUBLISHER_LENGTH = 160;
 
 function fail(message: string): never {
   throw new EvidenceAnalyzerError(message, true);
@@ -80,6 +102,38 @@ function booleanValue(value: unknown, field: string): boolean {
 
 function nullableString(value: unknown, field: string): string | null {
   return value === null ? null : nonEmptyString(value, field);
+}
+
+function validPublishedAt(value: string): boolean {
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value);
+  if (!match) return false;
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  const date = new Date(Date.UTC(year, month - 1, day));
+  return date.getUTCFullYear() === year && date.getUTCMonth() === month - 1 && date.getUTCDate() === day;
+}
+
+function externalChunkMetadata(chunk: Record<string, unknown>, field: string): ExternalEvidenceChunkMetadata {
+  const canonicalUrl = nonEmptyString(chunk.canonicalUrl, `${field}.canonicalUrl`);
+  const publisher = nonEmptyString(chunk.publisher, `${field}.publisher`);
+  const publishedAt = nonEmptyString(chunk.publishedAt, `${field}.publishedAt`);
+  const retrievedAt = chunk.retrievedAt;
+  let parsedUrl: URL;
+  try {
+    parsedUrl = new URL(canonicalUrl);
+  } catch {
+    fail(`${field}.canonicalUrl이 올바르지 않습니다.`);
+  }
+  if (parsedUrl.protocol !== "https:" || parsedUrl.username || parsedUrl.password
+    || new TextEncoder().encode(canonicalUrl).byteLength > MAX_EXTERNAL_CANONICAL_URL_BYTES) {
+    fail(`${field}.canonicalUrl이 올바르지 않습니다.`);
+  }
+  if (publisher.length > MAX_EXTERNAL_PUBLISHER_LENGTH || !validPublishedAt(publishedAt)
+    || typeof retrievedAt !== "number" || !Number.isSafeInteger(retrievedAt) || retrievedAt < 0) {
+    fail(`${field} 외부 출처 메타데이터가 올바르지 않습니다.`);
+  }
+  return { canonicalUrl, publisher, publishedAt, retrievedAt };
 }
 
 function pathValue(value: unknown, field: string): SpatialPoint[] {
@@ -153,16 +207,41 @@ function knownCitationIds(known: readonly EvidenceChunkInput[] | readonly string
 /** Validates first-stage input before evidence is sent to the provider. */
 export function parseEvidenceChunks(chunks: readonly EvidenceChunkInput[]): EvidenceChunkInput[] {
   if (chunks.length === 0) fail("분석할 근거 청크가 필요합니다.");
-  return chunks.map((chunk, index) => {
+  return chunks.map((chunk, index): EvidenceChunkInput => {
     const field = `chunks[${index}]`;
     if (!isRecord(chunk)) fail(`${field}가 필요합니다.`);
-    exactKeys(chunk, ["id", "locationLabel", "content"], field);
-    return {
+    if (!CHUNK_ORIGINS.has(chunk.origin as EvidenceChunkOrigin)) fail(`${field}.origin이 올바르지 않습니다.`);
+    const origin = chunk.origin as EvidenceChunkOrigin;
+    exactKeys(chunk, ["id", "locationLabel", "content", "origin", ...(origin === "external_web"
+      ? ["canonicalUrl", "publisher", "publishedAt", "retrievedAt"]
+      : [])], field);
+    const base = {
       id: nonEmptyString(chunk.id, `${field}.id`),
       locationLabel: nonEmptyString(chunk.locationLabel, `${field}.locationLabel`),
       content: nonEmptyString(chunk.content, `${field}.content`),
     };
+    if (origin === "external_web") {
+      return { ...base, origin, ...externalChunkMetadata(chunk, field) };
+    }
+    return { ...base, origin };
   });
+}
+
+/** Applies source-origin rules after strict model-output parsing and before persistence. */
+export function enforceExternalEvidenceRules(
+  card: TacticCardContent,
+  originsByChunkId: ReadonlyMap<string, EvidenceChunkOrigin>,
+): TacticCardContent {
+  const cited = [...card.preferred, ...card.alternatives, ...card.risky]
+    .flatMap((action) => action.citationIds);
+  const externalOnly = cited.length > 0
+    && cited.every((id) => originsByChunkId.get(id) === "external_web");
+  return {
+    ...card,
+    confidence: externalOnly && card.confidence === "high" ? "medium" : card.confidence,
+    scenarioSuitable: card.conflicts.length > 0 ? false : card.scenarioSuitable,
+    animationSuitable: card.conflicts.length > 0 ? false : card.animationSuitable,
+  };
 }
 
 /** Returns only citation IDs represented by the validated first-stage evidence. */
