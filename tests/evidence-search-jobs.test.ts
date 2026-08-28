@@ -24,12 +24,23 @@ const admin: EvidenceAdmin = {
 };
 const settings = { analyzerModel: "model-1", promptVersion: "prompt-1", schemaVersion: "schema-1" };
 
+function deferred<T = void>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((promiseResolve, promiseReject) => {
+    resolve = promiseResolve;
+    reject = promiseReject;
+  });
+  return { promise, resolve, reject };
+}
+
 class SQLiteD1Statement implements EvidenceD1Statement {
   private values: SQLInputValue[] = [];
 
   constructor(
     private readonly database: DatabaseSync,
     readonly query: string,
+    private readonly executeRun: (statement: SQLiteD1Statement) => Promise<{ meta: { changes: number } }>,
   ) {}
 
   bind(...values: unknown[]): EvidenceD1Statement {
@@ -46,7 +57,7 @@ class SQLiteD1Statement implements EvidenceD1Statement {
   }
 
   async run(): Promise<{ meta: { changes: number } }> {
-    return this.execute();
+    return this.executeRun(this);
   }
 
   execute(): { meta: { changes: number } } {
@@ -59,6 +70,8 @@ class SQLiteD1Database implements EvidenceD1Database {
   readonly database = new DatabaseSync(":memory:");
   beforeNextBatch: (() => void | Promise<void>) | null = null;
   afterNextBatchCommit: (() => void | Promise<void>) | null = null;
+  beforeNextRun: { pattern: RegExp; callback: () => void | Promise<void> } | null = null;
+  afterNextRunCommit: { pattern: RegExp; callback: () => void | Promise<void> } | null = null;
 
   constructor() {
     this.database.exec("PRAGMA foreign_keys = ON");
@@ -68,7 +81,22 @@ class SQLiteD1Database implements EvidenceD1Database {
   }
 
   prepare(query: string): EvidenceD1Statement {
-    return new SQLiteD1Statement(this.database, query);
+    return new SQLiteD1Statement(this.database, query, (statement) => this.executeRun(statement));
+  }
+
+  private async executeRun(statement: SQLiteD1Statement): Promise<{ meta: { changes: number } }> {
+    const before = this.beforeNextRun;
+    if (before?.pattern.test(statement.query)) {
+      this.beforeNextRun = null;
+      await before.callback();
+    }
+    const result = statement.execute();
+    const after = this.afterNextRunCommit;
+    if (after?.pattern.test(statement.query)) {
+      this.afterNextRunCommit = null;
+      await after.callback();
+    }
+    return result;
   }
 
   async batch(statements: EvidenceD1Statement[]): Promise<{ meta: { changes: number } }[]> {
@@ -298,6 +326,72 @@ test("search is explicit, deduplicated by input version, and stores at most eigh
   );
 });
 
+test("search insertion is guarded by the captured bundle version and content authority", async () => {
+  const context = createContext([candidate(1)]);
+  seedBundle(context.db);
+  context.db.beforeNextRun = {
+    pattern: /INSERT OR IGNORE INTO evidence_search_runs/,
+    callback: () => context.db.run(
+      "UPDATE evidence_bundles SET version=2,content_version='content-2',updated_at=2 WHERE id='bundle-1'",
+    ),
+  };
+
+  await assert.rejects(() => context.jobs.startSearch("bundle-1", admin), /갱신/);
+  assert.equal(context.db.first<{ count: number }>(
+    "SELECT count(*) AS count FROM evidence_search_runs",
+  ).count, 0);
+  assert.equal(context.scheduled.length, 0);
+});
+
+test("bundle mutation before search acquisition terminally stales the queued run", async () => {
+  const context = createContext([candidate(1)]);
+  seedBundle(context.db);
+  context.db.beforeNextRun = {
+    pattern: /UPDATE evidence_search_runs SET status='searching'/,
+    callback: () => context.db.run(
+      "UPDATE evidence_bundles SET version=2,content_version='content-2',updated_at=2 WHERE id='bundle-1'",
+    ),
+  };
+
+  const run = await context.jobs.startSearch("bundle-1", admin);
+  await Promise.all(context.scheduled);
+
+  assert.deepEqual({ ...context.db.first(
+    "SELECT status,is_stale AS isStale FROM evidence_search_runs WHERE id=?",
+    run.id,
+  ) }, { status: "failed", isStale: 1 });
+  assert.equal(context.provider.inputs.length, 0);
+});
+
+test("post-commit search insertion is reconciled and repeated queued starts repair handoff once", async () => {
+  const context = createContext([candidate(1)]);
+  seedBundle(context.db);
+  const acquisitionEntered = deferred();
+  const releaseAcquisition = deferred();
+  context.db.afterNextRunCommit = {
+    pattern: /INSERT OR IGNORE INTO evidence_search_runs/,
+    callback: () => { throw new Error("simulated post-commit search insertion transport failure"); },
+  };
+  context.db.beforeNextRun = {
+    pattern: /UPDATE evidence_search_runs SET status='searching'/,
+    callback: async () => {
+      acquisitionEntered.resolve();
+      await releaseAcquisition.promise;
+    },
+  };
+
+  const first = await context.jobs.startSearch("bundle-1", admin);
+  await acquisitionEntered.promise;
+  const second = await context.jobs.startSearch("bundle-1", admin);
+  assert.equal(second.id, first.id);
+  assert.equal(context.scheduled.length, 2);
+
+  releaseAcquisition.resolve();
+  await Promise.all(context.scheduled);
+  assert.equal(context.provider.inputs.length, 1);
+  assert.equal((await context.jobs.getSearch("bundle-1", first.id))?.run.status, "ready");
+});
+
 test("selection uses bundle CAS and never fetches or stores an unselected candidate", async () => {
   const fetchCalls: string[] = [];
   const context = createContext([candidate(1), candidate(2)], async (input) => {
@@ -382,6 +476,161 @@ test("one failed import preserves its successful sibling and retry is idempotent
   assert.equal(context.db.first<{ count: number }>("SELECT count(*) AS count FROM evidence_sources").count, 2);
 });
 
+test("post-commit import start is reconciled and repeated importing starts repair handoff once", async () => {
+  const fetchCalls: string[] = [];
+  const context = createContext([candidate(1)], async (input) => {
+    fetchCalls.push(input.url);
+    return successfulFetch(input);
+  });
+  seedBundle(context.db);
+  const detail = await runSearch(context);
+  await select(context, detail, [0]);
+  const acquisitionEntered = deferred();
+  const releaseAcquisition = deferred();
+  context.db.afterNextRunCommit = {
+    pattern: /UPDATE evidence_search_runs\s+SET status='importing'/,
+    callback: () => { throw new Error("simulated post-commit import start transport failure"); },
+  };
+  context.db.beforeNextRun = {
+    pattern: /UPDATE evidence_search_candidates\s+SET status='importing'/,
+    callback: async () => {
+      acquisitionEntered.resolve();
+      await releaseAcquisition.promise;
+    },
+  };
+
+  const before = context.scheduled.length;
+  const first = await context.jobs.startImport("bundle-1", detail.run.id, admin);
+  await acquisitionEntered.promise;
+  const second = await context.jobs.startImport("bundle-1", detail.run.id, admin);
+  assert.equal(first.id, second.id);
+  assert.equal(context.scheduled.length - before, 2);
+
+  releaseAcquisition.resolve();
+  await Promise.all(context.scheduled.slice(before));
+  assert.deepEqual(fetchCalls, [detail.candidates[0]!.url]);
+  assert.equal((await context.jobs.getSearch("bundle-1", detail.run.id))?.run.status, "completed");
+});
+
+test("candidate acquisition transport failure is isolated, a sibling succeeds, and retry recovers", async () => {
+  const fetchCalls: string[] = [];
+  const context = createContext([candidate(1), candidate(2)], async (input) => {
+    fetchCalls.push(input.url);
+    return successfulFetch(input);
+  });
+  seedBundle(context.db);
+  const detail = await runSearch(context);
+  await select(context, detail, [0, 1]);
+  context.db.beforeNextRun = {
+    pattern: /UPDATE evidence_search_candidates\s+SET status='importing'/,
+    callback: () => { throw new Error("simulated candidate acquisition transport failure"); },
+  };
+
+  let before = context.scheduled.length;
+  await context.jobs.startImport("bundle-1", detail.run.id, admin);
+  await Promise.all(context.scheduled.slice(before));
+  assert.deepEqual(
+    context.db.all<{ status: string }>("SELECT status FROM evidence_search_candidates ORDER BY rank").map((row) => row.status),
+    ["selected", "imported"],
+  );
+  assert.deepEqual(fetchCalls, [detail.candidates[1]!.url]);
+  assert.equal((await context.jobs.getSearch("bundle-1", detail.run.id))?.run.status, "importing");
+
+  before = context.scheduled.length;
+  await context.jobs.startImport("bundle-1", detail.run.id, admin);
+  await Promise.all(context.scheduled.slice(before));
+  assert.deepEqual(fetchCalls, [detail.candidates[1]!.url, detail.candidates[0]!.url]);
+  assert.equal((await context.jobs.getSearch("bundle-1", detail.run.id))?.run.status, "completed");
+});
+
+test("post-commit candidate acquisition is reconciled without duplicate fetch work", async () => {
+  const fetchCalls: string[] = [];
+  const context = createContext([candidate(1), candidate(2)], async (input) => {
+    fetchCalls.push(input.url);
+    return successfulFetch(input);
+  });
+  seedBundle(context.db);
+  const detail = await runSearch(context);
+  await select(context, detail, [0, 1]);
+  context.db.afterNextRunCommit = {
+    pattern: /UPDATE evidence_search_candidates\s+SET status='importing'/,
+    callback: () => { throw new Error("simulated post-commit candidate acquisition transport failure"); },
+  };
+
+  const before = context.scheduled.length;
+  await context.jobs.startImport("bundle-1", detail.run.id, admin);
+  await Promise.all(context.scheduled.slice(before));
+
+  assert.deepEqual(fetchCalls, detail.candidates.map((value) => value.url));
+  assert.deepEqual(
+    context.db.all<{ status: string }>("SELECT status FROM evidence_search_candidates ORDER BY rank").map((row) => row.status),
+    ["imported", "imported"],
+  );
+  assert.equal((await context.jobs.getSearch("bundle-1", detail.run.id))?.run.status, "completed");
+});
+
+test("post-commit candidate failure update is reconciled before a sibling succeeds and retry", async () => {
+  const attempts = new Map<string, number>();
+  const context = createContext([candidate(1), candidate(2)], async (input) => {
+    const attempt = (attempts.get(input.url) ?? 0) + 1;
+    attempts.set(input.url, attempt);
+    if (input.url === candidate(1).url && attempt === 1) throw new Error("first fetch fails");
+    return successfulFetch(input);
+  });
+  seedBundle(context.db);
+  const detail = await runSearch(context);
+  await select(context, detail, [0, 1]);
+  context.db.afterNextRunCommit = {
+    pattern: /UPDATE evidence_search_candidates SET status='failed'/,
+    callback: () => { throw new Error("simulated post-commit candidate failure transport failure"); },
+  };
+
+  let before = context.scheduled.length;
+  await context.jobs.startImport("bundle-1", detail.run.id, admin);
+  await Promise.all(context.scheduled.slice(before));
+  assert.deepEqual(
+    context.db.all<{ status: string }>("SELECT status FROM evidence_search_candidates ORDER BY rank").map((row) => row.status),
+    ["failed", "imported"],
+  );
+  assert.equal((await context.jobs.getSearch("bundle-1", detail.run.id))?.run.status, "completed");
+
+  before = context.scheduled.length;
+  await context.jobs.startImport("bundle-1", detail.run.id, admin);
+  await Promise.all(context.scheduled.slice(before));
+  assert.deepEqual(attempts, new Map([
+    [detail.candidates[0]!.url, 2],
+    [detail.candidates[1]!.url, 1],
+  ]));
+  assert.equal((await context.jobs.getSearch("bundle-1", detail.run.id))?.run.status, "completed");
+});
+
+test("pre-commit candidate failure update retries state repair and preserves sibling progress", async () => {
+  const attempts = new Map<string, number>();
+  const context = createContext([candidate(1), candidate(2)], async (input) => {
+    const attempt = (attempts.get(input.url) ?? 0) + 1;
+    attempts.set(input.url, attempt);
+    if (input.url === candidate(1).url && attempt === 1) throw new Error("first fetch fails");
+    return successfulFetch(input);
+  });
+  seedBundle(context.db);
+  const detail = await runSearch(context);
+  await select(context, detail, [0, 1]);
+  context.db.beforeNextRun = {
+    pattern: /UPDATE evidence_search_candidates SET status='failed'/,
+    callback: () => { throw new Error("simulated pre-commit candidate failure transport failure"); },
+  };
+
+  const before = context.scheduled.length;
+  await context.jobs.startImport("bundle-1", detail.run.id, admin);
+  await Promise.all(context.scheduled.slice(before));
+
+  assert.deepEqual(
+    context.db.all<{ status: string }>("SELECT status FROM evidence_search_candidates ORDER BY rank").map((row) => row.status),
+    ["failed", "imported"],
+  );
+  assert.equal((await context.jobs.getSearch("bundle-1", detail.run.id))?.run.status, "completed");
+});
+
 test("bundle mutation stales searches and an imported source stales prior analysis", async () => {
   const context = createContext([candidate(1)]);
   seedBundle(context.db);
@@ -441,6 +690,36 @@ test("selection CAS leaves candidate and audit state unchanged when the bundle w
   assert.equal(context.db.first<{ count: number }>(
     "SELECT count(*) AS count FROM evidence_audit_events WHERE target_type='search_candidate'",
   ).count, 0);
+});
+
+test("a known zero-row selection CAS remains a conflict after an identical concurrent winner and bundle mutation", async () => {
+  const context = createContext([candidate(1), candidate(2)]);
+  seedBundle(context.db);
+  const detail = await runSearch(context);
+  const input: SearchSelectionInput = {
+    expectedBundleVersion: 1,
+    selectedIds: [detail.candidates[0]!.id],
+    excludedIds: [detail.candidates[1]!.id],
+  };
+  const staleBatchEntered = deferred();
+  const releaseStaleBatch = deferred();
+  context.db.beforeNextBatch = async () => {
+    staleBatchEntered.resolve();
+    await releaseStaleBatch.promise;
+  };
+
+  const staleSelection = context.jobs.saveSelection("bundle-1", detail.run.id, input, admin);
+  await staleBatchEntered.promise;
+  await context.jobs.saveSelection("bundle-1", detail.run.id, input, admin);
+  context.db.run(
+    "UPDATE evidence_bundles SET version=2,content_version='content-2',updated_at=updated_at+1 WHERE id='bundle-1'",
+  );
+  releaseStaleBatch.resolve();
+
+  await assert.rejects(staleSelection, /갱신/);
+  assert.equal(context.db.first<{ count: number }>(
+    "SELECT count(*) AS count FROM evidence_audit_events WHERE target_type='search_candidate'",
+  ).count, 2);
 });
 
 test("registration CAS cleanup leaves no source or R2 object and records a terminal candidate failure", async () => {

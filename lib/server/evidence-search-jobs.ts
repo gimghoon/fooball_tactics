@@ -276,71 +276,100 @@ export class EvidenceExternalSearchJobs {
       promptVersion: this.dependencies.promptVersion,
     }));
     const existing = await this.findRunByInput(bundleId, inputVersion);
-    if (existing !== null && SEARCH_REUSABLE_STATUSES.has(existing.status)) return asRun(existing);
+    if (existing !== null && SEARCH_REUSABLE_STATUSES.has(existing.status)) {
+      if (existing.status === "queued") {
+        await this.scheduleQueuedSearch(existing.id, bundle, directEvidenceSummary);
+        const repaired = await this.run(existing.id);
+        if (repaired === null) throw new EvidenceConflictError();
+        return asRun(repaired);
+      }
+      return asRun(existing);
+    }
     if (existing !== null && existing.status !== "failed") return asRun(existing);
 
     const now = this.now();
     let runId = existing?.id ?? this.id();
     let queued = false;
     if (existing === null) {
-      const result = await this.dependencies.db.prepare(
-        `INSERT OR IGNORE INTO evidence_search_runs
-          (id,bundle_id,input_version,bundle_version,status,search_model,prompt_version,query_json,error_message,is_stale,created_at,updated_at)
-          VALUES (?,?,?,?,'queued',?,?,?,NULL,0,?,?)`,
-      ).bind(
-        runId,
-        bundle.id,
-        inputVersion,
-        bundle.version,
-        this.dependencies.provider.modelId,
-        this.dependencies.promptVersion,
-        "[]",
-        now,
-        now,
-      ).run();
-      queued = changes(result) === 1;
+      let result: { meta?: { changes?: number } } | undefined;
+      try {
+        result = await this.dependencies.db.prepare(
+          `INSERT OR IGNORE INTO evidence_search_runs
+            (id,bundle_id,input_version,bundle_version,status,search_model,prompt_version,query_json,error_message,is_stale,created_at,updated_at)
+            SELECT ?,?,?,?,'queued',?,?,?,NULL,0,?,?
+            WHERE EXISTS (SELECT 1 FROM evidence_bundles WHERE id=? AND version=? AND content_version=?)`,
+        ).bind(
+          runId,
+          bundle.id,
+          inputVersion,
+          bundle.version,
+          this.dependencies.provider.modelId,
+          this.dependencies.promptVersion,
+          "[]",
+          now,
+          now,
+          bundle.id,
+          bundle.version,
+          bundle.contentVersion,
+        ).run();
+      } catch (error) {
+        const committed = await this.findRunByInput(bundle.id, inputVersion);
+        if (committed === null) throw error;
+        runId = committed.id;
+        if (committed.status === "queued") queued = true;
+        else if (SEARCH_REUSABLE_STATUSES.has(committed.status) || committed.status !== "failed") {
+          return asRun(committed);
+        } else {
+          throw error;
+        }
+      }
+      queued ||= changes(result) === 1;
       if (!queued) {
         const winner = await this.findRunByInput(bundle.id, inputVersion);
         if (winner === null) throw new EvidenceConflictError();
         runId = winner.id;
-        if (SEARCH_REUSABLE_STATUSES.has(winner.status) || winner.status !== "failed") return asRun(winner);
+        if (winner.status === "queued") queued = true;
+        else if (SEARCH_REUSABLE_STATUSES.has(winner.status) || winner.status !== "failed") return asRun(winner);
       }
     }
 
     if (!queued) {
-      const result = await this.dependencies.db.prepare(
-        `UPDATE evidence_search_runs
-          SET status='queued',query_json='[]',error_message=NULL,is_stale=0,started_at=NULL,completed_at=NULL,
-            bundle_version=?,search_model=?,prompt_version=?,updated_at=?
-          WHERE id=? AND bundle_id=? AND input_version=? AND status='failed'
-            AND NOT EXISTS (SELECT 1 FROM evidence_search_candidates WHERE run_id=evidence_search_runs.id)
-            AND EXISTS (SELECT 1 FROM evidence_bundles WHERE id=? AND version=? AND content_version=?)`,
-      ).bind(
-        bundle.version,
-        this.dependencies.provider.modelId,
-        this.dependencies.promptVersion,
-        now,
-        runId,
-        bundle.id,
-        inputVersion,
-        bundle.id,
-        bundle.version,
-        bundle.contentVersion,
-      ).run();
-      queued = changes(result) === 1;
+      let result: { meta?: { changes?: number } } | undefined;
+      try {
+        result = await this.dependencies.db.prepare(
+          `UPDATE evidence_search_runs
+            SET status='queued',query_json='[]',error_message=NULL,is_stale=0,started_at=NULL,completed_at=NULL,
+              bundle_version=?,search_model=?,prompt_version=?,updated_at=?
+            WHERE id=? AND bundle_id=? AND input_version=? AND status='failed'
+              AND NOT EXISTS (SELECT 1 FROM evidence_search_candidates WHERE run_id=evidence_search_runs.id)
+              AND EXISTS (SELECT 1 FROM evidence_bundles WHERE id=? AND version=? AND content_version=?)`,
+        ).bind(
+          bundle.version,
+          this.dependencies.provider.modelId,
+          this.dependencies.promptVersion,
+          now,
+          runId,
+          bundle.id,
+          inputVersion,
+          bundle.id,
+          bundle.version,
+          bundle.contentVersion,
+        ).run();
+      } catch (error) {
+        const committed = await this.run(runId);
+        if (committed?.status !== "queued") throw error;
+        queued = true;
+      }
+      queued ||= changes(result) === 1;
       if (!queued) {
         const current = await this.run(runId);
         if (current === null) throw new EvidenceConflictError();
-        return asRun(current);
+        if (current.status === "queued") queued = true;
+        else return asRun(current);
       }
     }
 
-    try {
-      this.schedule(() => this.executeSearch(runId, bundle, directEvidenceSummary));
-    } catch {
-      await this.failQueuedSearch(runId);
-      throw new EvidenceUnavailableError("외부 출처 검색 작업을 예약하지 못했습니다.");
-    }
+    await this.scheduleQueuedSearch(runId, bundle, directEvidenceSummary);
     const created = await this.run(runId);
     if (created === null) throw new EvidenceConflictError();
     return asRun(created);
@@ -445,13 +474,18 @@ export class EvidenceExternalSearchJobs {
           AND ${authority}`,
     ).bind(now, runId, bundleId, run.updatedAt, ...authorityValues));
 
+    let results: { meta?: { changes?: number } }[];
     try {
-      const results = await this.dependencies.db.batch(statements);
-      if (changes(results.at(-1)) !== 1) throw new EvidenceConflictError();
+      results = await this.dependencies.db.batch(statements);
     } catch (error) {
-      const after = await this.candidatesByIds(runId, ids);
-      if (!this.selectionApplied(after, input.selectedIds, input.excludedIds)) throw error;
+      const [after, afterRun] = await Promise.all([
+        this.candidatesByIds(runId, ids),
+        this.run(runId),
+      ]);
+      if (afterRun?.updatedAt !== now || !this.selectionApplied(after, input.selectedIds, input.excludedIds)) throw error;
+      return (await this.getSearch(bundleId, runId))!;
     }
+    if (changes(results.at(-1)) !== 1) throw new EvidenceConflictError();
     return (await this.getSearch(bundleId, runId))!;
   }
 
@@ -460,7 +494,14 @@ export class EvidenceExternalSearchJobs {
     const run = await this.run(runId);
     if (run === null || run.bundleId !== bundleId) throw new EvidenceNotFoundError("외부 출처 검색 작업을 찾을 수 없습니다.");
     if (run.isStale) throw new EvidenceConflictError("오래된 검색 결과입니다. 외부 출처를 다시 검색해 주세요.");
-    if (run.status === "importing") return asRun(run);
+    if (run.status === "importing") {
+      const bundle = await this.bundle(bundleId);
+      if (run.bundleVersion !== bundle.version) throw new EvidenceConflictError();
+      this.scheduleImportContinuation(bundleId, runId);
+      const repaired = await this.run(runId);
+      if (repaired === null) throw new EvidenceConflictError();
+      return asRun(repaired);
+    }
     if (!IMPORT_START_STATUSES.has(run.status)) {
       throw new EvidenceConflictError("가져올 수 있는 외부 출처 검색 작업 상태가 아닙니다.");
     }
@@ -475,23 +516,28 @@ export class EvidenceExternalSearchJobs {
     if (retryable.length > MAX_SELECTION) throw new EvidenceRequestValidationError("선택한 후보는 최대 5개여야 합니다.");
 
     const now = Math.max(this.now(), run.updatedAt + 1);
-    const result = await this.dependencies.db.prepare(
-      `UPDATE evidence_search_runs
-        SET status='importing',error_message=NULL,completed_at=NULL,updated_at=?
-        WHERE id=? AND bundle_id=? AND updated_at=? AND is_stale=0
-          AND status IN ('ready','completed','failed') AND bundle_version=?
-          AND EXISTS (SELECT 1 FROM evidence_bundles WHERE id=? AND version=?)
-          AND EXISTS (SELECT 1 FROM evidence_search_candidates
-            WHERE run_id=? AND selected_by IS NOT NULL AND status IN ('selected','failed'))`,
-    ).bind(now, runId, bundleId, run.updatedAt, bundle.version, bundleId, bundle.version, runId).run();
+    let result: { meta?: { changes?: number } } | undefined;
+    try {
+      result = await this.dependencies.db.prepare(
+        `UPDATE evidence_search_runs
+          SET status='importing',error_message=NULL,completed_at=NULL,updated_at=?
+          WHERE id=? AND bundle_id=? AND updated_at=? AND is_stale=0
+            AND status IN ('ready','completed','failed') AND bundle_version=?
+            AND EXISTS (SELECT 1 FROM evidence_bundles WHERE id=? AND version=?)
+            AND EXISTS (SELECT 1 FROM evidence_search_candidates
+              WHERE run_id=? AND selected_by IS NOT NULL AND status IN ('selected','failed'))`,
+      ).bind(now, runId, bundleId, run.updatedAt, bundle.version, bundleId, bundle.version, runId).run();
+    } catch (error) {
+      const committed = await this.run(runId);
+      if (committed?.status !== "importing" || committed.updatedAt !== now) throw error;
+    }
     if (changes(result) !== 1) {
       const winner = await this.run(runId);
-      if (winner?.status === "importing") return asRun(winner);
-      throw new EvidenceConflictError();
+      if (winner?.status !== "importing") throw new EvidenceConflictError();
     }
 
     try {
-      this.schedule(() => this.executeImports(bundleId, runId));
+      this.scheduleImportContinuation(bundleId, runId);
     } catch {
       await this.dependencies.db.prepare(
         `UPDATE evidence_search_runs SET status='failed',error_message=?,completed_at=?,updated_at=?
@@ -510,21 +556,34 @@ export class EvidenceExternalSearchJobs {
     directEvidenceSummary: string,
   ): Promise<void> {
     const startedAt = this.now();
-    const acquired = await this.dependencies.db.prepare(
-      `UPDATE evidence_search_runs SET status='searching',started_at=?,error_message=NULL,updated_at=?
-        WHERE id=? AND bundle_id=? AND status='queued' AND is_stale=0 AND bundle_version=?
-          AND EXISTS (SELECT 1 FROM evidence_bundles WHERE id=? AND version=? AND content_version=?)`,
-    ).bind(
-      startedAt,
-      startedAt,
-      runId,
-      bundle.id,
-      bundle.version,
-      bundle.id,
-      bundle.version,
-      bundle.contentVersion,
-    ).run();
-    if (changes(acquired) !== 1) return;
+    let acquired: { meta?: { changes?: number } } | undefined;
+    try {
+      acquired = await this.dependencies.db.prepare(
+        `UPDATE evidence_search_runs SET status='searching',started_at=?,error_message=NULL,updated_at=?
+          WHERE id=? AND bundle_id=? AND status='queued' AND is_stale=0 AND bundle_version=?
+            AND EXISTS (SELECT 1 FROM evidence_bundles WHERE id=? AND version=? AND content_version=?)`,
+      ).bind(
+        startedAt,
+        startedAt,
+        runId,
+        bundle.id,
+        bundle.version,
+        bundle.id,
+        bundle.version,
+        bundle.contentVersion,
+      ).run();
+    } catch {
+      const current = await this.run(runId);
+      if (current?.status !== "searching" || current.startedAt !== startedAt || current.updatedAt !== startedAt) {
+        await this.staleRunIfBundleChanged(runId, bundle);
+        return;
+      }
+      acquired = { meta: { changes: 1 } };
+    }
+    if (changes(acquired) !== 1) {
+      await this.staleRunIfBundleChanged(runId, bundle);
+      return;
+    }
 
     try {
       const result = await this.dependencies.provider.search({
@@ -615,11 +674,20 @@ export class EvidenceExternalSearchJobs {
   }
 
   private async executeImports(bundleId: string, runId: string): Promise<void> {
-    const candidates = (await this.candidates(runId)).filter((candidate) =>
-      candidate.selectedBy !== null && (candidate.status === "selected" || candidate.status === "failed"),
-    ).slice(0, MAX_SELECTION);
-    for (const candidate of candidates) await this.importCandidate(bundleId, runId, candidate);
-    await this.finishImportRun(runId);
+    try {
+      const candidates = (await this.candidates(runId)).filter((candidate) =>
+        candidate.selectedBy !== null && (candidate.status === "selected" || candidate.status === "failed"),
+      ).slice(0, MAX_SELECTION);
+      for (const candidate of candidates) {
+        try {
+          await this.importCandidate(bundleId, runId, candidate);
+        } catch {
+          // Candidate transport/state failures are isolated so later selected siblings still run.
+        }
+      }
+    } finally {
+      await this.finishImportRun(runId);
+    }
   }
 
   private async importCandidate(
@@ -628,14 +696,21 @@ export class EvidenceExternalSearchJobs {
     candidate: EvidenceSearchCandidateRow,
   ): Promise<void> {
     const acquiredAt = this.now();
-    const acquired = await this.dependencies.db.prepare(
-      `UPDATE evidence_search_candidates
-        SET status='importing',failure_reason=NULL,updated_at=?
-        WHERE id=? AND run_id=? AND bundle_id=? AND selected_by IS NOT NULL AND status IN ('selected','failed')
-          AND EXISTS (SELECT 1 FROM evidence_search_runs
-            WHERE id=? AND bundle_id=? AND status='importing' AND is_stale=0
-              AND bundle_version=(SELECT version FROM evidence_bundles WHERE id=?))`,
-    ).bind(acquiredAt, candidate.id, runId, bundleId, runId, bundleId, bundleId).run();
+    let acquired: { meta?: { changes?: number } } | undefined;
+    try {
+      acquired = await this.dependencies.db.prepare(
+        `UPDATE evidence_search_candidates
+          SET status='importing',failure_reason=NULL,updated_at=?
+          WHERE id=? AND run_id=? AND bundle_id=? AND selected_by IS NOT NULL AND status IN ('selected','failed')
+            AND EXISTS (SELECT 1 FROM evidence_search_runs
+              WHERE id=? AND bundle_id=? AND status='importing' AND is_stale=0
+                AND bundle_version=(SELECT version FROM evidence_bundles WHERE id=?))`,
+      ).bind(acquiredAt, candidate.id, runId, bundleId, runId, bundleId, bundleId).run();
+    } catch (error) {
+      const after = await this.candidate(candidate.id);
+      if (after?.status !== "importing" || after.updatedAt !== acquiredAt) throw error;
+      acquired = { meta: { changes: 1 } };
+    }
     if (changes(acquired) !== 1) return;
 
     try {
@@ -667,12 +742,35 @@ export class EvidenceExternalSearchJobs {
       const current = await this.candidate(candidate.id);
       if (current?.status === "imported") return;
       const now = this.now();
-      await this.dependencies.db.prepare(
-        `UPDATE evidence_search_candidates SET status='failed',failure_reason=?,updated_at=?
-          WHERE id=? AND run_id=? AND status='importing'
-            AND EXISTS (SELECT 1 FROM evidence_search_runs WHERE id=? AND status='importing' AND is_stale=0)`,
-      ).bind(safeError(importErrorMessage(error)), now, candidate.id, runId, runId).run();
+      const message = safeError(importErrorMessage(error));
+      try {
+        await this.failCandidateImport(runId, candidate.id, message, now);
+      } catch (failureError) {
+        const after = await this.candidate(candidate.id);
+        if (after?.status === "failed" || after?.status === "imported") return;
+        try {
+          await this.failCandidateImport(runId, candidate.id, message, this.now());
+        } catch {
+          throw failureError;
+        }
+      }
     }
+  }
+
+  private async failCandidateImport(
+    runId: string,
+    candidateId: string,
+    message: string,
+    now: number,
+  ): Promise<void> {
+    const result = await this.dependencies.db.prepare(
+      `UPDATE evidence_search_candidates SET status='failed',failure_reason=?,updated_at=?
+        WHERE id=? AND run_id=? AND status='importing'
+          AND EXISTS (SELECT 1 FROM evidence_search_runs WHERE id=? AND status='importing' AND is_stale=0)`,
+    ).bind(message, now, candidateId, runId, runId).run();
+    if (changes(result) === 1) return;
+    const after = await this.candidate(candidateId);
+    if (after?.status !== "failed" && after?.status !== "imported") throw new EvidenceConflictError();
   }
 
   private async finishCandidateImport(
@@ -759,10 +857,11 @@ export class EvidenceExternalSearchJobs {
   private async staleRunIfBundleChanged(runId: string, bundle: SearchBundleRow): Promise<void> {
     const now = this.now();
     await this.dependencies.db.prepare(
-      `UPDATE evidence_search_runs SET is_stale=1,error_message='근거 묶음이 갱신되었습니다.',updated_at=?
-        WHERE id=? AND status='searching' AND is_stale=0
+      `UPDATE evidence_search_runs
+        SET status='failed',is_stale=1,error_message='근거 묶음이 갱신되었습니다.',completed_at=?,updated_at=?
+        WHERE id=? AND status IN ('queued','searching') AND is_stale=0
           AND NOT EXISTS (SELECT 1 FROM evidence_bundles WHERE id=? AND version=? AND content_version=?)`,
-    ).bind(now, runId, bundle.id, bundle.version, bundle.contentVersion).run();
+    ).bind(now, now, runId, bundle.id, bundle.version, bundle.contentVersion).run();
   }
 
   private async failQueuedSearch(runId: string): Promise<void> {
@@ -810,6 +909,23 @@ export class EvidenceExternalSearchJobs {
       const candidate = candidates.find((value) => value.id === id);
       return candidate?.status === "selected" || candidate?.status === "imported";
     }) && excludedIds.every((id) => candidates.find((value) => value.id === id)?.status === "excluded");
+  }
+
+  private async scheduleQueuedSearch(
+    runId: string,
+    bundle: SearchBundleRow,
+    directEvidenceSummary: string,
+  ): Promise<void> {
+    try {
+      this.schedule(() => this.executeSearch(runId, bundle, directEvidenceSummary));
+    } catch {
+      await this.failQueuedSearch(runId);
+      throw new EvidenceUnavailableError("외부 출처 검색 작업을 예약하지 못했습니다.");
+    }
+  }
+
+  private scheduleImportContinuation(bundleId: string, runId: string): void {
+    this.schedule(() => this.executeImports(bundleId, runId));
   }
 
   private schedule(operation: () => Promise<void>): void {
